@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run check
+      - run: cp .env.example .env
+      - run: docker compose config
+        env:
+          PUBLIC_URL: http://127.0.0.1:3000
+          PANEL_BIND: 127.0.0.1:3000
+          RUNNER_SHARED_SECRET: ci-test-secret
