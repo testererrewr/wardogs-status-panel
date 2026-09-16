@@ -1,0 +1,8 @@
+.git
+.github
+.env
+data
+custom-bots
+backups
+node_modules
+*.zip

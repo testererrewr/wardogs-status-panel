@@ -1,0 +1,10 @@
+.env
+node_modules/
+data/*
+!data/.gitkeep
+custom-bots/*
+!custom-bots/.gitkeep
+backups/
+compose.override.yaml
+npm-debug.log*
+.DS_Store
