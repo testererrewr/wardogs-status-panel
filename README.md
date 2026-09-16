@@ -1,238 +1,124 @@
-# Server Status Hub v3.0
+# Server Status Hub v3.7
 
-Multi-User Discord Status-Bot Hosting für einen Debian-VPS.
+Multi-User Hosting für Discord Status Bots mit WARDOGS, FiveM, GameDig, generischer JSON API, reinen Text-Rotationen, Premium-Plänen, Free-Boost, Multi-VPS Nodes und freigeschalteten Custom Bots.
 
-## Funktionen
+## Neu in v3.7
 
-- Anmeldung/Registrierung ausschließlich über Discord OAuth2 (`identify`)
-- jeder neue Benutzer erhält standardmäßig **1 kostenlosen Status-Bot**
-- Admin kann pro Benutzer das Status-Bot-Limit erhöhen oder auf 0 setzen
-- Status-Bots gehören immer ihrem Benutzer; normale User sehen nur eigene Bots
-- Servertypen:
-  - **FiveM** (`dynamic.json` / `players.json`)
-  - **WARDOGS** (`GET /v1/status`, Bearer/RCON Passwort)
-  - **GameDig** (300+ Games; Game-ID + Host/Port)
-  - **Generische JSON API** mit konfigurierbaren JSON-Pfaden
-- rotierende Discord Presence-Texte mit `{players}`, `{max}`, `{map}`, `{server}`, `{game}`, `{ping}`
-- Bot-Tokens und Query-Secrets AES-256-GCM verschlüsselt
-- öffentliche User dürfen standardmäßig keine privaten/LAN/localhost-Ziele abfragen (SSRF-Schutz)
-- Admin kann private Ziele pro Status-Bot erlauben
+- öffentliche `Bots as a Service`-Seite unter `/bot-services`
+- einzelne Managed Bots unabhängig von Status-Bot-Limits anbieten
+- Admin-Katalog für Name, Beschreibung, Features, Preis, Status, Kauf-Link, Support-Link und Sichtbarkeit
+- vorbereiteter `WARDOGS Warning Bot` als Coming-Soon-Angebot
+- Deutsch/Englisch für Bot-Service-Inhalte
+- öffentliche Team-Seite unter `/team`
+- erster `.env`-Admin als `Founder & Administrator`
+- weitere Admins automatisch als `Administrator`
+- Discord User `293104788361576448` standardmäßig als Team Member
+- Text-only Status Bots, Free-Boost, Premium, Donations, Node Manager und Multi-VPS bleiben enthalten
 
-### Custom Bot Hosting
+## Bot Services
 
-Custom Bot Uploads sind standardmäßig **gesperrt** (`customBotLimit = 0`). Ein Admin kann einem Benutzer im Bereich **Benutzer** Upload-Slots geben.
+Unter `/bot-services` werden einzeln buchbare Spezial-Bots angeboten. Diese Produkte sind getrennt von Status-Bot-Plänen und Custom-Bot-Freigaben.
 
-- ZIP Upload
-- Node.js 22 oder Python 3.13
-- ENV-Variablen verschlüsselt gespeichert
-- normale User-Uploads bleiben zuerst `pending`
-- **Admin muss jeden Upload freigeben**, bevor er laufen kann
-- Bot läuft danach in einem eigenen Docker-Container
-- 256 MB RAM, 0.5 CPU, PID-Limit
-- read-only Root-FS + kleine tmpfs-Bereiche
-- `cap-drop ALL`, `no-new-privileges`
-- keine Host-Verzeichnisse und kein Docker-Socket im hochgeladenen Bot
-- Logs im Panel
+Der Admin verwaltet Angebote unter `/admin/bot-services`. Ein Angebot kann `Coming soon`, `Available` oder `Paused` sein. Kauf- und Support-Links sind frei konfigurierbar.
 
-Der interne `runner` besitzt für die Containerverwaltung Zugriff auf den Docker-Socket. Er ist **nicht öffentlich erreichbar** und akzeptiert nur Requests mit einem zufälligen Shared Secret vom Panel. Trotzdem gilt: fremden Code vor der Freigabe prüfen.
+Der vorbereitete WARDOGS Warning Bot überwacht Spieler-Joins und kann Discord-Warnungen senden, wenn die eigenen Erkennungsregeln einen Spieler als auffällig markieren. Preis und Kauf-Link werden erst im Adminbereich gesetzt.
 
-## Installation auf Debian VPS
+## Free-Boost
 
-Repo klonen:
+Ein Free-Account startet mit 1 Status Bot. Alle Free Status Bots rotieren automatisch `Powered by status-hub.lol` mit.
+
+Für mehr kostenlose Bots muss mindestens einer der Status Bots des Users auf einem Discord-Server laufen, auf dem der Branding-Channel ganz oben steht. Der Channel muss für `@everyone` sichtbar sein.
+
+Das Panel prüft die Discord-Server über den vorhandenen Bot-Token. Es verwendet den größten gültigen Server des Users und setzt das Free-Limit anhand der konfigurierten Mitgliederstufen. Die Prüfung läuft regelmäßig erneut. Wird der Channel entfernt, versteckt oder nach unten verschoben, verfällt der Boost nach Ablauf der Verifizierung.
+
+## Premium
+
+| Plan | Status Bots | Branding |
+|---|---:|---|
+| Free | 1 bis 5 mit Free-Boost | `Powered by status-hub.lol` |
+| Premium 5 | 5 | nein |
+| Premium 10 | 10 | nein |
+| Premium 15 | 15 | nein |
+| Premium 20 | 20 | nein |
+
+Admins können Plan und Laufzeit pro User im Backend setzen. Nach Ablauf fällt der User auf Free zurück. Bots oberhalb des neuen Limits werden pausiert, nicht gelöscht.
+
+## Node Manager
+
+Jeder Status Node meldet Kapazität, RAM, Load, Laufzeit und Heartbeat an die Control Plane.
+
+Im Adminbereich können Nodes:
+
+- für neue Bots gesperrt werden
+- komplett deaktiviert werden
+- gedraint werden
+- in der Kapazität geändert werden
+- einzelne Bots auf einen anderen Node verschieben
+- alle Bots auf einen gewählten Node verschieben
+
+Neue Debian-VPS Nodes können mit einem Einzeiler installiert werden. Remote Nodes sollten nur über eine HTTPS-Control-Plane verwendet werden.
+
+## Donations und Supporter
+
+Unter `/donate` gibt es eine öffentliche Support-Seite. Im Adminbereich können PayPal-, Ko-fi-, Stripe- oder eigene Support-Links gesetzt werden.
+
+Supporter werden im Adminbereich manuell eingetragen und können mit Name, Badge/Betrag, Nachricht, Link und Featured-Status öffentlich angezeigt werden. Ein Payment-Webhook ist noch nicht an einen bestimmten Anbieter gebunden.
+
+## Text-only Status Bots
+
+Neben Gameserver-Bots können Nutzer einen Status-Bot als reine Text-Rotation anlegen. Dabei wird kein Gameserver abgefragt. Jede Zeile ist ein Status-Text und wird im gewählten Intervall durchgeschaltet.
+
+Text-only Bots zählen exakt wie Gameserver-Bots gegen dasselbe Free-/Premium-Limit und werden ebenfalls über die Status Nodes verteilt. Free-Accounts erhalten auch dort das automatische `Powered by status-hub.lol` Branding.
+
+## Games
+
+- WARDOGS direkt
+- FiveM direkt
+- GameDig mit 320+ Game-/Service-Typen
+- generische JSON API
+
+Die Games-&-FAQ-Seite zeigt Suchfeld, Features, Standardports und bekannte Einschränkungen.
+
+## Custom Bots
+
+Custom Bots sind Node.js- oder Python-ZIPs. Ein User kann sie nur hochladen, wenn `customBotLimit > 0` im Adminbereich gesetzt wurde. Jeder Upload benötigt zusätzlich Admin-Freigabe. Premium oder Free-Boost geben niemals automatisch Custom-Bot-Rechte.
+
+Custom Bots laufen in separaten eingeschränkten Docker-Containern.
+
+## Erstinstallation
 
 ```bash
 cd /opt
-git clone https://github.com/DEINNAME/wardogs-status-panel.git server-status-hub
-cd server-status-hub
-chmod +x *.sh
-./setup-vps.sh
+git clone https://github.com/testererrewr/wardogs-status-panel.git
+cd wardogs-status-panel
+bash ./setup-vps.sh
 ```
 
-Das Setup bietet zwei Modi:
-
-1. **Direkt über IP:3000** – sinnvoll wenn 80/443 bereits belegt sind.
-2. **Domain + HTTPS über Caddy** – benötigt freie Ports 80/443.
-
-Bei Direktmodus lautet die URL z. B.:
-
-```text
-http://159.195.109.20:3000
-```
-
-Discord Redirect:
-
-```text
-http://159.195.109.20:3000/auth/discord/callback
-```
-
-Bei Domainmodus z. B.:
-
-```text
-https://status.example.com/auth/discord/callback
-```
-
-## Discord OAuth Application
-
-Im Discord Developer Portal eine Application für den Panel-Login verwenden. Unter OAuth2 -> Redirects exakt die vom Setup ausgegebene Callback-URL eintragen. Das Panel fordert nur `identify` an.
-
-Die Status-Bots selbst sind separate reguläre Discord Bot Accounts. Jeder Status-Bot benötigt seinen eigenen Bot Token.
-
-## User-Modell
-
-Erster Login eines neuen Discord Accounts:
-
-```text
-role = user
-statusBotLimit = 1
-customBotLimit = 0
-```
-
-Accounts in `ADMIN_DISCORD_IDS` werden automatisch Admins.
-
-Im Adminbereich `/users` kannst du z. B. setzen:
-
-```text
-User A: Status 1 / Custom 0
-User B: Status 5 / Custom 1
-User C: Status 10 / Custom 3
-```
-
-## FiveM
-
-Basis-URL z. B.:
-
-```text
-http://1.2.3.4:30120
-```
-
-Das Panel liest `dynamic.json` und `players.json`.
-
-## WARDOGS
-
-Basis-URL z. B.:
-
-```text
-http://1.2.3.4:7776
-```
-
-Dazu RCON/Bearer-Passwort. Abfrage: `/v1/status`.
-
-## GameDig
-
-Beispiel Minecraft:
-
-```text
-Game-ID: minecraft
-Host: play.example.com
-Port: 25565
-```
-
-GameDig unterstützt sehr viele Game-Query-Protokolle. Je nach Spiel ist statt des Gameports ein Query-Port nötig.
-
-## Generische JSON API
-
-Beispiel JSON:
-
-```json
-{
-  "players": { "current": 12, "max": 64 },
-  "map": "Arena",
-  "serverName": "EU #1"
-}
-```
-
-Standardpfade:
-
-```text
-players.current
-players.max
-map
-serverName
-```
-
-Optional kann ein Bearer Token gespeichert werden.
-
-## Custom Bot ZIP Format
-
-Node Beispiel:
-
-```text
-my-bot.zip
-├── index.js
-└── package.json
-```
-
-Entrypoint: `index.js`
-
-Python Beispiel:
-
-```text
-my-bot.zip
-├── bot.py
-└── requirements.txt
-```
-
-Entrypoint: `bot.py`
-
-Secrets nicht in die ZIP packen. Im Panel als ENV eintragen:
-
-```text
-DISCORD_TOKEN=...
-API_KEY=...
-```
-
-## Update von GitHub
-
-```bash
-cd /opt/server-status-hub
-./update.sh
-```
-
-Das Skript führt `git pull --ff-only` aus, korrigiert die Rechte für `data/` und `custom-bots/` und baut den Stack neu.
-
-Wenn dein bestehender Clone noch `/opt/wardogs-status-panel` heißt, ist das ebenfalls okay:
+## Update
 
 ```bash
 cd /opt/wardogs-status-panel
-./update.sh
+git config core.fileMode false
+git pull --ff-only
+bash ./update.sh
 ```
 
-## Rechte-Fix
+`.env`, `data/` und `custom-bots/` gehören nicht auf GitHub.
 
-Das Setup und `update.sh` setzen automatisch:
+## Wichtige URLs
+
+Bei direktem IP-Betrieb:
 
 ```text
-data/        -> UID/GID 1000:1000
-custom-bots/ -> UID/GID 1000:1000
+http://DEINE-IP:3000
+http://DEINE-IP:3000/auth/discord/callback
 ```
 
-Damit tritt der frühere Fehler `EACCES: permission denied, open '/app/data/db.tmp'` nicht mehr auf.
-
-## Diagnose / Backup
-
-```bash
-./doctor.sh
-./backup.sh
-```
-
-Backup enthält `.env`, Datenbank und Custom-Bot-Uploads und damit sensible Daten. Nicht öffentlich hochladen.
-
-## Architektur
+Später mit Domain:
 
 ```text
-Internet
-   |
-   +--> :3000 direkt ODER Caddy :80/:443
-                |
-          Server Status Hub
-            |        |
-            |        +--> Discord Status Bots
-            |        +--> FiveM/WARDOGS/GameDig/JSON Queries
-            |
-            +--> interner Runner ----> Docker Socket
-                      |
-                      +--> isolierter Custom Bot #1
-                      +--> isolierter Custom Bot #2
+https://status-hub.lol
+https://status-hub.lol/auth/discord/callback
 ```
 
-`data/`, `custom-bots/` und `.env` sind in `.gitignore` und dürfen nicht nach GitHub gepusht werden.
+Die tatsächliche `PUBLIC_URL` erst umstellen, wenn DNS und HTTPS für die Domain eingerichtet sind. Das Branding kann bereits vorher `status-hub.lol` verwenden.

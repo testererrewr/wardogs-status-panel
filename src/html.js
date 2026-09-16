@@ -1,57 +1,121 @@
+import { gameDigCatalog, gameDigMeta, gameDigFieldDefs, specialCatalogEntries } from './game-catalog.js';
+import { tr } from './i18n.js';
+
 export function esc(value = '') {
   return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 }
 
-export function layout({ title, body, user, csrf, flash }) {
+function jsonScript(value) { return JSON.stringify(value).replaceAll('<', '\\u003c').replaceAll('>', '\\u003e').replaceAll('&', '\\u0026'); }
+function selected(a, b) { return a === b ? 'selected' : ''; }
+
+export function layout({ title, body, user, csrf, flash, lang = 'de' }) {
   const nav = user ? `
   <header class="topbar">
     <a class="brand" href="/">Server Status Hub</a>
-    <nav><a href="/">Status Bots</a><a href="/custom-bots">Custom Bots</a>${user.role === 'admin' ? '<a href="/users">Benutzer</a>' : ''}
+    <nav><a href="/">${tr(lang,'Status Bots','Status Bots')}</a><a href="/games">${tr(lang,'Games & FAQ','Games & FAQ')}</a><a href="/get-more">${tr(lang,'Mehr gratis','Get more')}</a><a href="/plans">${tr(lang,'Premium','Premium')}</a><a href="/bot-services">${tr(lang,'Bot Services','Bot Services')}</a><a href="/donate">${tr(lang,'Spenden','Donate')}</a><a href="/team">Team</a><a href="/custom-bots">Custom Bots</a>${user.role === 'admin' ? `<a href="/nodes">${tr(lang,'Node Manager','Node Manager')}</a><a href="/users">${tr(lang,'Benutzer','Users')}</a><a href="/admin/bot-services">${tr(lang,'Bot Services verwalten','Manage Bot Services')}</a><a href="/admin/settings">${tr(lang,'Einstellungen','Settings')}</a>` : ''}
     <form method="post" action="/logout" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="linkbtn">Logout</button></form></nav>
-    <div class="userchip">${user.avatarUrl ? `<img src="${esc(user.avatarUrl)}" alt="">` : ''}<span>${esc(user.globalName || user.username || user.discordId)}</span></div>
-  </header>` : '';
-  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · Server Status Hub</title><link rel="stylesheet" href="/style.css"></head>
-  <body>${nav}<main class="container">${flash ? `<div class="flash ${esc(flash.type)}">${esc(flash.message)}</div>` : ''}${body}</main></body></html>`;
+    <div class="top-actions"><div class="langswitch"><a class="${lang==='de'?'active':''}" href="/language/de">DE</a><a class="${lang==='en'?'active':''}" href="/language/en">EN</a></div><div class="userchip">${user.avatarUrl ? `<img src="${esc(user.avatarUrl)}" alt="">` : ''}<span>${esc(user.globalName || user.username || user.discordId)}</span></div></div>
+  </header>` : `
+  <header class="topbar publicbar">
+    <a class="brand" href="/login">Server Status Hub</a>
+    <nav><a href="/games">${tr(lang,'Games & FAQ','Games & FAQ')}</a><a href="/plans">Premium</a><a href="/bot-services">${tr(lang,'Bot Services','Bot Services')}</a><a href="/donate">${tr(lang,'Spenden','Donate')}</a><a href="/team">Team</a><a href="/login">${tr(lang,'Login mit Discord','Login with Discord')}</a></nav>
+    <div class="langswitch"><a class="${lang==='de'?'active':''}" href="/language/de">DE</a><a class="${lang==='en'?'active':''}" href="/language/en">EN</a></div>
+  </header>`;
+  return `<!doctype html><html lang="${esc(lang)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · Server Status Hub</title><link rel="stylesheet" href="/style.css"></head><body>${nav}<main class="container">${flash ? `<div class="flash ${esc(flash.type)}">${esc(flash.message)}</div>` : ''}${body}</main></body></html>`;
 }
 
-function selected(a, b) { return a === b ? 'selected' : ''; }
+function localizedFieldLabel(label, lang) {
+  if (lang !== 'en') return label;
+  const map = new Map([
+    ['Discord Guild ID','Discord Guild ID'],['API Benutzer','API user'],['Admin Passwort','Admin password'],['Farming Simulator Webinterface-Code','Farming Simulator web interface code'],['TShock REST Token','TShock REST token'],['Telnet Port','Telnet port'],['Telnet Passwort','Telnet password'],['Zusatzdaten über Telnet abrufen','Fetch extra data via Telnet'],['Account ID','Account ID'],['API Key','API key'],['Server ID','Server ID'],['Auth Token','Auth token'],['Nur gültige HTTPS-Zertifikate akzeptieren','Require valid HTTPS certificates'],['XML-RPC Login','XML-RPC login'],['XML-RPC Passwort','XML-RPC password'],['TeamSpeak Query Port','TeamSpeak query port'],['Zusätzliche Server-Regeln abrufen','Fetch additional server rules'],['Public Server ID','Public server ID'],['Account E-Mail','Account email'],['Access Token','Access token'],['Account Passwort','Account password']
+  ]);
+  return map.get(label) || label;
+}
 
-export function serverForm({ server = {}, csrf, isEdit = false, isAdmin = false }) {
+function extraGameFields(server, isEdit, lang) {
+  const cfg = server.queryConfig || {};
+  const options = cfg.extraOptions || {};
+  const ids = gameDigCatalog().filter((g) => g.fields.length || g.note).map((g) => g.id);
+  return ids.map((gameId) => {
+    const meta = gameDigMeta(gameId);
+    const fields = gameDigFieldDefs(gameId).map((field) => {
+      const name = `gd_${field.key}`;
+      const stored = options[field.key];
+      const label = localizedFieldLabel(field.label, lang);
+      if (field.type === 'checkbox') return `<label class="check"><input name="${esc(name)}" type="checkbox" value="1" ${stored ? 'checked' : ''}> ${esc(label)}</label>`;
+      const type = field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text';
+      const value = field.secret ? '' : (stored ?? field.default ?? '');
+      const placeholder = field.secret && isEdit ? tr(lang,'Leer = unverändert','Leave empty to keep current') : (field.placeholder || '');
+      return `<label>${esc(label)}<input name="${esc(name)}" type="${type}" ${type === 'number' ? 'min="1" max="65535"' : ''} autocomplete="${field.secret ? 'new-password' : 'off'}" value="${esc(value)}" placeholder="${esc(placeholder)}"></label>`;
+    }).join('');
+    return `<div class="gamedig-extra" data-game-id="${esc(gameId)}" hidden>${meta?.note ? `<div class="help span2"><strong>${esc(meta.name)}:</strong> ${esc(meta.note)}</div>` : ''}${fields}</div>`;
+  }).join('');
+}
+
+export function serverForm({ server = {}, csrf, isEdit = false, isAdmin = false, lang = 'de' }) {
   const id = server.id || '';
   const cfg = server.queryConfig || {};
   const type = server.gameType || 'fivem';
+  const catalog = gameDigCatalog().map((g) => ({ id: g.id, name: g.name, defaultPort: g.defaultPort, protocol: g.protocol, hostMode: g.hostMode, note: g.note }));
+  const currentGameId = cfg.gameId || 'minecraft';
+  const currentMeta = gameDigMeta(currentGameId) || gameDigMeta('minecraft') || catalog[0] || { id: currentGameId, name: currentGameId };
+  const defaultTemplates = type === 'text_only' ? [tr(lang,'Willkommen auf unserem Discord','Welcome to our Discord'), tr(lang,'Mehr Infos im Server','More info in the server')] : [tr(lang,'{players}/{max} Spieler online','{players}/{max} players online'),'Map: {map}'];
   return `<form method="post" action="${isEdit ? `/servers/${esc(id)}/edit` : '/servers/new'}" class="panel formgrid" id="serverForm">
     <input type="hidden" name="_csrf" value="${esc(csrf)}">
-    <label>Servername<input name="name" required maxlength="80" value="${esc(server.name || '')}" placeholder="Mein Gameserver"></label>
-    <label>Servertyp<select name="gameType" id="gameType"><option value="fivem" ${selected(type,'fivem')}>FiveM</option><option value="wardogs" ${selected(type,'wardogs')}>WARDOGS</option><option value="gamedig" ${selected(type,'gamedig')}>GameDig (300+ Games)</option><option value="generic_json" ${selected(type,'generic_json')}>Generische JSON API</option></select></label>
-    <label>Discord Bot Token<input name="botToken" ${isEdit ? '' : 'required'} type="password" autocomplete="new-password" placeholder="${isEdit ? 'Leer = unverändert' : 'Bot Token'}"></label>
-    <label>Abfrage-Intervall (Sek.)<input name="intervalSeconds" type="number" min="10" max="3600" value="${esc(server.intervalSeconds || 30)}"></label>
-
-    <div class="span2 gamebox" data-types="fivem wardogs"><h3>HTTP Serveradresse</h3><label>Basis-URL<input name="baseUrl" value="${esc(cfg.baseUrl || '')}" placeholder="http://1.2.3.4:30120"></label></div>
-    <div class="span2 gamebox" data-types="wardogs"><h3>WARDOGS</h3><label>RCON/Bearer Passwort<input name="querySecret" type="password" autocomplete="new-password" placeholder="${isEdit ? 'Leer = unverändert' : 'RCON Passwort'}"></label></div>
-    <div class="span2 gamebox" data-types="gamedig"><h3>GameDig</h3><div class="formgrid inner"><label>Host / IP<input name="queryHost" value="${esc(cfg.host || '')}" placeholder="play.example.com"></label><label>Port (optional)<input name="queryPort" type="number" min="1" max="65535" value="${esc(cfg.port || '')}" placeholder="25565"></label><label>GameDig Game-ID<input name="gameId" value="${esc(cfg.gameId || '')}" placeholder="minecraft"></label><div class="help">GameDig unterstützt über 300 Games. Verwende die jeweilige Game-ID, z. B. <code>minecraft</code>.</div></div></div>
-    <div class="span2 gamebox" data-types="generic_json"><h3>Generische JSON API</h3><div class="formgrid inner"><label class="span2">JSON URL<input name="jsonUrl" value="${esc(cfg.url || '')}" placeholder="https://status.example.com/server.json"></label><label>Spieler-Pfad<input name="currentPath" value="${esc(cfg.currentPath || 'players.current')}"></label><label>Max-Pfad<input name="maxPath" value="${esc(cfg.maxPath || 'players.max')}"></label><label>Map-Pfad<input name="mapPath" value="${esc(cfg.mapPath || 'map')}"></label><label>Name-Pfad<input name="namePath" value="${esc(cfg.namePath || 'serverName')}"></label><label class="span2">Bearer Token (optional)<input name="genericToken" type="password" autocomplete="new-password" placeholder="${isEdit ? 'Leer = unverändert' : 'optional'}"></label></div></div>
-
-    ${isAdmin ? `<label class="check span2"><input name="allowPrivateTarget" type="checkbox" value="1" ${server.allowPrivateTarget ? 'checked' : ''}> Private/LAN/localhost-Ziele erlauben (Admin-Option)</label>` : ''}
-    <label>Status-Wechsel (Sek.)<input name="switchSeconds" type="number" min="5" max="3600" value="${esc(server.switchSeconds || 15)}"></label>
-    <label>Status offline<input name="offlineTemplate" maxlength="128" value="${esc(server.offlineTemplate || 'Server offline')}"></label>
-    <label class="span2">Online-Status Rotation<textarea name="onlineTemplates" rows="5" maxlength="1290">${esc((Array.isArray(server.onlineTemplates) && server.onlineTemplates.length ? server.onlineTemplates : ['{players}/{max} Spieler online','Map: {map}']).join('\n'))}</textarea></label>
-    <label class="check"><input name="enabled" type="checkbox" value="1" ${server.enabled !== false ? 'checked' : ''}> Bot aktivieren</label>
-    <div class="span2 help">Eine Zeile = ein Status. Platzhalter: <code>{players}</code>, <code>{max}</code>, <code>{server}</code>, <code>{map}</code>, <code>{game}</code>, <code>{ping}</code>. Secrets werden verschlüsselt gespeichert.</div>
-    <div class="span2 actions"><a class="button ghost" href="/">Abbrechen</a><button class="button primary" type="submit">${isEdit ? 'Speichern & neu starten' : 'Status Bot erstellen'}</button></div>
+    <label>${tr(lang,'Servername','Server name')}<input name="name" required maxlength="80" value="${esc(server.name || '')}" placeholder="${tr(lang,'Mein Gameserver','My game server')}"></label>
+    <label>${tr(lang,'Servertyp','Server type')}<select name="gameType" id="gameType"><option value="fivem" ${selected(type,'fivem')}>FiveM</option><option value="wardogs" ${selected(type,'wardogs')}>WARDOGS</option><option value="gamedig" ${selected(type,'gamedig')}>GameDig · 320+ Games</option><option value="generic_json" ${selected(type,'generic_json')}>${tr(lang,'Generische JSON API','Generic JSON API')}</option><option value="text_only" ${selected(type,'text_only')}>${tr(lang,'Nur Text-Rotation','Text-only rotation')}</option></select></label>
+    <label>Discord Bot Token<input name="botToken" ${isEdit ? '' : 'required'} type="password" autocomplete="new-password" placeholder="${isEdit ? tr(lang,'Leer = unverändert','Leave empty to keep current') : 'Bot Token'}"></label>
+    <label class="query-interval-field">${tr(lang,'Abfrage-Intervall (Sek.)','Query interval (sec.)')}<input name="intervalSeconds" type="number" min="10" max="3600" value="${esc(server.intervalSeconds || 30)}"></label>
+    <div class="span2 gamebox" data-types="fivem wardogs"><h3>${tr(lang,'HTTP Serveradresse','HTTP server address')}</h3><label>${tr(lang,'Basis-URL','Base URL')}<input name="baseUrl" value="${esc(cfg.baseUrl || '')}" placeholder="http://1.2.3.4:30120"></label></div>
+    <div class="span2 gamebox" data-types="wardogs"><h3>WARDOGS</h3><label>${tr(lang,'RCON/Bearer Passwort','RCON/Bearer password')}<input name="querySecret" type="password" autocomplete="new-password" placeholder="${isEdit ? tr(lang,'Leer = unverändert','Leave empty to keep current') : 'RCON password'}"></label></div>
+    <div class="span2 gamebox" data-types="gamedig"><h3>${tr(lang,'GameDig Spiel auswählen','Select GameDig game')}</h3>
+      <div class="gamepicker"><label class="span2">${tr(lang,'Spiel suchen','Search game')}<input id="gameSearch" type="search" autocomplete="off" value="${esc(currentMeta.name || currentGameId)}" placeholder="Minecraft, Rust, ARK, Counter-Strike 2 ..."><input type="hidden" name="gameId" id="gameId" value="${esc(currentMeta.id || currentGameId)}"></label><div id="gameResults" class="game-results" hidden></div><div id="selectedGame" class="selected-game span2"></div></div>
+      <div class="formgrid inner game-host-fields"><label id="hostLabel">Host / IP<input id="queryHost" name="queryHost" value="${esc(cfg.host || '')}" placeholder="play.example.com"></label><label>${tr(lang,'Server-/Query-Port','Server/query port')}<input id="queryPort" name="queryPort" type="number" min="1" max="65535" value="${esc(cfg.port || '')}" placeholder="${tr(lang,'automatisch','automatic')}"></label></div>
+      <div id="gameSpecificFields" class="formgrid inner special-fields">${extraGameFields(server, isEdit, lang)}</div>
+      <div class="help">${tr(lang,'Das Panel kennt GameDig-IDs und Standardports automatisch.','The panel knows GameDig IDs and default ports automatically.')} <a href="/games" target="_blank" rel="noopener">${tr(lang,'Alle Games & Features','All games & features')}</a>.</div>
+    </div>
+    <div class="span2 gamebox" data-types="text_only"><h3>${tr(lang,'Nur Text-Rotation','Text-only rotation')}</h3><div class="help">${tr(lang,'Keine Gameserver-Abfrage. Der Bot wechselt nur zwischen deinen Texten und zählt trotzdem als normaler Status-Bot im Plan.','No game server query. The bot only rotates through your texts and still counts as a normal status bot in your plan.')}</div></div>
+    <div class="span2 gamebox" data-types="generic_json"><h3>${tr(lang,'Generische JSON API','Generic JSON API')}</h3><div class="formgrid inner"><label class="span2">JSON URL<input name="jsonUrl" value="${esc(cfg.url || '')}" placeholder="https://status.example.com/server.json"></label><label>${tr(lang,'Spieler-Pfad','Players path')}<input name="currentPath" value="${esc(cfg.currentPath || 'players.current')}"></label><label>${tr(lang,'Max-Pfad','Max path')}<input name="maxPath" value="${esc(cfg.maxPath || 'players.max')}"></label><label>${tr(lang,'Map-Pfad','Map path')}<input name="mapPath" value="${esc(cfg.mapPath || 'map')}"></label><label>${tr(lang,'Name-Pfad','Name path')}<input name="namePath" value="${esc(cfg.namePath || 'serverName')}"></label><label class="span2">Bearer Token (${tr(lang,'optional','optional')})<input name="genericToken" type="password" autocomplete="new-password" placeholder="${isEdit ? tr(lang,'Leer = unverändert','Leave empty to keep current') : tr(lang,'optional','optional')}"></label></div></div>
+    ${isAdmin ? `<label class="check span2"><input name="allowPrivateTarget" type="checkbox" value="1" ${server.allowPrivateTarget ? 'checked' : ''}> ${tr(lang,'Private/LAN/localhost-Ziele erlauben','Allow private/LAN/localhost targets')}</label>` : ''}
+    <label>${tr(lang,'Status-Wechsel (Sek.)','Status rotation (sec.)')}<input name="switchSeconds" type="number" min="5" max="3600" value="${esc(server.switchSeconds || 15)}"></label>
+    <label class="offline-status-field">${tr(lang,'Status offline','Offline status')}<input name="offlineTemplate" maxlength="128" value="${esc(server.offlineTemplate || tr(lang,'Server offline','Server offline'))}"></label>
+    <label class="span2">${tr(lang,'Status-Texte / Rotation','Status texts / rotation')}<textarea name="onlineTemplates" rows="5" maxlength="1290">${esc((Array.isArray(server.onlineTemplates) && server.onlineTemplates.length ? server.onlineTemplates : defaultTemplates).join('\n'))}</textarea></label>
+    <label class="check"><input name="enabled" type="checkbox" value="1" ${server.enabled !== false ? 'checked' : ''}> ${tr(lang,'Bot aktivieren','Enable bot')}</label>
+    <div class="span2 help template-help">${tr(lang,'Eine Zeile = ein Status. Platzhalter:','One line = one status. Placeholders:')} <code>{players}</code>, <code>{max}</code>, <code>{server}</code>, <code>{map}</code>, <code>{game}</code>, <code>{ping}</code>.</div>
+    <div class="span2 actions"><a class="button ghost" href="/">${tr(lang,'Abbrechen','Cancel')}</a><button class="button primary" type="submit">${isEdit ? tr(lang,'Speichern & neu starten','Save & restart') : tr(lang,'Status Bot erstellen','Create status bot')}</button></div>
   </form>
-  <script>const s=document.getElementById('gameType');function show(){document.querySelectorAll('.gamebox').forEach(x=>x.style.display=x.dataset.types.split(' ').includes(s.value)?'block':'none')}s.addEventListener('change',show);show();</script>`;
+  <script type="application/json" id="gameCatalogData">${jsonScript(catalog)}</script>
+  <script>(()=>{const type=document.getElementById('gameType'),search=document.getElementById('gameSearch'),hidden=document.getElementById('gameId'),results=document.getElementById('gameResults'),selectedBox=document.getElementById('selectedGame'),port=document.getElementById('queryPort'),host=document.getElementById('queryHost'),hostLabel=document.getElementById('hostLabel'),catalog=JSON.parse(document.getElementById('gameCatalogData').textContent),byId=new Map(catalog.map(g=>[g.id,g]));function showType(){document.querySelectorAll('.gamebox').forEach(x=>x.style.display=x.dataset.types.split(' ').includes(type.value)?'block':'none');document.querySelectorAll('.query-interval-field,.offline-status-field').forEach(x=>x.style.display=type.value==='text_only'?'none':'block');document.querySelectorAll('.template-help').forEach(x=>x.style.display=type.value==='text_only'?'none':'block')}function renderSelected(id,fillPort){const g=byId.get(id);if(!g)return;hidden.value=g.id;search.value=g.name;selectedBox.textContent='';const title=document.createElement('strong');title.textContent=g.name;const info=document.createElement('span');info.className='muted';info.textContent='GameDig ID: '+g.id+(g.protocol?' · '+g.protocol:'')+(g.defaultPort?' · Port '+g.defaultPort:'');selectedBox.append(title,info);if(g.note){const n=document.createElement('span');n.className='small muted';n.textContent=g.note;selectedBox.append(n)}port.placeholder=g.defaultPort?String(g.defaultPort):'${tr(lang,'automatisch','automatic')}';if(fillPort&&g.defaultPort&&(!port.value||port.dataset.auto==='1')){port.value=String(g.defaultPort);port.dataset.auto='1'}host.required=g.hostMode==='required';hostLabel.firstChild.textContent=g.hostMode==='none'?'Host / IP (${tr(lang,'nicht benötigt','not required')})':g.hostMode==='optional'?'Host / IP (${tr(lang,'optional bei Server ID','optional with server ID')})':'Host / IP';document.querySelectorAll('.gamedig-extra').forEach(x=>x.hidden=x.dataset.gameId!==g.id)}function renderResults(){const q=search.value.trim().toLowerCase(),list=catalog.filter(g=>!q||g.name.toLowerCase().includes(q)||g.id.toLowerCase().includes(q)||(g.protocol||'').toLowerCase().includes(q)).slice(0,24);results.textContent='';for(const g of list){const b=document.createElement('button');b.type='button';b.className='game-result';const a=document.createElement('span');a.textContent=g.name;const m=document.createElement('small');m.textContent=g.id+(g.defaultPort?' · Port '+g.defaultPort:'');b.append(a,m);b.addEventListener('mousedown',e=>{e.preventDefault();renderSelected(g.id,true);results.hidden=true});results.append(b)}results.hidden=list.length===0}type.addEventListener('change',showType);showType();search.addEventListener('focus',renderResults);search.addEventListener('input',renderResults);search.addEventListener('blur',()=>setTimeout(()=>results.hidden=true,150));port.addEventListener('input',()=>port.dataset.auto='0');renderSelected(hidden.value,false)})();</script>`;
 }
 
-export function customBotForm({ csrf }) {
-  return `<form method="post" action="/custom-bots/new" enctype="multipart/form-data" class="panel formgrid">
-    <input type="hidden" name="_csrf" value="${esc(csrf)}">
-    <label>Name<input name="name" required maxlength="80" placeholder="Mein Discord Bot"></label>
-    <label>Runtime<select name="runtime"><option value="node22">Node.js 22</option><option value="python313">Python 3.13</option></select></label>
-    <label class="span2">ZIP-Datei<input name="archive" type="file" accept=".zip,application/zip" required></label>
-    <label class="span2">Entrypoint<input name="entrypoint" required value="index.js" placeholder="index.js oder bot.py"></label>
-    <label class="span2">Umgebungsvariablen<textarea name="envText" rows="8" placeholder="DISCORD_TOKEN=...&#10;API_KEY=..."></textarea></label>
-    <div class="span2 warning"><strong>Sicherheitsmodell:</strong> Uploads starten nicht automatisch. Ein Admin muss jeden neuen Upload freigeben. Danach läuft der Bot in einem eigenen Docker-Container mit CPU/RAM/PID-Limits, read-only Root-Dateisystem, ohne Host-Mounts und ohne Linux-Capabilities.</div>
-    <div class="span2 actions"><a class="button ghost" href="/custom-bots">Abbrechen</a><button class="button primary">Hochladen</button></div>
-  </form>`;
+function featureBadges(features, lang) {
+  const map = { 'Spieler':'Players','Slots':'Slots','Map':'Map','Servername':'Server name','Online/Offline':'Online/offline','Spieler*':'Players*','Slots*':'Slots*','Map*':'Map*','Servername*':'Server name*','Spieler eingeschränkt':'Limited players','Map/Gametype':'Map/gametype','Ping':'Ping' };
+  return features.map((x) => `<span class="feature">${esc(lang === 'en' ? (map[x] || x) : x)}</span>`).join('');
+}
+
+export function gamesPage({ loggedIn = false, lang = 'de' } = {}) {
+  const special = specialCatalogEntries();
+  const gd = gameDigCatalog();
+  const textOnlyCard = `<article class="game-card panel" data-game-search="text rotation custom status static text" data-provider="direct"><div class="row between"><div><span class="eyebrow">Discord</span><h2>${tr(lang,'Nur Text-Rotation','Text-only rotation')}</h2></div></div><div class="feature-row"><span class="feature">${tr(lang,'Eigene Texte','Custom texts')}</span><span class="feature">${tr(lang,'Rotation','Rotation')}</span><span class="feature">${tr(lang,'Kein Gameserver nötig','No game server required')}</span></div><p>${tr(lang,'Rotiert frei definierte Discord-Status-Texte und zählt im selben Status-Bot-Limit wie Gameserver-Bots.','Rotates custom Discord status texts and counts against the same status-bot limit as game server bots.')}</p><a class="button ghost" href="/servers/new?type=text_only">${tr(lang,'Text-Bot erstellen','Create text bot')}</a></article>`;
+  const specialCards = textOnlyCard + special.map((g) => `<article class="game-card panel" data-game-search="${esc(`${g.name} ${g.provider} ${g.features.join(' ')}`.toLowerCase())}" data-provider="${esc(g.provider.toLowerCase())}"><div class="row between"><div><span class="eyebrow">${esc(g.provider)}</span><h2>${esc(g.name)}</h2></div>${g.defaultPort ? `<span class="portpill">Port ${esc(g.defaultPort)}</span>` : ''}</div><div class="feature-row">${featureBadges(g.features, lang)}</div><p>${esc(g.note)}</p><a class="button ghost" href="${g.id === 'wardogs' ? '/servers/new?type=wardogs' : g.id === 'fivem-direct' ? '/servers/new?type=fivem' : '/servers/new?type=generic_json'}">${tr(lang,'Status Bot erstellen','Create status bot')}</a></article>`).join('');
+  const gameCards = gd.map((g) => {
+    const features = g.playerDataLimited ? ['Spieler eingeschränkt','Slots*','Map*','Ping','Servername*','Online/Offline'] : ['Spieler*','Slots*','Map*','Ping','Servername*','Online/Offline'];
+    const meta = [g.protocol ? `${tr(lang,'Protokoll','Protocol')}: ${g.protocol}` : '', g.defaultPort ? `${tr(lang,'Standardport','Default port')}: ${g.defaultPort}` : '', g.releaseYear ? `Release: ${g.releaseYear}` : ''].filter(Boolean).join(' · ');
+    return `<article class="game-card panel" data-game-search="${esc(`${g.name} ${g.id} ${g.protocol} ${g.note}`.toLowerCase())}" data-provider="gamedig"><div class="row between"><div><span class="eyebrow">GameDig · ${esc(g.id)}</span><h2>${esc(g.name)}</h2></div>${g.defaultPort ? `<span class="portpill">Port ${esc(g.defaultPort)}</span>` : ''}</div><div class="feature-row">${featureBadges(features, lang)}</div>${meta ? `<p class="muted small">${esc(meta)}</p>` : ''}${g.note ? `<div class="game-note">${esc(g.note)}</div>` : `<p class="muted small">${tr(lang,'* Verfügbarkeit hängt vom Gameserver und Query-Protokoll ab.','* Availability depends on the game server and query protocol.')}</p>`}<a class="button ghost" href="/servers/new?type=gamedig&game=${encodeURIComponent(g.id)}">${tr(lang,'Diesen Typ verwenden','Use this game')}</a></article>`;
+  }).join('');
+  return `<div class="pagehead games-head"><div><h1>${tr(lang,'Games & FAQ','Games & FAQ')}</h1><p>${gd.length}+ GameDig ${tr(lang,'Typen plus WARDOGS, FiveM und JSON.','types plus WARDOGS, FiveM and JSON.')}</p></div>${loggedIn ? `<a class="button primary" href="/servers/new">+ ${tr(lang,'Status Bot','Status Bot')}</a>` : `<a class="button discord" href="/login">${tr(lang,'Mit Discord starten','Start with Discord')}</a>`}</div>
+  <section class="panel game-explainer"><strong>${tr(lang,'Welche Daten zeigt ein Bot?','What data can a bot show?')}</strong><span><code>{players}</code>, <code>{max}</code>, <code>{map}</code>, <code>{server}</code>, <code>{game}</code>, <code>{ping}</code>. ${tr(lang,'Die tatsächlichen Werte hängen vom Spiel ab.','Actual values depend on the game.')}</span></section>
+  <div class="game-toolbar"><input id="gamesSearch" type="search" placeholder="${tr(lang,'Spiel suchen, z. B. Rust, Minecraft, ARK, CS2 ...','Search games, e.g. Rust, Minecraft, ARK, CS2 ...')}"><select id="gamesProvider"><option value="all">${tr(lang,'Alle Anbindungen','All providers')}</option><option value="direct">${tr(lang,'Direkte Anbindung','Direct')}</option><option value="direkt">WARDOGS/FiveM</option><option value="gamedig">GameDig</option><option value="json">JSON API</option></select><span id="gamesCount" class="muted"></span></div>
+  <section id="gamesGrid" class="games-grid">${specialCards}${gameCards}</section>
+  <section class="faq-section"><h2>FAQ</h2>
+    <details class="panel"><summary>${tr(lang,'Was ist GameDig?','What is GameDig?')}</summary><p>${tr(lang,'GameDig fragt öffentliche Gameserver-Query-Protokolle ab. Spiel auswählen, Host/IP und bei Bedarf den Query-Port eintragen.','GameDig queries public game server protocols. Select the game, enter host/IP and the query port when needed.')}</p></details>
+    <details class="panel"><summary>${tr(lang,'Warum fehlen bei manchen Spielen Werte?','Why are some values missing for certain games?')}</summary><p>${tr(lang,'Nicht jedes Spiel liefert dieselben Daten. Der Bot verwendet alle Werte, die verfügbar sind.','Not every game exposes the same data. The bot uses every value that is available.')}</p></details>
+    <details class="panel"><summary>${tr(lang,'Welchen Port muss ich eintragen?','Which port should I enter?')}</summary><p>${tr(lang,'Das Panel schlägt den GameDig-Standardport vor. Hoster können einen abweichenden Query-Port verwenden.','The panel suggests GameDig’s default port. Hosting providers may use a different query port.')}</p></details>
+    <details class="panel"><summary>WARDOGS</summary><p>${tr(lang,'Direkte /v1/status-Abfrage für Spieler, Slots, Map, Servername und Online/Offline.','Direct /v1/status query for players, slots, map, server name and online/offline.')}</p></details>
+    <details class="panel"><summary>FiveM</summary><p>${tr(lang,'Der direkte Modus nutzt dynamic.json und players.json.','Direct mode uses dynamic.json and players.json.')}</p></details>
+  </section><script>(()=>{const q=document.getElementById('gamesSearch'),p=document.getElementById('gamesProvider'),cards=[...document.querySelectorAll('.game-card')],count=document.getElementById('gamesCount');function f(){const s=q.value.trim().toLowerCase(),pv=p.value;let n=0;for(const c of cards){const ok=(!s||c.dataset.gameSearch.includes(s))&&(pv==='all'||c.dataset.provider===pv);c.hidden=!ok;if(ok)n++}count.textContent=n+' ${tr(lang,'Treffer','results')}'}q.addEventListener('input',f);p.addEventListener('change',f);f()})()</script>`;
+}
+
+export function customBotForm({ csrf, lang = 'de' }) {
+  return `<form method="post" action="/custom-bots/new" enctype="multipart/form-data" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf)}"><label>${tr(lang,'Name','Name')}<input name="name" required maxlength="80" placeholder="${tr(lang,'Mein Discord Bot','My Discord bot')}"></label><label>Runtime<select name="runtime"><option value="node22">Node.js 22</option><option value="python313">Python 3.13</option></select></label><label class="span2">${tr(lang,'ZIP-Datei','ZIP file')}<input name="archive" type="file" accept=".zip,application/zip" required></label><label class="span2">Entrypoint<input name="entrypoint" required value="index.js" placeholder="index.js or bot.py"></label><label class="span2">${tr(lang,'Umgebungsvariablen','Environment variables')}<textarea name="envText" rows="8" placeholder="DISCORD_TOKEN=...&#10;API_KEY=..."></textarea></label><div class="span2 warning"><strong>${tr(lang,'Sicherheit','Security')}:</strong> ${tr(lang,'Uploads benötigen Admin-Freigabe und laufen danach in eingeschränkten Containern.','Uploads require admin approval and then run in restricted containers.')}</div><div class="span2 actions"><a class="button ghost" href="/custom-bots">${tr(lang,'Abbrechen','Cancel')}</a><button class="button primary">${tr(lang,'Hochladen','Upload')}</button></div></form>`;
 }

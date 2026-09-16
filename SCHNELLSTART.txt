@@ -1,16 +1,17 @@
-SERVER STATUS HUB v3 - SCHNELLSTART
+SERVER STATUS HUB v3.6
 
-1) Auf GitHub Dateien committen.
-2) VPS:
-   cd /opt/wardogs-status-panel
-   ./update.sh
+UPDATE VPS:
+cd /opt/wardogs-status-panel
+git config core.fileMode false
+git pull --ff-only
+bash ./update.sh
 
-Neuinstallation:
-   git clone https://github.com/USER/REPO.git /opt/server-status-hub
-   cd /opt/server-status-hub
-   chmod +x *.sh
-   ./setup-vps.sh
+ADMIN:
+Node Manager = Nodes sperren/drainen/Bots verschieben
+Einstellungen = status-hub.lol, Donations, Free-Boost, Supporter
+Benutzer = Premium + Laufzeit + Custom Bot Freigaben
 
-Discord Redirect exakt so eintragen, wie setup-vps.sh ihn ausgibt.
-Neue User registrieren sich selbst mit Discord und erhalten 1 Status Bot.
-Custom Bot Slots werden ausschließlich durch Admins freigeschaltet.
+FREE:
+1 Bot standardmäßig
+bis 5 Bots mit Branding-Channel ganz oben
+alle Free Bots zeigen Powered by status-hub.lol

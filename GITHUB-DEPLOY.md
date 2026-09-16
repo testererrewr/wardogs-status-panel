@@ -1,37 +1,30 @@
-# GitHub Deploy
+# GitHub + Debian Deployment v3.6
 
-## Bestehendes GitHub Repository aktualisieren
+## Repository aktualisieren
 
-Entpacke die neue Version lokal und ersetze die Projektdateien im Repository. **Nicht** hochladen:
+Die ZIP entpacken und den gesamten Inhalt über GitHub `Add file -> Upload files` in das bestehende Repository hochladen. Danach committen.
+
+Nicht hochladen:
 
 ```text
 .env
 data/
 custom-bots/
-backups/
 ```
 
-Dann committen/pushen.
-
-Auf dem VPS:
+## VPS aktualisieren
 
 ```bash
-cd /opt/wardogs-status-panel   # oder dein Clone-Pfad
-./update.sh
+cd /opt/wardogs-status-panel
+git config core.fileMode false
+git pull --ff-only
+bash ./update.sh
 ```
 
-`update.sh` zieht GitHub, korrigiert automatisch die Schreibrechte der persistenten Ordner und baut Panel + Runner neu.
+## Neuen Status Node installieren
 
-## Neuinstallation
+Den fertigen Einzeiler im Adminbereich unter `Node Manager` verwenden. Für Remote Nodes sollte die Control Plane über HTTPS erreichbar sein.
 
-```bash
-sudo apt update
-sudo apt install -y git
-cd /opt
-sudo git clone https://github.com/USER/REPO.git server-status-hub
-cd server-status-hub
-sudo chmod +x *.sh
-sudo ./setup-vps.sh
-```
+## Spätere Domain status-hub.lol
 
-Für private Repositories SSH Deploy Key verwenden.
+Solange DNS/HTTPS noch nicht eingerichtet ist, bleibt `PUBLIC_URL` auf der aktuellen IP/Domain. Die Branding-Domain kann unabhängig davon bereits `status-hub.lol` sein.

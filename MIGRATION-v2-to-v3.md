@@ -12,7 +12,7 @@ Im bestehenden Clone:
 
 ```bash
 cd /opt/wardogs-status-panel
-./update.sh
+bash ./update.sh
 ```
 
 `update.sh` erledigt automatisch:

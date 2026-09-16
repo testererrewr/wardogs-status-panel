@@ -1,9 +1,15 @@
 import { GameDig } from 'gamedig';
+import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { decryptSecret } from './crypto.js';
 import { assertSafeHost, assertSafeUrl } from './target-safety.js';
 
 function baseUrl(value) {
   return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function secretValue(server) {
+  if (typeof server.querySecretPlain === 'string') return server.querySecretPlain;
+  return decryptSecret(server.querySecretEnc);
 }
 
 function num(value, fallback = NaN) {
@@ -60,7 +66,7 @@ async function safeJson(url, options = {}, allowPrivate = false, timeoutMs = 700
 async function queryWardogs(server) {
   const cfg = server.queryConfig || {};
   const url = `${baseUrl(cfg.baseUrl)}/v1/status`;
-  const secret = decryptSecret(server.querySecretEnc);
+  const secret = secretValue(server);
   const data = await safeJson(url, { headers: { Authorization: `Bearer ${secret}` } }, Boolean(server.allowPrivateTarget));
   const current = num(data?.players?.current);
   const max = num(data?.players?.max);
@@ -93,16 +99,37 @@ async function queryGameDig(server) {
   const cfg = server.queryConfig || {};
   const host = String(cfg.host || '').trim();
   const gameId = String(cfg.gameId || '').trim();
-  if (!host || !gameId) throw new Error('GameDig Host und Game-ID sind Pflicht');
-  await assertSafeHost(host, { allowPrivate: Boolean(server.allowPrivateTarget) });
+  const meta = gameDigMeta(gameId);
+  if (!gameId || !meta) throw new Error('Ungültiges oder nicht unterstütztes GameDig-Spiel');
+  if (meta.hostMode === 'required' && !host) throw new Error(`${meta.name}: Host / IP fehlt`);
+  if (host) await assertSafeHost(host, { allowPrivate: Boolean(server.allowPrivateTarget) });
+
   const query = {
     type: gameId,
-    host,
     maxRetries: 0,
     socketTimeout: Math.min(5000, Math.max(1000, Number(cfg.socketTimeout) || 2500)),
     attemptTimeout: Math.min(10000, Math.max(2000, Number(cfg.attemptTimeout) || 6000))
   };
+  if (host) query.host = host;
   if (cfg.port) query.port = Number(cfg.port);
+
+  const defs = gameDigFieldDefs(gameId);
+  const nonSecret = cfg.extraOptions && typeof cfg.extraOptions === 'object' ? cfg.extraOptions : {};
+  let secret = {};
+  const secretRaw = secretValue(server);
+  if (secretRaw) {
+    try { secret = JSON.parse(secretRaw); } catch { secret = {}; }
+  }
+  for (const field of defs) {
+    const source = field.secret ? secret : nonSecret;
+    let value = source[field.key];
+    if (value === '' || value == null || value === false) continue;
+    if (field.type === 'number') value = Number(value);
+    if (field.type === 'checkbox') value = Boolean(value);
+    query[field.key] = value;
+  }
+
+  if (meta.hostMode === 'optional' && !host && !query.serverId) throw new Error(`${meta.name}: Host / IP oder Server ID fehlt`);
   const state = await GameDig.query(query);
   return {
     current: num(state.numplayers, Array.isArray(state.players) ? state.players.length : 0),
@@ -110,14 +137,14 @@ async function queryGameDig(server) {
     map: state.map || '',
     serverName: state.name || '',
     ping: Number.isFinite(Number(state.ping)) ? Number(state.ping) : null,
-    game: gameId
+    game: meta.name || gameId
   };
 }
 
 async function queryGenericJson(server) {
   const cfg = server.queryConfig || {};
   const headers = {};
-  const token = decryptSecret(server.querySecretEnc);
+  const token = secretValue(server);
   if (token) headers.Authorization = `Bearer ${token}`;
   const data = await safeJson(cfg.url, { headers }, Boolean(server.allowPrivateTarget));
   const current = num(getPath(data, cfg.currentPath || 'players.current'));
@@ -144,5 +171,5 @@ export async function fetchServerStatus(server) {
 }
 
 export function gameTypeLabel(type) {
-  return ({ wardogs: 'WARDOGS', fivem: 'FiveM', gamedig: 'GameDig', generic_json: 'Generische JSON API' })[type] || type;
+  return ({ wardogs: 'WARDOGS', fivem: 'FiveM', gamedig: 'GameDig', generic_json: 'Generic JSON API', text_only: 'Text Rotation' })[type] || type;
 }

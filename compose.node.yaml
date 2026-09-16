@@ -1,0 +1,19 @@
+services:
+  status-node:
+    build: .
+    command: ["npm", "run", "status-node"]
+    restart: unless-stopped
+    environment:
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL}
+      STATUS_NODE_JOIN_SECRET: ${STATUS_NODE_JOIN_SECRET}
+      STATUS_NODE_ID: ${STATUS_NODE_ID}
+      STATUS_NODE_NAME: ${STATUS_NODE_NAME}
+      STATUS_NODE_MAX_BOTS: ${STATUS_NODE_MAX_BOTS:-50}
+      STATUS_NODE_SYNC_SECONDS: ${STATUS_NODE_SYNC_SECONDS:-10}
+      STATUS_NODE_TOKEN_FILE: /node-data/token
+      STATUS_NODE_ALLOW_INSECURE: ${STATUS_NODE_ALLOW_INSECURE:-false}
+    volumes:
+      - status_node_data:/node-data
+
+volumes:
+  status_node_data:

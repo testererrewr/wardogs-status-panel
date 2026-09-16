@@ -18,6 +18,24 @@ services:
       retries: 3
       start_period: 20s
 
+  status-node:
+    build: .
+    command: ["npm", "run", "status-node"]
+    restart: unless-stopped
+    depends_on:
+      server-status-hub:
+        condition: service_healthy
+    environment:
+      CONTROL_PLANE_URL: http://server-status-hub:3000
+      STATUS_NODE_JOIN_SECRET: ${STATUS_NODE_JOIN_SECRET}
+      STATUS_NODE_ID: ${LOCAL_STATUS_NODE_ID:-local-main}
+      STATUS_NODE_NAME: ${LOCAL_STATUS_NODE_NAME:-Main VPS}
+      STATUS_NODE_MAX_BOTS: ${LOCAL_STATUS_NODE_MAX_BOTS:-50}
+      STATUS_NODE_SYNC_SECONDS: ${STATUS_NODE_SYNC_SECONDS:-10}
+      STATUS_NODE_TOKEN_FILE: /node-data/token
+    volumes:
+      - status_node_data:/node-data
+
   runner:
     build:
       context: .
@@ -56,5 +74,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  status_node_data:
   caddy_data:
   caddy_config:
