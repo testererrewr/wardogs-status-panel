@@ -6,4 +6,5 @@ COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY src/runner.js ./src/runner.js
 EXPOSE 4000
+ENTRYPOINT []
 CMD ["node", "src/runner.js"]

@@ -9,7 +9,8 @@ import {
   readDb, findUser, upsertUser, deleteUser, getServer, listServersFor, upsertServer, deleteServer,
   getCustomBot, listCustomBotsFor, upsertCustomBot, deleteCustomBot, assignLegacyOwnership,
   listStatusNodes, getStatusNode, upsertStatusNode, deleteStatusNode, getSiteSettings, updateSiteSettings,
-  listSupporters, upsertSupporter, deleteSupporter, listBotServices, getBotService, upsertBotService, deleteBotService
+  listSupporters, upsertSupporter, deleteSupporter, listBotServices, getBotService, upsertBotService, deleteBotService,
+  createPaypalPurchase, getPaypalPurchase, getPaypalPurchaseByOrder, updatePaypalPurchase, rememberPaypalWebhookEvent, paypalWebhookEventSeen
 } from './db.js';
 import { encryptSecret, decryptSecret } from './crypto.js';
 import { fetchServerStatus, gameTypeLabel } from './server-query.js';
@@ -21,7 +22,8 @@ import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntim
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode } from './cluster.js';
-import { verifyFreeBoostForUser, refreshDueFreeBoosts } from './free-boost.js';
+import { verifyFreeBoostForUser, refreshDueFreeBoosts, freeBoostRanges, recalculateStoredFreeBoostLimits } from './free-boost.js';
+import { paypalConfigured, paypalEnvironment, createCheckoutOrder, getCheckoutOrder, captureCheckoutOrder, extractCompletedCapture, verifyWebhook, ensureWebhook } from './paypal.js';
 
 const required = ['SESSION_SECRET', 'APP_ENCRYPTION_KEY', 'DISCORD_OAUTH_CLIENT_ID', 'DISCORD_OAUTH_CLIENT_SECRET', 'STATUS_NODE_JOIN_SECRET'];
 for (const key of required) if (!process.env[key]) throw new Error(`${key} fehlt in .env`);
@@ -76,6 +78,68 @@ function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').t
 function isAdmin(req) { return currentUser(req)?.role === 'admin'; }
 function statusLimit(user) { return effectivePlan(user).statusBotLimit; }
 function customLimit(user) { return user?.role === 'admin' ? Infinity : Math.max(0, Number(user?.customBotLimit || 0)); }
+
+function normalizedMoney(value) {
+  const raw = String(value ?? '').trim().replace(',', '.');
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) return '';
+  const amount = Number(raw);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 10000) return '';
+  return amount.toFixed(2);
+}
+function paypalAutoConfig(settings = getSiteSettings()) {
+  const auto = settings.premiumSales?.paypalAuto || {};
+  const currency = /^[A-Z]{3}$/.test(String(auto.currency || '').toUpperCase()) ? String(auto.currency).toUpperCase() : 'EUR';
+  const accessDays = Math.max(1, Math.min(3650, Number(auto.accessDays) || 30));
+  const amounts = {};
+  for (const id of ['premium5','premium10','premium15','premium20']) amounts[id] = normalizedMoney(auto.amounts?.[id]);
+  return { ...auto, currency, accessDays, amounts };
+}
+function paypalAutoReady(settings = getSiteSettings()) {
+  const auto = paypalAutoConfig(settings);
+  return Boolean(auto.enabled && paypalConfigured() && auto.webhookId);
+}
+function moneyMatches(a, b) { return normalizedMoney(a) === normalizedMoney(b); }
+function applyPaypalPurchase(purchase, capture) {
+  const fresh = getPaypalPurchase(purchase.id);
+  if (!fresh) throw new Error('PayPal purchase not found');
+  if (fresh.appliedAt) return fresh;
+  if (capture.status !== 'COMPLETED') throw new Error('PayPal payment is not completed');
+  if (capture.customId && capture.customId !== fresh.id) throw new Error('PayPal purchase reference mismatch');
+  if (!moneyMatches(capture.amount, fresh.amount) || String(capture.currency || '').toUpperCase() !== String(fresh.currency || '').toUpperCase()) throw new Error('PayPal amount mismatch');
+  const user = findUser(fresh.userDiscordId);
+  if (!user) throw new Error('User for PayPal purchase not found');
+  const days = Math.max(1, Math.min(3650, Number(fresh.accessDays) || 30));
+  const now = Date.now();
+  const existingExpiry = Date.parse(user.planExpiresAt || '');
+  const base = user.planId === fresh.planId && Number.isFinite(existingExpiry) && existingExpiry > now ? existingExpiry : now;
+  const expiresAt = new Date(base + days * 86400_000).toISOString();
+  upsertUser({ discordId: user.discordId, planId: fresh.planId, planExpiresAt: expiresAt, premiumSource: { provider: 'paypal', purchaseId: fresh.id, captureId: capture.captureId || fresh.captureId || '' } });
+  const updated = updatePaypalPurchase(fresh.id, { status: 'completed', captureId: capture.captureId || fresh.captureId || '', completedAt: fresh.completedAt || new Date().toISOString(), appliedAt: new Date().toISOString(), entitlementExpiresAt: expiresAt });
+  rebalanceAssignments();
+  return updated;
+}
+function revokePaypalPurchase(purchase, reason) {
+  if (!purchase) return;
+  const user = findUser(purchase.userDiscordId);
+  updatePaypalPurchase(purchase.id, { status: reason, revokedAt: new Date().toISOString() });
+  if (user?.premiumSource?.provider === 'paypal' && user.premiumSource.purchaseId === purchase.id) {
+    upsertUser({ discordId: user.discordId, planId: 'free', planExpiresAt: null, premiumSource: null });
+    rebalanceAssignments();
+  }
+}
+function purchaseFromPaypalEvent(event) {
+  const resource = event?.resource || {};
+  const customId = String(resource.custom_id || '');
+  if (customId) {
+    const byId = getPaypalPurchase(customId);
+    if (byId) return byId;
+  }
+  const db = readDb();
+  const related = resource.supplementary_data?.related_ids || {};
+  const orderId = String(related.order_id || resource.order_id || '');
+  const captureId = String(related.capture_id || resource.capture_id || '');
+  return (db.paypalPurchases || []).find((x) => (orderId && x.orderId === orderId) || (captureId && x.captureId === captureId)) || null;
+}
 
 function ownedServer(req, id) {
   const server = getServer(id); const u = currentUser(req);
@@ -203,7 +267,8 @@ app.get('/api/status-nodes/work', requireStatusNode, (req, res) => {
 
 app.get('/login', (req, res) => {
   if (currentUser(req)) return res.redirect('/');
-  render(req, res, 'Login', `<section class="loginbox panel"><h1>Server Status Hub</h1><p>${l(req,'Mit Discord anmelden oder kostenlos registrieren.','Sign in with Discord or register for free.')}</p><a class="button discord" href="/auth/discord">${l(req,'Mit Discord fortfahren','Continue with Discord')}</a><p class="muted small">${l(req,'Neue Accounts erhalten 1 kostenlosen Status-Bot. Mit Server-Branding sind bis zu 5 gratis möglich.','New accounts get 1 free status bot. Server branding can unlock up to 5 for free.')}</p></section>`);
+  const lang = langOf(req);
+  render(req, res, 'Server Status Hub', `<section class="landing-hero"><div class="landing-copy"><span class="eyebrow">status-hub.lol</span><h1>${tr(lang,'Deine Discord Status-Bots. Einfach gehostet.','Your Discord status bots. Hosted simply.')}</h1><p>${tr(lang,'Erstelle Status-Bots für WARDOGS, FiveM, GameDig, JSON-APIs oder reine Text-Rotation. Ein kostenloser Bot ist inklusive.','Create status bots for WARDOGS, FiveM, GameDig, JSON APIs or text-only rotation. One free bot is included.')}</p><div class="actions wrap"><a class="button discord landing-cta" href="/auth/discord">${tr(lang,'Kostenlos mit Discord starten','Start free with Discord')}</a><a class="button ghost" href="/games">${tr(lang,'Unterstützte Games','Supported games')}</a></div><div class="landing-points"><span>✓ ${tr(lang,'1 Bot kostenlos','1 bot free')}</span><span>✓ ${tr(lang,'Deutsch & Englisch','German & English')}</span><span>✓ ${tr(lang,'Automatisch gehostet','Fully hosted')}</span></div></div><div class="landing-preview panel"><div class="preview-status"><span class="dot online"></span><div><strong>EU Server #1</strong><span>42/100 ${tr(lang,'Spieler online','players online')}</span></div></div><div class="preview-status"><span class="dot online"></span><div><strong>Minecraft</strong><span>Map: survival</span></div></div><div class="preview-status"><span class="dot starting"></span><div><strong>${tr(lang,'Text-Rotation','Text rotation')}</strong><span>Powered by status-hub.lol</span></div></div></div></section><section class="landing-features"><article class="panel"><span class="eyebrow">Games</span><h2>320+</h2><p>${tr(lang,'GameDig plus direkte WARDOGS- und FiveM-Anbindungen.','GameDig plus direct WARDOGS and FiveM integrations.')}</p></article><article class="panel"><span class="eyebrow">Free</span><h2>1–5</h2><p>${tr(lang,'Ein Bot gratis. Mit dem Branding-Channel sind je nach Servergröße bis zu 5 möglich.','One bot free. With the branding channel, server size can unlock up to 5.')}</p></article><article class="panel"><span class="eyebrow">Premium</span><h2>5–20</h2><p>${tr(lang,'Mehr Bots und kein Powered-by-Branding.','More bots and no Powered-by branding.')}</p></article></section><section class="landing-bottom panel"><div><h2>${tr(lang,'In wenigen Minuten online','Online in minutes')}</h2><p>${tr(lang,'Discord Bot Token eintragen, Game auswählen und Status konfigurieren. Hosting und Updates übernimmt der Hub.','Enter a Discord bot token, choose a game and configure the status. The Hub handles hosting and updates.')}</p></div><a class="button primary" href="/auth/discord">${tr(lang,'Jetzt starten','Get started')}</a></section>`);
 });
 
 app.get('/auth/discord', rateLimit({ windowMs: 60_000, limit: 20 }), (req, res) => {
@@ -265,18 +330,115 @@ app.get('/bot-services', (req, res) => {
   render(req,res,tr(lang,'Bot Services','Bot Services'),`<div class="pagehead"><div><h1>${tr(lang,'Bots as a Service','Bots as a Service')}</h1><p>${tr(lang,'Einzelne, von status-hub.lol betriebene Spezial-Bots. Diese Produkte sind unabhängig von deinem Status-Bot-Limit.','Individual specialist bots operated by status-hub.lol. These products are separate from your status-bot quota.')}</p></div></div><section class="service-grid">${cards || `<div class="panel empty">${tr(lang,'Noch keine Bot Services veröffentlicht.','No bot services published yet.')}</div>`}</section><div class="panel help service-note"><strong>${tr(lang,'Wichtig','Important')}:</strong> ${tr(lang,'Status-Bot-Pläne und Custom-Bot-Freigaben bleiben davon getrennt. Kaufbare Bot Services sind eigene Managed-Produkte.','Status-bot plans and custom-bot permissions remain separate. Purchasable bot services are independent managed products.')}</div>`);
 });
 
+app.post('/paypal/checkout/:planId', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), checkCsrf, async (req, res) => {
+  const user = currentUser(req);
+  const planId = String(req.params.planId || '');
+  if (!PLANS[planId] || planId === 'free') return res.status(400).send('Invalid premium plan');
+  const settings = getSiteSettings();
+  const auto = paypalAutoConfig(settings);
+  if (!paypalAutoReady(settings)) { flash(req,'err',l(req,'Automatischer PayPal-Checkout ist noch nicht eingerichtet.','Automatic PayPal checkout is not configured yet.')); return res.redirect('/plans'); }
+  const amount = auto.amounts[planId];
+  if (!amount) { flash(req,'err',l(req,'Für diesen Plan ist kein gültiger PayPal-Preis hinterlegt.','No valid PayPal price is configured for this plan.')); return res.redirect('/plans'); }
+  const purchase = createPaypalPurchase({ id: crypto.randomUUID(), provider: 'paypal', userDiscordId: user.discordId, planId, amount, currency: auto.currency, accessDays: auto.accessDays, status: 'creating' });
+  try {
+    const order = await createCheckoutOrder({ purchaseId: purchase.id, planId, amount, currency: auto.currency, returnUrl: `${baseUrl}/paypal/return?purchase=${encodeURIComponent(purchase.id)}`, cancelUrl: `${baseUrl}/paypal/cancel?purchase=${encodeURIComponent(purchase.id)}` });
+    updatePaypalPurchase(purchase.id, { orderId: order.orderId, status: 'approval_pending' });
+    return res.redirect(order.approvalUrl);
+  } catch (error) {
+    updatePaypalPurchase(purchase.id, { status: 'failed', error: String(error.message || error).slice(0,500) });
+    flash(req,'err',`PayPal: ${error.message}`); return res.redirect('/plans');
+  }
+});
+
+app.get('/paypal/return', requireLogin, rateLimit({ windowMs: 60_000, limit: 20 }), async (req, res) => {
+  try {
+    const user = currentUser(req);
+    const purchase = getPaypalPurchase(String(req.query.purchase || '')) || getPaypalPurchaseByOrder(String(req.query.token || ''));
+    if (!purchase || purchase.userDiscordId !== user.discordId) throw new Error('PayPal purchase not found');
+    const orderId = String(req.query.token || purchase.orderId || '');
+    if (!orderId || (purchase.orderId && orderId !== purchase.orderId)) throw new Error('PayPal order mismatch');
+    let order = await getCheckoutOrder(orderId);
+    if (order.status !== 'COMPLETED') order = await captureCheckoutOrder(orderId);
+    const capture = extractCompletedCapture(order);
+    if (capture.status === 'COMPLETED') {
+      applyPaypalPurchase(purchase, capture);
+      flash(req,'ok',l(req,`PayPal-Zahlung erfolgreich. ${PLANS[purchase.planId].label} wurde automatisch freigeschaltet.`,`PayPal payment successful. ${PLANS[purchase.planId].label} was activated automatically.`));
+    } else {
+      updatePaypalPurchase(purchase.id, { status: String(capture.status || order.status || 'pending').toLowerCase() });
+      flash(req,'ok',l(req,'PayPal verarbeitet die Zahlung noch. Premium wird automatisch freigeschaltet, sobald PayPal die Zahlung bestätigt.','PayPal is still processing the payment. Premium will activate automatically as soon as PayPal confirms it.'));
+    }
+  } catch (error) { flash(req,'err',`PayPal: ${error.message}`); }
+  res.redirect('/plans');
+});
+
+app.get('/paypal/cancel', requireLogin, (req, res) => {
+  const purchase = getPaypalPurchase(String(req.query.purchase || ''));
+  const user = currentUser(req);
+  if (purchase && purchase.userDiscordId === user.discordId && !purchase.appliedAt) updatePaypalPurchase(purchase.id, { status: 'cancelled' });
+  flash(req,'err',l(req,'PayPal-Zahlung abgebrochen.','PayPal payment cancelled.'));
+  res.redirect('/plans');
+});
+
+app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async (req, res) => {
+  try {
+    const settings = getSiteSettings();
+    const auto = paypalAutoConfig(settings);
+    if (!paypalConfigured() || !auto.webhookId) return res.status(503).send('PayPal webhook not configured');
+    const event = req.body || {};
+    if (!event.id || !event.event_type) return res.status(400).send('Invalid webhook');
+    if (paypalWebhookEventSeen(event.id)) return res.status(200).send('OK');
+    if (!await verifyWebhook(req.headers, event, auto.webhookId)) return res.status(400).send('Invalid PayPal signature');
+    const purchase = purchaseFromPaypalEvent(event);
+    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
+      if (!purchase) throw new Error('PayPal purchase not found for completed capture');
+      const resource = event.resource || {};
+      applyPaypalPurchase(purchase, { status: resource.status || 'COMPLETED', captureId: resource.id || '', customId: resource.custom_id || purchase.id, amount: resource.amount?.value || '', currency: resource.amount?.currency_code || '' });
+    } else if (event.event_type === 'PAYMENT.CAPTURE.DENIED') {
+      if (purchase) updatePaypalPurchase(purchase.id, { status: 'denied', error: event.summary || 'PayPal capture denied' });
+    } else if (event.event_type === 'PAYMENT.CAPTURE.REFUNDED') {
+      if (purchase) {
+        const refundAmount = event.resource?.amount?.value || '';
+        if (!refundAmount || moneyMatches(refundAmount, purchase.amount)) revokePaypalPurchase(purchase, 'refunded');
+        else updatePaypalPurchase(purchase.id, { status: 'partial_refund', lastRefundAt: new Date().toISOString() });
+      }
+    } else if (event.event_type === 'PAYMENT.CAPTURE.REVERSED') {
+      if (purchase) revokePaypalPurchase(purchase, 'reversed');
+    }
+    rememberPaypalWebhookEvent(event.id, event.event_type);
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('PayPal webhook:', error.message);
+    res.status(500).send('Webhook processing failed');
+  }
+});
+
 app.get('/plans', (req, res) => {
-  const lang = langOf(req); const u = currentUser(req); const current = effectivePlan(u);
-  const cards = Object.values(PLANS).map((p) => `<article class="panel plan-card ${u && current.id===p.id?'current-plan':''}"><span class="eyebrow">${p.id==='free'?tr(lang,'Kostenlos','Free'):'Premium'}</span><h2>${esc(p.label)}</h2><div class="plan-number">${p.statusBotLimit}</div><p>Status Bot${p.statusBotLimit===1?'':'s'}</p><ul><li>${tr(lang,'Alle unterstützten Games','All supported games')}</li><li>${tr(lang,'Status-Rotation, Map & Spieler','Status rotation, map & players')}</li><li>${p.branded?tr(lang,'Powered by status-hub.lol im Free-Status','Powered by status-hub.lol on Free status bots'):tr(lang,'Kein Service-Branding','No service branding')}</li><li>${tr(lang,'Automatische Node-Verteilung','Automatic node distribution')}</li></ul>${u && current.id===p.id?`<span class="badge online">${tr(lang,'Aktueller Plan','Current plan')}</span>`:`<span class="muted small">${tr(lang,'Freischaltung erfolgt durch den Betreiber.','Activation is handled by the operator.')}</span>`}</article>`).join('');
-  render(req,res,'Premium',`<div class="pagehead"><div><h1>Premium</h1><p>${tr(lang,'Free startet mit 1 Bot und kann über Server-Branding auf bis zu 5 Gratis-Bots wachsen. Premium entfernt Branding.','Free starts with 1 bot and can grow to up to 5 free bots through server branding. Premium removes branding.')}</p></div></div><section class="plan-grid">${cards}</section><div class="panel help"><strong>Custom Bots:</strong> ${tr(lang,'bleiben unabhängig und werden nur manuell im Backend freigeschaltet.','remain separate and are enabled manually in the backend only.')}</div>`);
+  const lang = langOf(req); const u = currentUser(req); const current = effectivePlan(u); const settings = getSiteSettings(); const sales = settings.premiumSales || {}; const auto = paypalAutoConfig(settings); const automatic = paypalAutoReady(settings);
+  const discordContact = sales.discordUserId && validSnowflake(sales.discordUserId) ? `https://discord.com/users/${encodeURIComponent(sales.discordUserId)}` : '';
+  const cards = Object.values(PLANS).map((p) => {
+    const automaticPrice = p.id !== 'free' && auto.amounts[p.id] ? `${auto.amounts[p.id]} ${auto.currency} / ${auto.accessDays} ${tr(lang,'Tage','days')}` : '';
+    const price = p.id === 'free' ? tr(lang,'Kostenlos','Free') : (automaticPrice || String(sales.prices?.[p.id] || tr(lang,'Preis auf Anfrage','Price on request')));
+    let action = '';
+    if (p.id !== 'free') {
+      if (automatic && auto.amounts[p.id]) action = u ? `<form method="post" action="/paypal/checkout/${esc(p.id)}"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary" type="submit">${tr(lang,'Jetzt mit PayPal kaufen','Buy now with PayPal')}</button></form>` : `<a class="button primary" href="/login">${tr(lang,'Einloggen & mit PayPal kaufen','Login & buy with PayPal')}</a>`;
+      else if (/^https?:\/\//i.test(String(sales.paypalUrl || ''))) action = `<a class="button primary" href="${esc(sales.paypalUrl)}" target="_blank" rel="noopener">${tr(lang,'Jetzt mit PayPal kaufen','Buy now with PayPal')}</a>`;
+      else if (discordContact) action = `<a class="button primary" href="${esc(discordContact)}" target="_blank" rel="noopener">${tr(lang,'Auf Discord kaufen','Buy via Discord')}</a>`;
+      else if (sales.discordUsername) action = `<div class="plan-contact">${tr(lang,'Zum Kaufen auf Discord anschreiben','Message on Discord to buy')}: <strong>${esc(sales.discordUsername)}</strong></div>`;
+      else if (settings.supportUrl) action = `<a class="button primary" href="${esc(settings.supportUrl)}" target="_blank" rel="noopener">${tr(lang,'Kaufen / Support','Buy / support')}</a>`;
+    }
+    return `<article class="panel plan-card ${u && current.id===p.id?'current-plan':''}"><span class="eyebrow">${p.id==='free'?tr(lang,'Kostenlos','Free'):'Premium'}</span><h2>${esc(p.label)}</h2><div class="plan-number">${p.statusBotLimit}</div><p>Status Bot${p.statusBotLimit===1?'':'s'}</p><div class="plan-price">${esc(price)}</div><ul><li>${tr(lang,'Alle unterstützten Games','All supported games')}</li><li>${tr(lang,'Status-Rotation, Map & Spieler je nach Game','Status rotation, map & players depending on the game')}</li><li>${p.branded?tr(lang,'Powered by status-hub.lol im Free-Status','Powered by status-hub.lol on Free status bots'):tr(lang,'Kein Service-Branding','No service branding')}</li></ul>${u && current.id===p.id?`<div class="actions wrap"><span class="badge online">${tr(lang,'Aktueller Plan','Current plan')}</span>${action}</div>`:action}</article>`;
+  }).join('');
+  const purchaseNote = automatic ? tr(lang,`PayPal ist automatisch angebunden. Nach erfolgreicher Zahlung wird Premium sofort für ${auto.accessDays} Tage freigeschaltet.`,`PayPal is connected automatically. After successful payment, Premium is activated immediately for ${auto.accessDays} days.`) : sales.paypalUrl ? tr(lang,'PayPal-Link ist hinterlegt; Freischaltung erfolgt noch manuell.','A PayPal link is configured; activation is still manual.') : sales.discordUsername ? `${tr(lang,'Aktueller Kaufkontakt','Current purchase contact')}: ${esc(sales.discordUsername)}` : tr(lang,'Kaufkontakt wird noch eingerichtet.','Purchase contact is not configured yet.');
+  render(req,res,'Premium',`<div class="pagehead"><div><h1>Premium</h1><p>${tr(lang,'Free startet mit 1 Bot und kann über Server-Branding auf bis zu 5 Gratis-Bots wachsen. Premium entfernt Branding.','Free starts with 1 bot and can grow to up to 5 free bots through server branding. Premium removes branding.')}</p></div></div><section class="plan-grid">${cards}</section><div class="panel help"><strong>${tr(lang,'Kaufen','Purchase')}:</strong> ${purchaseNote}<br><strong>Custom Bots:</strong> ${tr(lang,'bleiben unabhängig und werden nur manuell im Backend freigeschaltet.','remain separate and are enabled manually in the backend only.')}</div>`);
 });
 
 app.get('/get-more', requireLogin, (req, res) => {
   const lang = langOf(req); const u = currentUser(req); const plan = effectivePlan(u); const settings = getSiteSettings(); const boost = u.freeBoost || {};
-  const tiers = (settings.freeBoost?.tiers || []).map((x) => `<div class="tier"><strong>${esc(x.members)}+</strong><span>${esc(x.limit)} ${tr(lang,'Gratis-Bots gesamt','free bots total')}</span></div>`).join('');
+  const ranges = freeBoostRanges(settings);
+  const tiers = ranges.map((x) => `<div class="tier"><strong>${x.to == null ? `${esc(x.from)}+` : `${esc(x.from)}–${esc(x.to)}`}</strong><span>${esc(x.limit)} ${tr(lang,'Gratis-Bots gesamt','free bots total')}</span></div>`).join('');
   const stateText = boost.state === 'verified' ? `${tr(lang,'Verifiziert','Verified')}: ${esc(boost.guildName || boost.guildId)} · ${esc(boost.memberCount || 0)} ${tr(lang,'Mitglieder','members')} · ${esc(boost.freeBotLimit || 1)} ${tr(lang,'Gratis-Bots','free bots')}` : boost.state === 'missing-brand' ? tr(lang,'Branding-Channel nicht ganz oben gefunden.','Branding channel was not found at the very top.') : boost.state === 'no-bot' ? tr(lang,'Du brauchst zuerst einen Status-Bot, der auf deinem Discord-Server eingeladen ist.','You first need a status bot invited to your Discord server.') : tr(lang,'Noch nicht geprüft.','Not checked yet.');
   const channel = settings.freeBoost?.channelName || 'Powered by status-hub.lol';
-  render(req,res,tr(lang,'Mehr gratis','Get more'),`<div class="pagehead"><div><h1>${tr(lang,'Mehr gratis Status-Bots','Get more free status bots')}</h1><p>${tr(lang,'Free-Accounts können je nach Größe ihres Discord-Servers bis zu 5 Status-Bots gratis nutzen.','Free accounts can use up to 5 status bots for free depending on the size of their Discord server.')}</p></div></div><section class="boost-grid"><article class="panel boost-card"><span class="eyebrow">${tr(lang,'Voraussetzung','Requirement')}</span><h2>${tr(lang,'Branding-Channel ganz oben','Branding channel at the very top')}</h2><p>${tr(lang,'Erstelle auf dem Discord-Server, auf dem dein Status-Bot läuft, einen sichtbaren Channel ganz oben mit diesem Namen:','On the Discord server where your status bot runs, create a visible channel at the very top with this name:')}</p><div class="copybox"><code>${esc(channel)}</code></div><p class="muted small">${tr(lang,'Der Bot muss den Channel sehen können. Free-Bots zeigen zusätzlich immer „Powered by status-hub.lol“ in ihrer Statusrotation.','The bot must be able to see the channel. Free bots also always show “Powered by status-hub.lol” in their status rotation.')}</p></article><article class="panel boost-card"><span class="eyebrow">${tr(lang,'Dein Status','Your status')}</span><h2>${esc(plan.label)}</h2><p>${stateText}</p><form method="post" action="/get-more/verify"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${tr(lang,'Jetzt prüfen','Verify now')}</button></form></article></section><section class="panel boost-tiers"><h2>${tr(lang,'Gratis-Stufen nach Servergröße','Free tiers by server size')}</h2><div class="tier-grid"><div class="tier"><strong>0–49</strong><span>1 ${tr(lang,'Bot','bot')}</span></div>${tiers}</div><p class="muted small">${tr(lang,'Die Stufen sind im Adminbereich konfigurierbar. Die Verifizierung wird regelmäßig erneut geprüft. Wird der Channel entfernt oder verschoben, fällt das Free-Limit wieder zurück.','Tiers are configurable in the admin backend. Verification is checked regularly. If the channel is removed or moved, the Free limit falls back again.')}</p></section><div class="actions"><a class="button ghost" href="/plans">Premium</a>${settings.supportUrl ? `<a class="button ghost" href="${esc(settings.supportUrl)}" target="_blank" rel="noopener">${tr(lang,'Support kontaktieren','Contact support')}</a>` : ''}</div>`);
+  render(req,res,tr(lang,'Mehr gratis','Get more'),`<div class="pagehead"><div><h1>${tr(lang,'Mehr gratis Status-Bots','Get more free status bots')}</h1><p>${tr(lang,'Free-Accounts können je nach Größe ihres Discord-Servers bis zu 5 Status-Bots gratis nutzen.','Free accounts can use up to 5 status bots for free depending on the size of their Discord server.')}</p></div></div><section class="boost-grid"><article class="panel boost-card"><span class="eyebrow">${tr(lang,'Voraussetzung','Requirement')}</span><h2>${tr(lang,'Branding-Channel ganz oben','Branding channel at the very top')}</h2><p>${tr(lang,'Erstelle auf dem Discord-Server, auf dem dein Status-Bot läuft, einen sichtbaren Channel ganz oben mit diesem Namen:','On the Discord server where your status bot runs, create a visible channel at the very top with this name:')}</p><div class="copybox"><code>${esc(channel)}</code></div><p class="muted small">${tr(lang,'Der Bot muss den Channel sehen können. Free-Bots zeigen zusätzlich immer „Powered by status-hub.lol“ in ihrer Statusrotation.','The bot must be able to see the channel. Free bots also always show “Powered by status-hub.lol” in their status rotation.')}</p></article><article class="panel boost-card"><span class="eyebrow">${tr(lang,'Dein Status','Your status')}</span><h2>${esc(plan.label)}</h2><p>${stateText}</p><form method="post" action="/get-more/verify"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${tr(lang,'Jetzt prüfen','Verify now')}</button></form></article></section><section class="panel boost-tiers"><h2>${tr(lang,'Gratis-Stufen nach Servergröße','Free tiers by server size')}</h2><div class="tier-grid">${tiers}</div><p class="muted small">${tr(lang,'Die Stufen werden direkt aus den Admin-Einstellungen berechnet. Änderungen gelten sofort auch für bereits verifizierte Accounts.','Tiers are calculated directly from the admin settings. Changes apply immediately to already verified accounts too.')}</p></section><div class="actions"><a class="button ghost" href="/plans">Premium</a>${settings.supportUrl ? `<a class="button ghost" href="${esc(settings.supportUrl)}" target="_blank" rel="noopener">${tr(lang,'Support kontaktieren','Contact support')}</a>` : ''}</div>`);
 });
 
 app.post('/get-more/verify', requireLogin, checkCsrf, async (req, res) => {
@@ -329,8 +491,8 @@ app.get('/servers/new', requireLogin, (req, res) => {
   const u = currentUser(req); const count = readDb().servers.filter((s) => s.ownerDiscordId === u.discordId).length;
   if (count >= statusLimit(u)) return res.status(403).send('Dein Status-Bot-Limit ist erreicht. Ein Admin kann dein Limit erhöhen.');
   const requestedType = ['wardogs','fivem','gamedig','generic_json','text_only'].includes(String(req.query.type || '')) ? String(req.query.type) : 'fivem';
-  const requestedGame = gameDigMeta(String(req.query.game || '')) ? String(req.query.game) : 'minecraft';
-  const initial = { gameType: requestedType, queryConfig: requestedType === 'gamedig' ? { gameId: requestedGame, port: gameDigMeta(requestedGame)?.defaultPort || null, extraOptions: {} } : {} };
+  const requestedGame = gameDigMeta(String(req.query.game || '')) ? String(req.query.game) : '';
+  const initial = { gameType: requestedType, queryConfig: requestedType === 'gamedig' && requestedGame ? { gameId: requestedGame, port: gameDigMeta(requestedGame)?.defaultPort || null, extraOptions: {} } : {} };
   render(req, res, l(req,'Status Bot erstellen','Create status bot'), `<div class="pagehead"><div><h1>${l(req,'Status Bot erstellen','Create status bot')}</h1><p>${l(req,'Serverstatus oder reine Text-Rotation. Beides zählt als ein Status-Bot.','Server status or text-only rotation. Both count as one status bot.')}</p></div><a class="button ghost" href="/games">Games & FAQ</a></div>${serverForm({ server: initial, csrf: csrf(req), isAdmin: u.role === 'admin', lang: langOf(req) })}`);
 });
 
@@ -348,7 +510,7 @@ app.post('/servers/new', requireLogin, checkCsrf, async (req, res) => {
       gameType: q.gameType, queryConfig: q.queryConfig, querySecretEnc: q.newSecret ? encryptSecret(q.newSecret) : null,
       allowPrivateTarget: u.role === 'admin' && req.body.allowPrivateTarget === '1',
       intervalSeconds: Math.min(3600, Math.max(10, Number(req.body.intervalSeconds) || 30)), switchSeconds: Math.min(3600, Math.max(5, Number(req.body.switchSeconds) || 15)),
-      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), enabled: req.body.enabled === '1'
+      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), enabled: req.body.enabled === '1', restartNonce: Date.now()
     });
     rebalanceAssignments(); flash(req, 'ok', `Status Bot „${entry.name}“ wurde erstellt und einem freien Status-Node zugewiesen.`); res.redirect('/');
   } catch (error) { flash(req, 'err', error.message); res.redirect('/servers/new'); }
@@ -373,7 +535,7 @@ app.post('/servers/:id/edit', requireLogin, checkCsrf, async (req, res) => {
     if (req.body.botToken) { const bot = await validateBotToken(String(req.body.botToken).trim()); if (readDb().servers.some((x) => x.id !== old.id && x.botId === bot.id)) throw new Error('Dieser Discord Bot wird bereits von einem anderen Status-Eintrag verwendet'); patch.botTokenEnc = encryptSecret(String(req.body.botToken).trim()); patch.botId = bot.id; }
     if (q.newSecret) patch.querySecretEnc = encryptSecret(q.newSecret);
     else if (q.clearSecret) patch.querySecretEnc = null;
-    const entry = upsertServer({ ...patch, restartNonce: Date.now() }); rebalanceAssignments(); flash(req, 'ok', 'Gespeichert. Die Änderung wird vom Status-Node übernommen.'); res.redirect('/');
+    const entry = upsertServer({ ...patch, restartNonce: Date.now() }); rebalanceAssignments(); flash(req, 'ok', l(req,'Gespeichert und Neustart ausgelöst. Der Status-Node übernimmt die Änderung.','Saved and restart triggered. The status node will apply the change.')); res.redirect('/');
   } catch (error) { flash(req, 'err', error.message); res.redirect(`/servers/${encodeURIComponent(req.params.id)}/edit`); }
 });
 
@@ -430,29 +592,76 @@ app.get('/custom-bots/:id/source', requireLogin, (req,res)=>{const b=ownedCustom
 app.get('/custom-bots/:id/logs', requireLogin, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');let logs='';try{logs=(await customBotLogs(b)).logs||'';}catch(e){logs=`Logs unavailable: ${e.message}`;}render(req,res,'Custom Bot Logs',`<div class="pagehead"><div><h1>${esc(b.name)} · Logs</h1></div><a class="button ghost" href="/custom-bots">${l(req,'Zurück','Back')}</a></div><pre class="panel logbox">${esc(logs)}</pre>`);});
 app.post('/custom-bots/:id/delete', requireLogin, checkCsrf, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await deleteCustomBotRuntime(b).catch(()=>{});deleteCustomBotFiles(b.id);deleteCustomBot(b.id);flash(req,'ok',l(req,'Custom Bot gelöscht.','Custom bot deleted.'));res.redirect('/custom-bots');});
 
-app.get('/nodes', requireAdmin, (req, res) => {
+function adminShell(req, active, content) {
+  const lang=langOf(req);
+  const items=[['overview',tr(lang,'Übersicht','Overview')],['nodes',tr(lang,'Nodes','Nodes')],['users',tr(lang,'Benutzer & Pläne','Users & plans')],['services',tr(lang,'Bot Services','Bot services')],['settings',tr(lang,'Einstellungen','Settings')]];
+  const nav=items.map(([id,label])=>`<a class="${active===id?'active':''}" href="/admin?tab=${id}#${id}">${esc(label)}</a>`).join('');
+  return `<div class="admin-shell"><aside class="admin-sidebar panel"><span class="eyebrow">Admin</span><h2>Control Center</h2><nav>${nav}</nav></aside><section class="admin-content" id="${esc(active)}">${content}</section></div>`;
+}
+
+function adminNodesContent(req) {
   rebalanceAssignments();
-  const lang = langOf(req); const db = readDb(); const nodes = listStatusNodes();
-  const rows = nodes.map((n) => {
-    const healthy = nodeIsHealthy(n); const assigned = db.servers.filter((s) => s.assignedNodeId === n.id).length; const m = n.metrics || {};
-    const mode = n.disabled ? tr(lang,'Deaktiviert','Disabled') : n.acceptNewBots === false ? tr(lang,'Keine neuen Bots','No new bots') : tr(lang,'Nimmt Bots an','Accepting bots');
-    return `<tr><td><strong>${esc(n.name || n.id)}</strong><div class="muted small">${esc(n.id)} · ${esc(n.hostname || '')}</div></td><td><span class="badge ${healthy?'online':'error'}">${healthy?'online':'offline'}</span><div class="muted small">${esc(mode)}</div></td><td>${assigned}/${esc(n.capacity || 0)}</td><td>${esc(m.rssMb ?? '—')} MB RSS<br><span class="muted small">${tr(lang,'frei','free')} ${esc(m.freeMemMb ?? '—')} MB / ${esc(m.totalMemMb ?? '—')} MB · Load ${esc(m.load1 ?? '—')}</span></td><td>${esc(n.lastSeenAt ? new Date(n.lastSeenAt).toLocaleString(localeCode(lang)) : tr(lang,'nie','never'))}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/nodes/${esc(n.id)}/details">${tr(lang,'Bots verwalten','Manage bots')}</a><form method="post" action="/nodes/${esc(n.id)}/drain" class="inline" onsubmit="return confirm('${tr(lang,'Node drainen und Bots automatisch verteilen?','Drain node and redistribute bots automatically?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Drain</button></form></div><form method="post" action="/nodes/${esc(n.id)}" class="nodeform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input name="name" maxlength="100" value="${esc(n.name || '')}" placeholder="Node name"><input name="capacity" type="number" min="1" max="1000" value="${esc(n.capacity || 50)}"><label class="check"><input type="checkbox" name="acceptNewBots" value="1" ${n.acceptNewBots !== false?'checked':''}> ${tr(lang,'Neue Bots','New bots')}</label><label class="check"><input type="checkbox" name="disabled" value="1" ${n.disabled?'checked':''}> ${tr(lang,'Deaktiviert','Disabled')}</label><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form></td></tr>`;
-  }).join('');
-  const installer = String(process.env.NODE_INSTALL_SCRIPT_URL || 'https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh');
-  const deployCommand = `curl -fsSL ${installer} | bash -s -- ${baseUrl} ${process.env.STATUS_NODE_JOIN_SECRET} 50 "Worker VPS"`;
-  const httpsWarning = baseUrl.startsWith('https://') ? '' : `<div class="panel warning"><strong>${tr(lang,'Remote Nodes erst mit HTTPS verwenden.','Use remote nodes only after enabling HTTPS.')}</strong> ${tr(lang,'Bot-Tokens und Server-Secrets werden zwischen Control Plane und Node übertragen.','Bot tokens and server secrets are transferred between the control plane and nodes.')}</div>`;
-  render(req,res,tr(lang,'Node Manager','Node Manager'),`<div class="pagehead"><div><h1>${tr(lang,'Node Manager','Node Manager')}</h1><p>${tr(lang,'Nodes sperren, drainen, Kapazitäten setzen und Bots gezielt verschieben.','Lock nodes, drain them, set capacities and move bots manually.')}</p></div></div>${httpsWarning}<div class="panel node-deploy"><h2>${tr(lang,'Neuen Debian-VPS hinzufügen','Add a Debian VPS')}</h2><p>${tr(lang,'Diesen Einzeiler als root auf dem neuen VPS ausführen:','Run this single command as root on the new VPS:')}</p><pre class="logbox">${esc(deployCommand)}</pre></div><div class="panel tablewrap"><table><thead><tr><th>Node</th><th>Status</th><th>${tr(lang,'Belegung','Load')}</th><th>${tr(lang,'Ressourcen','Resources')}</th><th>${tr(lang,'Letzter Kontakt','Last seen')}</th><th>${tr(lang,'Verwaltung','Management')}</th></tr></thead><tbody>${rows||`<tr><td colspan="6">${tr(lang,'Noch kein Node registriert.','No node registered yet.')}</td></tr>`}</tbody></table></div>`);
+  const lang=langOf(req),db=readDb(),nodes=listStatusNodes();
+  const rows=nodes.map((n)=>{const healthy=nodeIsHealthy(n),assigned=db.servers.filter((s)=>s.assignedNodeId===n.id).length,m=n.metrics||{},mode=n.disabled?tr(lang,'Deaktiviert','Disabled'):n.acceptNewBots===false?tr(lang,'Keine neuen Bots','No new bots'):tr(lang,'Nimmt Bots an','Accepting bots');return `<tr><td><strong>${esc(n.name||n.id)}</strong><div class="muted small">${esc(n.id)} · ${esc(n.hostname||'')}</div></td><td><span class="badge ${healthy?'online':'error'}">${healthy?'online':'offline'}</span><div class="muted small">${esc(mode)}</div></td><td>${assigned}/${esc(n.capacity||0)}</td><td>${esc(m.rssMb??'—')} MB RSS<div class="muted small">${tr(lang,'frei','free')} ${esc(m.freeMemMb??'—')} MB / ${esc(m.totalMemMb??'—')} MB</div></td><td><form method="post" action="/nodes/${esc(n.id)}" class="nodeform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input name="name" maxlength="100" value="${esc(n.name||'')}"><input name="capacity" type="number" min="1" max="1000" value="${esc(n.capacity||50)}"><label class="check"><input type="checkbox" name="acceptNewBots" value="1" ${n.acceptNewBots!==false?'checked':''}> ${tr(lang,'Neue Bots','New bots')}</label><label class="check"><input type="checkbox" name="disabled" value="1" ${n.disabled?'checked':''}> ${tr(lang,'Deaktiviert','Disabled')}</label><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form><div class="actions wrap"><a class="button ghost smallbtn" href="/nodes/${esc(n.id)}/details">${tr(lang,'Bots verwalten','Manage bots')}</a><form method="post" action="/nodes/${esc(n.id)}/drain"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Drain</button></form></div></td></tr>`}).join('');
+  const installer=String(process.env.NODE_INSTALL_SCRIPT_URL||'https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh');
+  const deploy=`curl -fsSL ${installer} | bash -s -- ${baseUrl} ${process.env.STATUS_NODE_JOIN_SECRET} 50 "Worker VPS"`;
+  return `<div class="pagehead"><div><h1>${tr(lang,'Node Manager','Node Manager')}</h1><p>${tr(lang,'Neue Bots sperren, Nodes drainen, Kapazitäten setzen und Bots verschieben.','Block new bots, drain nodes, set capacity and move bots.')}</p></div></div><div class="panel node-deploy"><h2>${tr(lang,'Neuen VPS hinzufügen','Add a new VPS')}</h2><pre class="logbox">${esc(deploy)}</pre></div><div class="panel tablewrap"><table><thead><tr><th>Node</th><th>Status</th><th>${tr(lang,'Belegung','Load')}</th><th>RAM</th><th>${tr(lang,'Verwaltung','Management')}</th></tr></thead><tbody>${rows||`<tr><td colspan="5">${tr(lang,'Keine Nodes','No nodes')}</td></tr>`}</tbody></table></div>`;
+}
+
+function adminUsersContent(req) {
+  const lang=langOf(req),db=readDb();
+  const baseOptions=Object.values(PLANS).map((p)=>`<option value="${esc(p.id)}">${esc(p.label)} (${p.statusBotLimit})</option>`).join('');
+  const rows=db.users.map((u)=>{const count=db.servers.filter((s)=>s.ownerDiscordId===u.discordId).length,custom=db.customBots.filter((b)=>b.ownerDiscordId===u.discordId).length,plan=effectivePlan(u),opts=baseOptions.replace(`value="${esc(u.planId||'free')}"`,`value="${esc(u.planId||'free')}" selected`);return `<tr><td><strong>${esc(u.globalName||u.username||u.discordId)}</strong><div class="muted small">${esc(u.discordId)}</div></td><td>${count}/${plan.statusBotLimit===Infinity?'∞':esc(plan.statusBotLimit)}<div class="muted small">${esc(plan.label)}</div></td><td>${custom}/${esc(u.customBotLimit||0)}</td><td><form method="post" action="/users/${esc(u.discordId)}" class="userform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><select name="role"><option value="user" ${u.role==='user'?'selected':''}>user</option><option value="admin" ${u.role==='admin'?'selected':''}>admin</option></select><select name="planId">${opts}</select><input name="planDuration" type="number" min="0" max="87600" placeholder="${tr(lang,'Dauer','Duration')}"><select name="planDurationUnit"><option value="hours">${tr(lang,'Stunden','Hours')}</option><option value="days" selected>${tr(lang,'Tage','Days')}</option><option value="months">${tr(lang,'Monate','Months')}</option></select><input name="statusBotLimitOverride" type="number" min="0" max="500" value="${u.statusBotLimitOverride??''}" placeholder="Bot override"><input name="customBotLimit" type="number" min="0" max="50" value="${esc(u.customBotLimit??0)}" placeholder="Custom"><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form></td></tr>`}).join('');
+  return `<div class="pagehead"><div><h1>${tr(lang,'Benutzer & Pläne','Users & plans')}</h1><p>${tr(lang,'Premium zeitlich oder dauerhaft freischalten. Custom Bots bleiben separat.','Enable Premium temporarily or permanently. Custom bots remain separate.')}</p></div></div><div class="panel tablewrap"><table><thead><tr><th>User</th><th>Status Bots</th><th>Custom Bots</th><th>${tr(lang,'Freigaben','Permissions')}</th></tr></thead><tbody>${rows||`<tr><td colspan="4">${tr(lang,'Keine Benutzer','No users')}</td></tr>`}</tbody></table></div>`;
+}
+
+function adminServicesContent(req) {
+  const lang=langOf(req),services=listBotServices(false),editId=String(req.query.edit||''),edit=editId?getBotService(editId):null,f=edit||{};
+  const rows=services.map((x)=>`<tr><td><strong>${esc(x.nameDe||x.nameEn)}</strong></td><td>${esc(x.priceLabel||'—')}</td><td>${esc(x.status)}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/admin?tab=services&edit=${encodeURIComponent(x.id)}#services">${tr(lang,'Bearbeiten','Edit')}</a><form method="post" action="/admin/bot-services/${esc(x.id)}/delete" class="inline" onsubmit="return confirm('${tr(lang,'Bot Service löschen?','Delete bot service?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Löschen','Delete')}</button></form></div></td></tr>`).join('');
+  return `<div class="pagehead"><div><h1>${tr(lang,'Bot Services','Bot services')}</h1><p>${tr(lang,'Einzeln kaufbare Managed Bots verwalten.','Manage individually purchasable managed bots.')}</p></div><a class="button ghost" href="/bot-services" target="_blank">${tr(lang,'Öffentliche Seite','Public page')}</a></div><form method="post" action="/admin/bot-services" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="id" value="${esc(f.id||'')}"><label>${tr(lang,'Name Deutsch','Name German')}<input name="nameDe" required value="${esc(f.nameDe||'')}"></label><label>${tr(lang,'Name Englisch','Name English')}<input name="nameEn" required value="${esc(f.nameEn||'')}"></label><label class="span2">${tr(lang,'Beschreibung Deutsch','Description German')}<textarea name="descriptionDe" rows="3" required>${esc(f.descriptionDe||'')}</textarea></label><label class="span2">${tr(lang,'Beschreibung Englisch','Description English')}<textarea name="descriptionEn" rows="3" required>${esc(f.descriptionEn||'')}</textarea></label><label>${tr(lang,'Preis','Price')}<input name="priceLabel" value="${esc(f.priceLabel||'')}"></label><label>Status<select name="status"><option value="coming_soon" ${f.status==='coming_soon'||!f.status?'selected':''}>Coming soon</option><option value="available" ${f.status==='available'?'selected':''}>Available</option><option value="paused" ${f.status==='paused'?'selected':''}>Paused</option></select></label><label>${tr(lang,'Kauf-Link','Purchase URL')}<input name="purchaseUrl" value="${esc(f.purchaseUrl||'')}"></label><label>${tr(lang,'Support-Link','Support URL')}<input name="supportUrl" value="${esc(f.supportUrl||'')}"></label><label class="check"><input type="checkbox" name="visible" value="1" ${f.visible!==false?'checked':''}> ${tr(lang,'Sichtbar','Visible')}</label><label class="check"><input type="checkbox" name="featured" value="1" ${f.featured?'checked':''}> Featured</label><label class="span2">${tr(lang,'Features Deutsch','Features German')}<textarea name="featuresDe" rows="5">${esc((f.featuresDe||[]).join('\n'))}</textarea></label><label class="span2">${tr(lang,'Features Englisch','Features English')}<textarea name="featuresEn" rows="5">${esc((f.featuresEn||[]).join('\n'))}</textarea></label><div class="span2 actions"><button class="button primary">${edit?tr(lang,'Speichern','Save'):tr(lang,'Hinzufügen','Add')}</button></div></form><div class="panel tablewrap"><table><thead><tr><th>Service</th><th>${tr(lang,'Preis','Price')}</th><th>Status</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="4">${tr(lang,'Keine Services','No services')}</td></tr>`}</tbody></table></div>`;
+}
+
+function adminSettingsContent(req) {
+  const lang=langOf(req),settings=getSiteSettings(),supporters=listSupporters(false),tiers=settings.freeBoost?.tiers||[],teamIds=(settings.teamDiscordIds||[]).join(', '),sales=settings.premiumSales||{},prices=sales.prices||{},auto=paypalAutoConfig(settings);
+  const tierValue=(limit,fallback)=>tiers.find((x)=>Number(x.limit)===limit)?.members??fallback;
+  const rows=supporters.map((x)=>`<tr><td><strong>${esc(x.displayName)}</strong></td><td>${esc(x.amountLabel||'—')}</td><td><form method="post" action="/admin/supporters/${esc(x.id)}/delete"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Entfernen','Remove')}</button></form></td></tr>`).join('');
+  const paypalCredentialState=paypalConfigured()?`<span class="badge online">${tr(lang,'API Zugangsdaten vorhanden','API credentials present')}</span>`:`<span class="badge error">${tr(lang,'API Zugangsdaten fehlen','API credentials missing')}</span>`;
+  const webhookState=auto.webhookId?`<span class="badge online">Webhook ${esc(auto.webhookId)}</span>`:`<span class="badge neutral">${tr(lang,'Webhook nicht eingerichtet','Webhook not configured')}</span>`;
+  const setupButton=paypalConfigured()?`<form method="post" action="/admin/paypal/setup" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary" type="submit">${tr(lang,'PayPal automatisch einrichten / testen','Set up / test PayPal automatically')}</button></form>`:'';
+  return `<div class="pagehead"><div><h1>${tr(lang,'Einstellungen','Settings')}</h1><p>${tr(lang,'Branding, Premium-Verkauf, Free-Boost und öffentliche Links.','Branding, Premium sales, free boost and public links.')}</p></div></div>
+  <form method="post" action="/admin/settings" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}">
+    <label>${tr(lang,'Service-Domain','Service domain')}<input name="serviceDomain" required value="${esc(settings.serviceDomain||'status-hub.lol')}"></label><label>Support URL<input name="supportUrl" value="${esc(settings.supportUrl||'')}"></label><label class="span2">${tr(lang,'Team Discord IDs','Team Discord IDs')}<input name="teamDiscordIds" value="${esc(teamIds)}"></label>
+    <div class="span2 admin-subhead"><h3>Premium & PayPal</h3></div>
+    <label class="check span2"><input type="checkbox" name="paypalAutoEnabled" value="1" ${auto.enabled?'checked':''}> ${tr(lang,'Automatische PayPal-Freischaltung aktivieren','Enable automatic PayPal activation')}</label>
+    <label>${tr(lang,'Währung','Currency')}<input name="paypalCurrency" maxlength="3" value="${esc(auto.currency)}" placeholder="EUR"></label><label>${tr(lang,'Premium-Dauer pro Kauf (Tage)','Premium duration per purchase (days)')}<input name="paypalAccessDays" type="number" min="1" max="3650" value="${esc(auto.accessDays)}"></label>
+    <label>Premium 5 PayPal<input name="paypalAmountPremium5" inputmode="decimal" value="${esc(auto.amounts.premium5||'')}"></label><label>Premium 10 PayPal<input name="paypalAmountPremium10" inputmode="decimal" value="${esc(auto.amounts.premium10||'')}"></label><label>Premium 15 PayPal<input name="paypalAmountPremium15" inputmode="decimal" value="${esc(auto.amounts.premium15||'')}"></label><label>Premium 20 PayPal<input name="paypalAmountPremium20" inputmode="decimal" value="${esc(auto.amounts.premium20||'')}"></label>
+    <div class="span2 help"><div class="actions wrap">${paypalCredentialState}${webhookState}<span class="badge neutral">${esc(paypalEnvironment())}</span>${setupButton}</div><p class="muted small">${tr(lang,'Client ID und Secret werden nur in .env gespeichert. Nach erfolgreicher Zahlung wird der Plan automatisch freigeschaltet.','Client ID and secret are stored only in .env. After a successful payment, the plan is activated automatically.')}</p></div>
+    <label>PayPal URL (${tr(lang,'Fallback','fallback')})<input name="premiumPaypalUrl" value="${esc(sales.paypalUrl||'')}" placeholder="https://paypal.me/..."></label><label>${tr(lang,'Discord Username für Kauf','Discord username for sales')}<input name="salesDiscordUsername" value="${esc(sales.discordUsername||'')}" placeholder="@username"></label><label>${tr(lang,'Discord User ID für Kauf-Link','Discord user ID for sales link')}<input name="salesDiscordUserId" value="${esc(sales.discordUserId||'')}"></label>
+    <label>Premium 5 ${tr(lang,'Anzeige','display')}<input name="pricePremium5" value="${esc(prices.premium5||'')}"></label><label>Premium 10 ${tr(lang,'Anzeige','display')}<input name="pricePremium10" value="${esc(prices.premium10||'')}"></label><label>Premium 15 ${tr(lang,'Anzeige','display')}<input name="pricePremium15" value="${esc(prices.premium15||'')}"></label><label>Premium 20 ${tr(lang,'Anzeige','display')}<input name="pricePremium20" value="${esc(prices.premium20||'')}"></label>
+    <div class="span2 admin-subhead"><h3>${tr(lang,'Free-Boost','Free boost')}</h3></div><label>${tr(lang,'Branding-Channel','Branding channel')}<input name="channelName" value="${esc(settings.freeBoost?.channelName||'Powered by status-hub.lol')}"></label><label>${tr(lang,'Prüfintervall Stunden','Verification hours')}<input name="verifyHours" type="number" min="1" max="48" value="${esc(settings.freeBoost?.verifyHours||6)}"></label><label>2 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier2" type="number" min="1" value="${esc(tierValue(2,50))}"></label><label>3 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier3" type="number" min="1" value="${esc(tierValue(3,100))}"></label><label>4 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier4" type="number" min="1" value="${esc(tierValue(4,250))}"></label><label>5 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier5" type="number" min="1" value="${esc(tierValue(5,500))}"></label>
+    <div class="span2 admin-subhead"><h3>${tr(lang,'Spenden','Donations')}</h3></div><label>PayPal URL<input name="paypal" value="${esc(settings.donationLinks?.paypal||'')}"></label><label>Ko-fi URL<input name="kofi" value="${esc(settings.donationLinks?.kofi||'')}"></label><label>Stripe URL<input name="stripe" value="${esc(settings.donationLinks?.stripe||'')}"></label><label>${tr(lang,'Eigener Link','Custom URL')}<input name="customUrl" value="${esc(settings.donationLinks?.customUrl||'')}"></label><label>${tr(lang,'Button-Text','Button label')}<input name="customLabel" value="${esc(settings.donationLinks?.customLabel||'')}"></label><div class="span2 actions"><button class="button primary">${tr(lang,'Einstellungen speichern','Save settings')}</button></div>
+  </form>
+  <div class="pagehead subsection"><div><h2>Supporter</h2></div></div><form method="post" action="/admin/supporters" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><label>${tr(lang,'Anzeigename','Display name')}<input name="displayName" required></label><label>${tr(lang,'Betrag/Badge','Amount/badge')}<input name="amountLabel"></label><label>${tr(lang,'Link optional','Optional link')}<input name="link"></label><label class="check"><input type="checkbox" name="featured" value="1"> Featured</label><label class="check"><input type="checkbox" name="visible" value="1" checked> ${tr(lang,'Sichtbar','Visible')}</label><div class="span2 actions"><button class="button primary">${tr(lang,'Supporter hinzufügen','Add supporter')}</button></div></form><div class="panel tablewrap"><table><tbody>${rows||`<tr><td>${tr(lang,'Keine Supporter','No supporters')}</td></tr>`}</tbody></table></div>`;
+}
+
+app.get('/admin', requireAdmin, (req,res)=>{
+  const tab=['overview','nodes','users','services','settings'].includes(String(req.query.tab||''))?String(req.query.tab):'overview';
+  const db=readDb(); let content='';
+  if(tab==='nodes')content=adminNodesContent(req); else if(tab==='users')content=adminUsersContent(req); else if(tab==='services')content=adminServicesContent(req); else if(tab==='settings')content=adminSettingsContent(req); else { const healthy=listStatusNodes().filter((n)=>nodeIsHealthy(n)).length; content=`<div class="pagehead"><div><h1>Admin Control Center</h1><p>${l(req,'Alles an einem Ort verwalten.','Manage everything from one place.')}</p></div></div><section class="admin-stats"><article class="panel"><span class="eyebrow">Users</span><strong>${db.users.length}</strong></article><article class="panel"><span class="eyebrow">Status Bots</span><strong>${db.servers.length}</strong></article><article class="panel"><span class="eyebrow">Nodes online</span><strong>${healthy}/${db.statusNodes.length}</strong></article><article class="panel"><span class="eyebrow">Custom Bots</span><strong>${db.customBots.length}</strong></article></section>`; }
+  render(req,res,'Admin',adminShell(req,tab,content));
 });
+
+app.get('/nodes', requireAdmin, (req,res) => res.redirect('/admin?tab=nodes'));
 
 app.post('/nodes/:id', requireAdmin, checkCsrf, (req,res) => {
   const n=getStatusNode(req.params.id); if(!n)return res.status(404).send('Not found');
   upsertStatusNode({id:n.id,name:String(req.body.name || n.name || n.id).trim().slice(0,100),capacity:Math.min(1000,Math.max(1,Number(req.body.capacity)||50)),disabled:req.body.disabled==='1',acceptNewBots:req.body.acceptNewBots==='1'});
-  rebalanceAssignments(); flash(req,'ok',l(req,'Node gespeichert.','Node saved.')); res.redirect('/nodes');
+  rebalanceAssignments(); flash(req,'ok',l(req,'Node gespeichert.','Node saved.')); res.redirect('/admin?tab=nodes#nodes');
 });
 
 app.post('/nodes/:id/drain', requireAdmin, checkCsrf, (req,res) => {
   try { const result=drainStatusNode(req.params.id); flash(req,'ok',l(req,`Node wird gedraint. ${result.released} Bots wurden zur Neuverteilung freigegeben.`,`Node is draining. ${result.released} bots were released for redistribution.`)); }
-  catch(e){flash(req,'err',e.message);} res.redirect('/nodes');
+  catch(e){flash(req,'err',e.message);} res.redirect('/admin?tab=nodes#nodes');
 });
 
 app.get('/nodes/:id/details', requireAdmin, (req,res) => {
@@ -473,71 +682,66 @@ app.post('/nodes/:id/move-all', requireAdmin, checkCsrf, (req,res)=>{
   catch(e){flash(req,'err',e.message);} res.redirect(`/nodes/${encodeURIComponent(req.params.id)}/details`);
 });
 
-app.get('/users', requireAdmin, (req,res)=>{
-  const lang=langOf(req); const db=readDb();
-  const planOptions=Object.values(PLANS).map((p)=>`<option value="${esc(p.id)}">${esc(p.label)} (${p.statusBotLimit} Bots)</option>`).join('');
-  const rows=db.users.map((u)=>{
-    const serverCount=db.servers.filter((s)=>s.ownerDiscordId===u.discordId).length; const customCount=db.customBots.filter((b)=>b.ownerDiscordId===u.discordId).length; const plan=effectivePlan(u);
-    const expires=u.planExpiresAt?new Date(u.planExpiresAt).toLocaleString(localeCode(lang)):tr(lang,'dauerhaft','permanent');
-    const boost=u.freeBoost?.state==='verified'?`${u.freeBoost.freeBotLimit} free · ${u.freeBoost.memberCount||0} ${tr(lang,'Mitglieder','members')}`:tr(lang,'kein aktiver Boost','no active boost');
-    const opts=planOptions.replace(`value="${esc(u.planId||'free')}"`,`value="${esc(u.planId||'free')}" selected`);
-    return `<tr><td><strong>${esc(u.globalName||u.username||u.discordId)}</strong><div class="muted small">${esc(u.discordId)}</div></td><td>${esc(u.role)}</td><td>${serverCount}/${plan.statusBotLimit===Infinity?'∞':esc(plan.statusBotLimit)}<div class="muted small">${esc(plan.label)} · ${esc(expires)} · ${esc(boost)}</div></td><td>${customCount}/${esc(u.customBotLimit)}</td><td><form method="post" action="/users/${esc(u.discordId)}" class="userform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><select name="role"><option value="user" ${u.role==='user'?'selected':''}>user</option><option value="admin" ${u.role==='admin'?'selected':''}>admin</option></select><select name="planId">${opts}</select><input name="planDuration" type="number" min="0" max="87600" placeholder="${tr(lang,'Dauer; 0=permanent','Duration; 0=permanent')}"><select name="planDurationUnit"><option value="hours">${tr(lang,'Stunden','Hours')}</option><option value="days" selected>${tr(lang,'Tage','Days')}</option><option value="months">${tr(lang,'Monate','Months')}</option></select><input name="statusBotLimitOverride" type="number" min="0" max="500" value="${u.statusBotLimitOverride??''}" placeholder="Bot limit override"><input name="customBotLimit" type="number" min="0" max="50" value="${esc(u.customBotLimit??0)}" title="Custom Bot Limit"><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form></td><td>${bootstrapAdmins.has(u.discordId)?'<span class="muted">.env Admin</span>':`<form method="post" action="/users/${esc(u.discordId)}/delete" onsubmit="return confirm('${tr(lang,'User aus Panel entfernen? Seine Bots bleiben zugeordnet.','Remove user from panel? Their bots remain assigned.')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Entfernen','Remove')}</button></form>`}</td></tr>`;
-  }).join('');
-  render(req,res,tr(lang,'Benutzer','Users'),`<div class="pagehead"><div><h1>${tr(lang,'Benutzer, Pläne & Freigaben','Users, plans & permissions')}</h1><p>${tr(lang,'Free kann über den Branding-Boost auf bis zu 5 Status-Bots wachsen. Premium 5/10/15/20 entfernt Branding. Custom Bots bleiben separat.','Free can grow to up to 5 status bots through the branding boost. Premium 5/10/15/20 removes branding. Custom bots remain separate.')}</p></div></div><div class="panel help"><strong>${tr(lang,'Plan-Laufzeit','Plan duration')}:</strong> ${tr(lang,'Leer = bestehende Laufzeit behalten. 0 = dauerhaft. Nach Ablauf fällt der User automatisch auf Free zurück; Bots über dem Limit werden pausiert, nicht gelöscht.','Empty keeps the current duration. 0 = permanent. After expiry the user automatically falls back to Free; bots above the limit are paused, not deleted.')}</div><div class="panel tablewrap"><table><thead><tr><th>User</th><th>${tr(lang,'Rolle','Role')}</th><th>Status Bots / Plan</th><th>Custom Bots</th><th>${tr(lang,'Freigaben/Limits','Permissions/limits')}</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="6">${tr(lang,'Keine User','No users')}</td></tr>`}</tbody></table></div>`);
-});
+app.get('/users', requireAdmin, (req,res) => res.redirect('/admin?tab=users'));
 
 app.post('/users/:id', requireAdmin, checkCsrf, (req,res)=>{
   const old=findUser(req.params.id); if(!old)return res.status(404).send('Not found'); const protectedAdmin=bootstrapAdmins.has(old.discordId); const planId=PLANS[req.body.planId]?req.body.planId:(old.planId||'free'); let planExpiresAt=old.planExpiresAt||null; const durationRaw=String(req.body.planDuration??'').trim();
   if(durationRaw!==''){const amount=Math.min(87600,Math.max(0,Number(durationRaw)||0));const unit=['hours','days','months'].includes(req.body.planDurationUnit)?req.body.planDurationUnit:'days';const multiplier=unit==='hours'?3600_000:unit==='months'?30*86400_000:86400_000;planExpiresAt=amount===0?null:new Date(Date.now()+amount*multiplier).toISOString();}else if(planId!==(old.planId||'free'))planExpiresAt=null;
   const overrideRaw=String(req.body.statusBotLimitOverride??'').trim(); const statusBotLimitOverride=overrideRaw===''?null:Math.min(500,Math.max(0,Number(overrideRaw)||0));
-  upsertUser({discordId:old.discordId,role:protectedAdmin?'admin':(req.body.role==='admin'?'admin':'user'),planId,planExpiresAt,statusBotLimitOverride,customBotLimit:Math.min(50,Math.max(0,Number(req.body.customBotLimit)||0))}); rebalanceAssignments(); flash(req,'ok',l(req,'Benutzerplan und Freigaben gespeichert.','User plan and permissions saved.')); res.redirect('/users');
+  upsertUser({discordId:old.discordId,role:protectedAdmin?'admin':(req.body.role==='admin'?'admin':'user'),planId,planExpiresAt,statusBotLimitOverride,customBotLimit:Math.min(50,Math.max(0,Number(req.body.customBotLimit)||0)),premiumSource:null}); rebalanceAssignments(); flash(req,'ok',l(req,'Benutzerplan und Freigaben gespeichert.','User plan and permissions saved.')); res.redirect('/admin?tab=users#users');
 });
 
-app.post('/users/:id/delete', requireAdmin, checkCsrf, (req,res)=>{if(bootstrapAdmins.has(req.params.id)){flash(req,'err',l(req,'.env Admin kann nicht entfernt werden.','.env admin cannot be removed.'));return res.redirect('/users');}if(req.params.id===currentUser(req).discordId){flash(req,'err',l(req,'Eigenen Account nicht entfernen.','Do not remove your own account.'));return res.redirect('/users');}deleteUser(req.params.id);rebalanceAssignments();flash(req,'ok',l(req,'Benutzer entfernt.','User removed.'));res.redirect('/users');});
+app.post('/users/:id/delete', requireAdmin, checkCsrf, (req,res)=>{if(bootstrapAdmins.has(req.params.id)){flash(req,'err',l(req,'.env Admin kann nicht entfernt werden.','.env admin cannot be removed.'));return res.redirect('/admin?tab=users#users');}if(req.params.id===currentUser(req).discordId){flash(req,'err',l(req,'Eigenen Account nicht entfernen.','Do not remove your own account.'));return res.redirect('/admin?tab=users#users');}deleteUser(req.params.id);rebalanceAssignments();flash(req,'ok',l(req,'Benutzer entfernt.','User removed.'));res.redirect('/admin?tab=users#users');});
 
-app.get('/admin/bot-services', requireAdmin, (req,res) => {
-  const lang=langOf(req); const services=listBotServices(false); const editId=String(req.query.edit||''); const edit=editId?getBotService(editId):null;
-  const rows=services.map((x)=>`<tr><td><strong>${esc(x.nameDe||x.nameEn)}</strong>${x.featured?` <span class="badge online">Featured</span>`:''}<div class="muted small">${esc(x.slug||x.id)}</div></td><td>${esc(x.priceLabel||'—')}</td><td>${esc(x.status)}</td><td>${x.visible!==false?tr(lang,'Sichtbar','Visible'):tr(lang,'Versteckt','Hidden')}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/admin/bot-services?edit=${encodeURIComponent(x.id)}">${tr(lang,'Bearbeiten','Edit')}</a><form method="post" action="/admin/bot-services/${esc(x.id)}/delete" onsubmit="return confirm('${tr(lang,'Bot Service löschen?','Delete bot service?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Löschen','Delete')}</button></form></div></td></tr>`).join('');
-  const f=edit||{};
-  render(req,res,tr(lang,'Bot Services verwalten','Manage Bot Services'),`<div class="pagehead"><div><h1>${tr(lang,'Bot Services verwalten','Manage Bot Services')}</h1><p>${tr(lang,'Einzeln buchbare Managed Bots veröffentlichen.','Publish individually purchasable managed bots.')}</p></div><a class="button ghost" href="/bot-services" target="_blank" rel="noopener">${tr(lang,'Öffentliche Seite','Public page')}</a></div><form method="post" action="/admin/bot-services" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="id" value="${esc(f.id||'')}"><label>${tr(lang,'Name Deutsch','Name German')}<input name="nameDe" required maxlength="100" value="${esc(f.nameDe||'')}"></label><label>${tr(lang,'Name Englisch','Name English')}<input name="nameEn" required maxlength="100" value="${esc(f.nameEn||'')}"></label><label class="span2">${tr(lang,'Beschreibung Deutsch','Description German')}<textarea name="descriptionDe" rows="3" maxlength="800" required>${esc(f.descriptionDe||'')}</textarea></label><label class="span2">${tr(lang,'Beschreibung Englisch','Description English')}<textarea name="descriptionEn" rows="3" maxlength="800" required>${esc(f.descriptionEn||'')}</textarea></label><label>${tr(lang,'Preis-Anzeige','Price label')}<input name="priceLabel" maxlength="60" value="${esc(f.priceLabel||'')}" placeholder="€4.99 / month"></label><label>Status<select name="status"><option value="coming_soon" ${f.status==='coming_soon'||!f.status?'selected':''}>Coming soon</option><option value="available" ${f.status==='available'?'selected':''}>Available</option><option value="paused" ${f.status==='paused'?'selected':''}>Paused</option></select></label><label>${tr(lang,'Kauf-Link','Purchase URL')}<input name="purchaseUrl" value="${esc(f.purchaseUrl||'')}" placeholder="https://..."></label><label>${tr(lang,'Support-Link optional','Support URL optional')}<input name="supportUrl" value="${esc(f.supportUrl||'')}" placeholder="https://discord.gg/..."></label><label>${tr(lang,'Sortierung','Sort order')}<input type="number" name="sortOrder" min="0" max="9999" value="${esc(f.sortOrder??10)}"></label><label class="check"><input type="checkbox" name="visible" value="1" ${f.visible!==false?'checked':''}> ${tr(lang,'Öffentlich sichtbar','Publicly visible')}</label><label class="check"><input type="checkbox" name="featured" value="1" ${f.featured?'checked':''}> Featured</label><label class="span2">${tr(lang,'Features Deutsch – eine Zeile pro Punkt','Features German – one per line')}<textarea name="featuresDe" rows="6">${esc((f.featuresDe||[]).join('\n'))}</textarea></label><label class="span2">${tr(lang,'Features Englisch – eine Zeile pro Punkt','Features English – one per line')}<textarea name="featuresEn" rows="6">${esc((f.featuresEn||[]).join('\n'))}</textarea></label><div class="span2 actions"><button class="button primary">${edit?tr(lang,'Änderungen speichern','Save changes'):tr(lang,'Bot Service hinzufügen','Add bot service')}</button>${edit?`<a class="button ghost" href="/admin/bot-services">${tr(lang,'Abbrechen','Cancel')}</a>`:''}</div></form><div class="panel tablewrap"><table><thead><tr><th>${tr(lang,'Service','Service')}</th><th>${tr(lang,'Preis','Price')}</th><th>Status</th><th>${tr(lang,'Sichtbarkeit','Visibility')}</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="5">${tr(lang,'Keine Bot Services.','No bot services.')}</td></tr>`}</tbody></table></div>`);
-});
+app.get('/admin/bot-services', requireAdmin, (req,res) => { const q = new URLSearchParams(); q.set('tab','services'); if (req.query.edit) q.set('edit', String(req.query.edit)); res.redirect(`/admin?${q}`); });
 
 app.post('/admin/bot-services', requireAdmin, checkCsrf, (req,res) => {
   const id=String(req.body.id||'').trim(); const old=id?getBotService(id):null;
   const nameDe=String(req.body.nameDe||'').trim(); const nameEn=String(req.body.nameEn||'').trim();
-  if(!nameDe||!nameEn){flash(req,'err',l(req,'Name fehlt.','Name is required.'));return res.redirect('/admin/bot-services');}
+  if(!nameDe||!nameEn){flash(req,'err',l(req,'Name fehlt.','Name is required.'));return res.redirect('/admin?tab=services#services');}
   const url=(value)=>{const v=String(value||'').trim();return /^https?:\/\//i.test(v)?v.slice(0,500):'';};
   const lines=(value)=>String(value||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean).slice(0,20).map((x)=>x.slice(0,160));
   const status=['coming_soon','available','paused'].includes(req.body.status)?req.body.status:'coming_soon';
   const slug=(old?.slug||nameEn.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,80)||`service-${Date.now()}`);
   upsertBotService({id:old?.id,slug,nameDe:nameDe.slice(0,100),nameEn:nameEn.slice(0,100),descriptionDe:String(req.body.descriptionDe||'').trim().slice(0,800),descriptionEn:String(req.body.descriptionEn||'').trim().slice(0,800),featuresDe:lines(req.body.featuresDe),featuresEn:lines(req.body.featuresEn),priceLabel:String(req.body.priceLabel||'').trim().slice(0,60),status,purchaseUrl:url(req.body.purchaseUrl),supportUrl:url(req.body.supportUrl),visible:req.body.visible==='1',featured:req.body.featured==='1',sortOrder:Math.max(0,Math.min(9999,Number(req.body.sortOrder)||10))});
-  flash(req,'ok',l(req,'Bot Service gespeichert.','Bot service saved.')); res.redirect('/admin/bot-services');
+  flash(req,'ok',l(req,'Bot Service gespeichert.','Bot service saved.')); res.redirect('/admin?tab=services#services');
 });
 
-app.post('/admin/bot-services/:id/delete', requireAdmin, checkCsrf, (req,res) => { deleteBotService(req.params.id); flash(req,'ok',l(req,'Bot Service gelöscht.','Bot service deleted.')); res.redirect('/admin/bot-services'); });
+app.post('/admin/bot-services/:id/delete', requireAdmin, checkCsrf, (req,res) => { deleteBotService(req.params.id); flash(req,'ok',l(req,'Bot Service gelöscht.','Bot service deleted.')); res.redirect('/admin?tab=services#services'); });
 
-app.get('/admin/settings', requireAdmin, (req,res) => {
-  const lang=langOf(req); const settings=getSiteSettings(); const supporters=listSupporters(false); const tiers=settings.freeBoost?.tiers || []; const teamIds=(settings.teamDiscordIds||[]).join(', ');
-  const tierValue=(limit,fallback)=>tiers.find((x)=>Number(x.limit)===limit)?.members ?? fallback;
-  const rows=supporters.map((x)=>`<tr><td><strong>${esc(x.displayName)}</strong>${x.featured?` <span class="badge online">${tr(lang,'Featured','Featured')}</span>`:''}<div class="muted small">${esc(x.message||'')}</div></td><td>${esc(x.amountLabel||'—')}</td><td>${x.visible!==false?tr(lang,'Sichtbar','Visible'):tr(lang,'Versteckt','Hidden')}</td><td><form method="post" action="/admin/supporters/${esc(x.id)}/delete" onsubmit="return confirm('${tr(lang,'Supporter entfernen?','Remove supporter?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Entfernen','Remove')}</button></form></td></tr>`).join('');
-  render(req,res,tr(lang,'Einstellungen','Settings'),`<div class="pagehead"><div><h1>${tr(lang,'Einstellungen','Settings')}</h1><p>${tr(lang,'Branding, Free-Boost, Support und Spendenlinks zentral verwalten.','Manage branding, Free boost, support and donation links.')}</p></div></div><form method="post" action="/admin/settings" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><label>${tr(lang,'Service-Domain','Service domain')}<input name="serviceDomain" required value="${esc(settings.serviceDomain||'status-hub.lol')}"></label><label>${tr(lang,'Support URL','Support URL')}<input name="supportUrl" value="${esc(settings.supportUrl||'')}" placeholder="https://discord.gg/..."></label><label class="span2">${tr(lang,'Zusätzliche Team Discord IDs','Additional team Discord IDs')}<input name="teamDiscordIds" value="${esc(teamIds)}" placeholder="293104788361576448"><span class="muted small">${tr(lang,'Kommagetrennt. Admins werden automatisch auf der Team-Seite angezeigt.','Comma-separated. Admins are shown on the Team page automatically.')}</span></label><label>PayPal URL<input name="paypal" value="${esc(settings.donationLinks?.paypal||'')}"></label><label>Ko-fi URL<input name="kofi" value="${esc(settings.donationLinks?.kofi||'')}"></label><label>Stripe URL<input name="stripe" value="${esc(settings.donationLinks?.stripe||'')}"></label><label>${tr(lang,'Eigener Spendenlink','Custom donation link')}<input name="customUrl" value="${esc(settings.donationLinks?.customUrl||'')}"></label><label>${tr(lang,'Eigener Button-Text','Custom button label')}<input name="customLabel" value="${esc(settings.donationLinks?.customLabel||'')}"></label><label>${tr(lang,'Branding-Channel','Branding channel')}<input name="channelName" required value="${esc(settings.freeBoost?.channelName||'Powered by status-hub.lol')}"></label><label>${tr(lang,'Prüfintervall (Stunden)','Verification interval (hours)')}<input name="verifyHours" type="number" min="1" max="48" value="${esc(settings.freeBoost?.verifyHours||6)}"></label><div class="span2 tier-settings"><h3>${tr(lang,'Free-Boost Stufen','Free boost tiers')}</h3><div class="tier-grid"><label>2 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier2" type="number" min="1" value="${esc(tierValue(2,50))}"></label><label>3 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier3" type="number" min="1" value="${esc(tierValue(3,100))}"></label><label>4 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier4" type="number" min="1" value="${esc(tierValue(4,250))}"></label><label>5 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier5" type="number" min="1" value="${esc(tierValue(5,500))}"></label></div></div><div class="span2 actions"><button class="button primary">${tr(lang,'Einstellungen speichern','Save settings')}</button></div></form><div class="pagehead subsection"><div><h2>${tr(lang,'Supporter verwalten','Manage supporters')}</h2><p>${tr(lang,'Diese Einträge erscheinen öffentlich auf der Spenden-Seite.','These entries are shown publicly on the donation page.')}</p></div></div><form method="post" action="/admin/supporters" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><label>${tr(lang,'Anzeigename','Display name')}<input name="displayName" required maxlength="80"></label><label>${tr(lang,'Betrag/Badge optional','Amount/badge optional')}<input name="amountLabel" maxlength="40" placeholder="€25"></label><label>${tr(lang,'Link optional','Link optional')}<input name="link" placeholder="https://..."></label><label class="check"><input type="checkbox" name="featured" value="1"> Featured</label><label class="check"><input type="checkbox" name="visible" value="1" checked> ${tr(lang,'Öffentlich sichtbar','Publicly visible')}</label><div class="span2 actions"><button class="button primary">${tr(lang,'Supporter hinzufügen','Add supporter')}</button></div></form><div class="panel tablewrap"><table><thead><tr><th>${tr(lang,'Supporter','Supporter')}</th><th>${tr(lang,'Betrag','Amount')}</th><th>Status</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="4">${tr(lang,'Noch keine Supporter.','No supporters yet.')}</td></tr>`}</tbody></table></div>`);
-});
+app.get('/admin/settings', requireAdmin, (req,res) => res.redirect('/admin?tab=settings'));
+
 
 app.post('/admin/settings', requireAdmin, checkCsrf, (req,res) => {
   const cleanDomain=String(req.body.serviceDomain||'status-hub.lol').trim().replace(/^https?:\/\//i,'').replace(/\/+$/,'').slice(0,120) || 'status-hub.lol';
-  const values=[2,3,4,5].map((limit)=>({limit,members:Math.max(1,Number(req.body[`tier${limit}`])||({2:50,3:100,4:250,5:500}[limit]))})).sort((a,b)=>a.members-b.members);
+  const defaults={2:50,3:100,4:250,5:500};
+  const values=[2,3,4,5].map((limit)=>({limit,members:Math.max(1,Number(req.body[`tier${limit}`])||defaults[limit])})).sort((a,b)=>a.members-b.members);
   const teamDiscordIds=String(req.body.teamDiscordIds||'').split(',').map((x)=>x.trim()).filter((x)=>validSnowflake(x)).slice(0,25);
-  updateSiteSettings({serviceDomain:cleanDomain,supportUrl:String(req.body.supportUrl||'').trim().slice(0,500),teamDiscordIds,donationLinks:{paypal:String(req.body.paypal||'').trim().slice(0,500),kofi:String(req.body.kofi||'').trim().slice(0,500),stripe:String(req.body.stripe||'').trim().slice(0,500),customUrl:String(req.body.customUrl||'').trim().slice(0,500),customLabel:String(req.body.customLabel||'').trim().slice(0,80)},freeBoost:{channelName:String(req.body.channelName||'Powered by status-hub.lol').trim().slice(0,100),verifyHours:Math.max(1,Math.min(48,Number(req.body.verifyHours)||6)),tiers:values}});
-  flash(req,'ok',l(req,'Einstellungen gespeichert.','Settings saved.')); res.redirect('/admin/settings');
+  const currency=/^[A-Za-z]{3}$/.test(String(req.body.paypalCurrency||''))?String(req.body.paypalCurrency).toUpperCase():'EUR';
+  const oldAuto=paypalAutoConfig(getSiteSettings());
+  const updated=updateSiteSettings({serviceDomain:cleanDomain,supportUrl:String(req.body.supportUrl||'').trim().slice(0,500),teamDiscordIds,donationLinks:{paypal:String(req.body.paypal||'').trim().slice(0,500),kofi:String(req.body.kofi||'').trim().slice(0,500),stripe:String(req.body.stripe||'').trim().slice(0,500),customUrl:String(req.body.customUrl||'').trim().slice(0,500),customLabel:String(req.body.customLabel||'').trim().slice(0,80)},premiumSales:{paypalUrl:String(req.body.premiumPaypalUrl||'').trim().slice(0,500),discordUserId:validSnowflake(req.body.salesDiscordUserId)?String(req.body.salesDiscordUserId).trim():'',discordUsername:String(req.body.salesDiscordUsername||'').trim().slice(0,80),prices:{premium5:String(req.body.pricePremium5||'').trim().slice(0,60),premium10:String(req.body.pricePremium10||'').trim().slice(0,60),premium15:String(req.body.pricePremium15||'').trim().slice(0,60),premium20:String(req.body.pricePremium20||'').trim().slice(0,60)},paypalAuto:{enabled:req.body.paypalAutoEnabled==='1',currency,accessDays:Math.max(1,Math.min(3650,Number(req.body.paypalAccessDays)||30)),webhookId:oldAuto.webhookId||'',amounts:{premium5:normalizedMoney(req.body.paypalAmountPremium5),premium10:normalizedMoney(req.body.paypalAmountPremium10),premium15:normalizedMoney(req.body.paypalAmountPremium15),premium20:normalizedMoney(req.body.paypalAmountPremium20)}}},freeBoost:{channelName:String(req.body.channelName||'Powered by status-hub.lol').trim().slice(0,100),verifyHours:Math.max(1,Math.min(48,Number(req.body.verifyHours)||6)),tiers:values}});
+  recalculateStoredFreeBoostLimits(updated); rebalanceAssignments();
+  flash(req,'ok',l(req,'Einstellungen gespeichert.','Settings saved.')); res.redirect('/admin?tab=settings#settings');
+});
+
+app.post('/admin/paypal/setup', requireAdmin, checkCsrf, rateLimit({ windowMs: 60_000, limit: 5 }), async (req,res) => {
+  try {
+    if (!paypalConfigured()) throw new Error('PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET fehlen in .env');
+    const settings=getSiteSettings(); const auto=paypalAutoConfig(settings);
+    const webhook=await ensureWebhook(auto.webhookId,`${baseUrl}/webhooks/paypal`);
+    updateSiteSettings({premiumSales:{paypalAuto:{enabled:true,webhookId:webhook.id}}});
+    flash(req,'ok',l(req,`PayPal ${paypalEnvironment()} verbunden. Webhook ist aktiv.`,`PayPal ${paypalEnvironment()} connected. Webhook is active.`));
+  } catch(error) { flash(req,'err',`PayPal: ${error.message}`); }
+  res.redirect('/admin?tab=settings#settings');
 });
 
 app.post('/admin/supporters', requireAdmin, checkCsrf, (req,res) => {
-  const name=String(req.body.displayName||'').trim(); if(!name){flash(req,'err',l(req,'Anzeigename fehlt.','Display name is required.'));return res.redirect('/admin/settings');}
+  const name=String(req.body.displayName||'').trim(); if(!name){flash(req,'err',l(req,'Anzeigename fehlt.','Display name is required.'));return res.redirect('/admin?tab=settings#settings');}
   upsertSupporter({displayName:name.slice(0,80),amountLabel:String(req.body.amountLabel||'').trim().slice(0,40),message:'',link:String(req.body.link||'').trim().slice(0,500),featured:req.body.featured==='1',visible:req.body.visible==='1'});
-  flash(req,'ok',l(req,'Supporter hinzugefügt.','Supporter added.')); res.redirect('/admin/settings');
+  flash(req,'ok',l(req,'Supporter hinzugefügt.','Supporter added.')); res.redirect('/admin?tab=settings#settings');
 });
 
-app.post('/admin/supporters/:id/delete', requireAdmin, checkCsrf, (req,res) => { deleteSupporter(req.params.id); flash(req,'ok',l(req,'Supporter entfernt.','Supporter removed.')); res.redirect('/admin/settings'); });
+app.post('/admin/supporters/:id/delete', requireAdmin, checkCsrf, (req,res) => { deleteSupporter(req.params.id); flash(req,'ok',l(req,'Supporter entfernt.','Supporter removed.')); res.redirect('/admin?tab=settings#settings'); });
 
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) { flash(req,'err',`Upload fehlgeschlagen: ${err.message}`); return res.redirect('/custom-bots/new'); }

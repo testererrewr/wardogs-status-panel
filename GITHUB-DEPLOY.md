@@ -1,4 +1,4 @@
-# GitHub + Debian Deployment v3.6
+# GitHub + Debian Deployment v3.9
 
 ## Repository aktualisieren
 
@@ -25,6 +25,6 @@ bash ./update.sh
 
 Den fertigen Einzeiler im Adminbereich unter `Node Manager` verwenden. Für Remote Nodes sollte die Control Plane über HTTPS erreichbar sein.
 
-## Spätere Domain status-hub.lol
+## Domain
 
-Solange DNS/HTTPS noch nicht eingerichtet ist, bleibt `PUBLIC_URL` auf der aktuellen IP/Domain. Die Branding-Domain kann unabhängig davon bereits `status-hub.lol` sein.
+Produktiv wird `PUBLIC_URL=https://status-hub.lol` verwendet. Discord OAuth nutzt `https://status-hub.lol/auth/discord/callback`. PayPal Webhooks nutzen `https://status-hub.lol/webhooks/paypal`.

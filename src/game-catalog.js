@@ -140,6 +140,12 @@ function normalizedDefinition(id, def = {}) {
   const special = SPECIAL[id] || {};
   const protocol = protocolName(options.protocol);
   const note = [special.note, EXTRA_NOTES[id]].filter(Boolean).join(' ');
+  const playerDataLimited = ['armareforger', 'conanexiles', 'asa', 'squad', 'tie', 'renown'].includes(id);
+  const serviceLike = ['discord', 'teamspeak2', 'teamspeak3', 'mumble', 'ventrilo'].includes(id) || /discord|teamspeak|mumble|ventrilo/i.test(protocol);
+  const placeholders = ['{server}', '{ping}'];
+  if (!playerDataLimited) placeholders.unshift('{players}', '{max}');
+  else placeholders.unshift('{max}');
+  if (!serviceLike) placeholders.splice(placeholders.length - 1, 0, '{map}');
   return {
     id,
     name: String(def?.name || id),
@@ -151,7 +157,8 @@ function normalizedDefinition(id, def = {}) {
     hostMode: special.hostMode || 'required',
     fields: Array.isArray(special.fields) ? special.fields : [],
     note,
-    playerDataLimited: ['armareforger', 'conanexiles', 'asa', 'squad', 'tie', 'renown'].includes(id)
+    playerDataLimited,
+    placeholders
   };
 }
 
@@ -168,6 +175,10 @@ export function gameDigMeta(id) {
 
 export function gameDigFieldDefs(id) {
   return gameDigMeta(id)?.fields || [];
+}
+
+export function gameDigPlaceholders(id) {
+  return gameDigMeta(id)?.placeholders || [];
 }
 
 export function specialCatalogEntries() {

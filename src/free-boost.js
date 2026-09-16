@@ -1,5 +1,5 @@
 import { decryptSecret } from './crypto.js';
-import { readDb, upsertUser, getSiteSettings } from './db.js';
+import { readDb, updateDb, upsertUser, getSiteSettings } from './db.js';
 
 function normalizeChannelName(value) {
   return String(value || '').trim().toLowerCase().replace(/[\s_.]+/g, '-').replace(/-+/g, '-');
@@ -26,6 +26,39 @@ async function discordBotApi(token, path) {
   const response = await fetch(`https://discord.com/api/v10${path}`, { headers: { Authorization: `Bot ${token}` } });
   if (!response.ok) throw new Error(`Discord API ${response.status}`);
   return response.json();
+}
+
+
+export function freeBoostRanges(settings = getSiteSettings()) {
+  const tiers = (Array.isArray(settings?.freeBoost?.tiers) ? settings.freeBoost.tiers : [])
+    .map((x) => ({ members: Math.max(1, Number(x.members) || 1), limit: Math.min(5, Math.max(2, Number(x.limit) || 2)) }))
+    .sort((a, b) => a.members - b.members || a.limit - b.limit);
+  const ranges = [];
+  let from = 0;
+  let currentLimit = 1;
+  for (const tier of tiers) {
+    if (tier.members > from) ranges.push({ from, to: tier.members - 1, limit: currentLimit });
+    from = tier.members;
+    currentLimit = Math.max(currentLimit, tier.limit);
+  }
+  ranges.push({ from, to: null, limit: currentLimit });
+  return ranges;
+}
+
+export function recalculateStoredFreeBoostLimits(settings = getSiteSettings()) {
+  return updateDb((db) => {
+    let changed = 0;
+    for (const user of db.users) {
+      if (user.freeBoost?.state !== 'verified') continue;
+      const memberCount = Number(user.freeBoost.memberCount || 0);
+      const freeBotLimit = freeBoostLimitForMembers(memberCount, settings);
+      if (Number(user.freeBoost.freeBotLimit || 1) !== freeBotLimit) {
+        user.freeBoost = { ...user.freeBoost, freeBotLimit };
+        changed += 1;
+      }
+    }
+    return changed;
+  });
 }
 
 export function freeBoostLimitForMembers(memberCount, settings = getSiteSettings()) {

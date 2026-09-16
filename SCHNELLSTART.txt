@@ -1,4 +1,4 @@
-SERVER STATUS HUB v3.6
+SERVER STATUS HUB v3.8
 
 UPDATE VPS:
 cd /opt/wardogs-status-panel

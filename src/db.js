@@ -20,6 +20,29 @@ function defaultSettings() {
       customLabel: '',
       customUrl: ''
     },
+    premiumSales: {
+      paypalUrl: String(process.env.PREMIUM_PAYPAL_URL || ''),
+      discordUserId: String(process.env.SALES_DISCORD_USER_ID || ''),
+      discordUsername: String(process.env.SALES_DISCORD_USERNAME || ''),
+      prices: {
+        premium5: '€4.99 / 30 days',
+        premium10: '€8.99 / 30 days',
+        premium15: '€12.99 / 30 days',
+        premium20: '€16.99 / 30 days'
+      },
+      paypalAuto: {
+        enabled: false,
+        currency: 'EUR',
+        accessDays: 30,
+        webhookId: '',
+        amounts: {
+          premium5: '4.99',
+          premium10: '8.99',
+          premium15: '12.99',
+          premium20: '16.99'
+        }
+      }
+    },
     freeBoost: {
       channelName: 'Powered by status-hub.lol',
       verifyHours: 6,
@@ -54,7 +77,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 8, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 10, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -62,6 +85,7 @@ function mergeSettings(input = {}) {
     ...base,
     ...input,
     donationLinks: { ...base.donationLinks, ...(input.donationLinks || {}) },
+    premiumSales: { ...base.premiumSales, ...(input.premiumSales || {}), prices: { ...base.premiumSales.prices, ...(input.premiumSales?.prices || {}) }, paypalAuto: { ...base.premiumSales.paypalAuto, ...(input.premiumSales?.paypalAuto || {}), amounts: { ...base.premiumSales.paypalAuto.amounts, ...(input.premiumSales?.paypalAuto?.amounts || {}) } } },
     freeBoost: { ...base.freeBoost, ...(input.freeBoost || {}), tiers: Array.isArray(input.freeBoost?.tiers) && input.freeBoost.tiers.length ? input.freeBoost.tiers : base.freeBoost.tiers },
     teamDiscordIds: Array.isArray(input.teamDiscordIds) ? input.teamDiscordIds.filter((x) => /^\d{17,20}$/.test(String(x))) : base.teamDiscordIds
   };
@@ -69,13 +93,15 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 8;
+  parsed.version = 10;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
   if (!Array.isArray(parsed.statusNodes)) parsed.statusNodes = [];
   if (!Array.isArray(parsed.supporters)) parsed.supporters = [];
   if (!Array.isArray(parsed.botServices)) parsed.botServices = previousVersion < 8 ? defaultBotServices() : [];
+  if (!Array.isArray(parsed.paypalPurchases)) parsed.paypalPurchases = [];
+  if (!Array.isArray(parsed.paypalWebhookEvents)) parsed.paypalWebhookEvents = [];
   parsed.siteSettings = mergeSettings(parsed.siteSettings || {});
 
   parsed.users = parsed.users.map((u) => ({
@@ -86,7 +112,8 @@ function migrate(parsed) {
     statusBotLimitOverride: (u.statusBotLimitOverride !== null && u.statusBotLimitOverride !== undefined && String(u.statusBotLimitOverride).trim() !== '' && Number.isFinite(Number(u.statusBotLimitOverride))) ? Number(u.statusBotLimitOverride) : (Number(u.statusBotLimit) !== 1 && Number.isFinite(Number(u.statusBotLimit)) ? Number(u.statusBotLimit) : null),
     customBotLimit: Number.isFinite(Number(u.customBotLimit)) ? Number(u.customBotLimit) : 0,
     locale: u.locale === 'en' ? 'en' : 'de',
-    freeBoost: u.freeBoost && typeof u.freeBoost === 'object' ? u.freeBoost : null
+    freeBoost: u.freeBoost && typeof u.freeBoost === 'object' ? u.freeBoost : null,
+    premiumSource: u.premiumSource && typeof u.premiumSource === 'object' ? u.premiumSource : null
   }));
 
   parsed.servers = parsed.servers.map((s) => s.gameType ? s : ({ ...s, gameType: 'wardogs', queryConfig: { baseUrl: s.rconUrl || '' }, querySecretEnc: s.rconPasswordEnc || null }));
@@ -182,7 +209,7 @@ export function upsertStatusNode(node) {
 export function deleteStatusNode(id) { updateDb((db) => { db.statusNodes = (db.statusNodes || []).filter((n) => n.id !== id); for (const s of db.servers) if (s.assignedNodeId === id) s.assignedNodeId = null; }); }
 
 export function getSiteSettings() { return readDb().siteSettings; }
-export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }
+export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, premiumSales: { ...(db.siteSettings?.premiumSales || {}), ...(patch.premiumSales || {}), prices: { ...(db.siteSettings?.premiumSales?.prices || {}), ...(patch.premiumSales?.prices || {}) }, paypalAuto: { ...(db.siteSettings?.premiumSales?.paypalAuto || {}), ...(patch.premiumSales?.paypalAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.paypalAuto?.amounts || {}), ...(patch.premiumSales?.paypalAuto?.amounts || {}) } } }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }
 
 export function listSupporters(visibleOnly = false) { const rows = readDb().supporters || []; return rows.filter((x) => !visibleOnly || x.visible !== false).sort((a,b) => Number(Boolean(b.featured)) - Number(Boolean(a.featured)) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
 export function upsertSupporter(supporter) {
@@ -214,3 +241,35 @@ export function upsertBotService(service) {
   });
 }
 export function deleteBotService(id) { updateDb((db) => { db.botServices = (db.botServices || []).filter((x) => x.id !== id); }); }
+
+
+export function createPaypalPurchase(purchase) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.paypalPurchases)) db.paypalPurchases = [];
+    const now = new Date().toISOString();
+    const entry = { id: purchase.id || crypto.randomUUID(), status: 'created', createdAt: now, updatedAt: now, ...purchase };
+    db.paypalPurchases.push(entry);
+    return entry;
+  });
+}
+export function getPaypalPurchase(id) { return (readDb().paypalPurchases || []).find((x) => x.id === id) || null; }
+export function getPaypalPurchaseByOrder(orderId) { return (readDb().paypalPurchases || []).find((x) => x.orderId === orderId) || null; }
+export function updatePaypalPurchase(id, patch) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.paypalPurchases)) db.paypalPurchases = [];
+    const index = db.paypalPurchases.findIndex((x) => x.id === id);
+    if (index < 0) return null;
+    db.paypalPurchases[index] = { ...db.paypalPurchases[index], ...patch, updatedAt: new Date().toISOString() };
+    return db.paypalPurchases[index];
+  });
+}
+export function rememberPaypalWebhookEvent(eventId, eventType) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.paypalWebhookEvents)) db.paypalWebhookEvents = [];
+    if (db.paypalWebhookEvents.some((x) => x.id === eventId)) return false;
+    db.paypalWebhookEvents.push({ id: eventId, eventType, processedAt: new Date().toISOString() });
+    if (db.paypalWebhookEvents.length > 1000) db.paypalWebhookEvents = db.paypalWebhookEvents.slice(-1000);
+    return true;
+  });
+}
+export function paypalWebhookEventSeen(eventId) { return (readDb().paypalWebhookEvents || []).some((x) => x.id === eventId); }
