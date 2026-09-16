@@ -1,0 +1,9 @@
+FROM docker:27-cli
+RUN apk add --no-cache nodejs npm
+WORKDIR /runner
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm install --omit=dev --no-audit --no-fund
+COPY src/runner.js ./src/runner.js
+EXPOSE 4000
+CMD ["node", "src/runner.js"]

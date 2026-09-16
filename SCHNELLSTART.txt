@@ -1,27 +1,16 @@
-WARDOGS STATUS PANEL v2.1 - GITHUB + DEBIAN VPS
-================================================
+SERVER STATUS HUB v3 - SCHNELLSTART
 
-1) Diesen Ordner in ein GitHub Repository hochladen.
-   WICHTIG: Keine .env und keine data/db.json hochladen.
+1) Auf GitHub Dateien committen.
+2) VPS:
+   cd /opt/wardogs-status-panel
+   ./update.sh
 
-2) Auf dem Debian VPS (öffentliches Repo):
+Neuinstallation:
+   git clone https://github.com/USER/REPO.git /opt/server-status-hub
+   cd /opt/server-status-hub
+   chmod +x *.sh
+   ./setup-vps.sh
 
-sudo apt-get update && sudo apt-get install -y git && sudo git clone https://github.com/DEINNAME/wardogs-status-panel.git /opt/wardogs-status-panel && cd /opt/wardogs-status-panel && sudo ./setup-vps.sh
-
-3) Discord OAuth Redirect URI exakt eintragen:
-
-https://DEINE-DOMAIN/auth/discord/callback
-
-oder bei IP-Betrieb:
-
-http://DEINE-IP/auth/discord/callback
-
-4) Spätere Updates nach einem GitHub Push:
-
-cd /opt/wardogs-status-panel && sudo ./update.sh
-
-5) Diagnose:
-
-cd /opt/wardogs-status-panel && sudo ./doctor.sh
-
-Ausführliche Anleitung: README.md und GITHUB-DEPLOY.md
+Discord Redirect exakt so eintragen, wie setup-vps.sh ihn ausgibt.
+Neue User registrieren sich selbst mit Discord und erhalten 1 Status Bot.
+Custom Bot Slots werden ausschließlich durch Admins freigeschaltet.

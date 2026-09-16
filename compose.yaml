@@ -1,13 +1,16 @@
 services:
-  wardogs-panel:
+  server-status-hub:
     build: .
     restart: unless-stopped
     env_file:
       - .env
-    expose:
-      - "3000"
+    ports:
+      - "${PANEL_BIND:-0.0.0.0:3000}:3000"
     volumes:
       - ./data:/app/data
+      - ./custom-bots:/app/custom-bots
+    depends_on:
+      - runner
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/healthz"]
       interval: 30s
@@ -15,11 +18,32 @@ services:
       retries: 3
       start_period: 20s
 
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    restart: unless-stopped
+    environment:
+      RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET}
+      RUNNER_PORT: 4000
+    expose:
+      - "4000"
+    volumes:
+      - ./custom-bots:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "--header", "X-Runner-Secret: ${RUNNER_SHARED_SECRET}", "http://127.0.0.1:4000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   caddy:
     image: caddy:2-alpine
+    profiles: ["proxy"]
     restart: unless-stopped
     depends_on:
-      - wardogs-panel
+      - server-status-hub
     environment:
       PUBLIC_URL: ${PUBLIC_URL}
     ports:

@@ -1,9 +1,6 @@
-#!/usr/bin/env sh
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -f .env ]; then
-  echo "FEHLER: .env fehlt. Kopiere .env.example nach .env und trage die Werte ein."
-  exit 1
-fi
-npm install --no-audit --no-fund
-exec npm start
+mkdir -p data custom-bots
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then chown -R 1000:1000 data custom-bots; fi
+if docker compose version >/dev/null 2>&1; then docker compose up -d --build; else docker-compose up -d --build; fi

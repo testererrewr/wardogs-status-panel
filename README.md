@@ -1,328 +1,238 @@
-# WARDOGS Discord Status Panel v2.1 — GitHub + Single VPS
+# Server Status Hub v3.0
 
-Diese Version ist für **einen Debian-VPS** gedacht. Auf demselben VPS laufen:
+Multi-User Discord Status-Bot Hosting für einen Debian-VPS.
 
-- das Webpanel
-- Discord OAuth2 Login
-- alle konfigurierten Discord Status-Bots
-- die WARDOGS/RCON-Abfragen
-- Caddy als Reverse Proxy
-- bei Domain-Nutzung automatisch HTTPS
+## Funktionen
 
-Es gibt **keinen separaten Worker** mehr.
+- Anmeldung/Registrierung ausschließlich über Discord OAuth2 (`identify`)
+- jeder neue Benutzer erhält standardmäßig **1 kostenlosen Status-Bot**
+- Admin kann pro Benutzer das Status-Bot-Limit erhöhen oder auf 0 setzen
+- Status-Bots gehören immer ihrem Benutzer; normale User sehen nur eigene Bots
+- Servertypen:
+  - **FiveM** (`dynamic.json` / `players.json`)
+  - **WARDOGS** (`GET /v1/status`, Bearer/RCON Passwort)
+  - **GameDig** (300+ Games; Game-ID + Host/Port)
+  - **Generische JSON API** mit konfigurierbaren JSON-Pfaden
+- rotierende Discord Presence-Texte mit `{players}`, `{max}`, `{map}`, `{server}`, `{game}`, `{ping}`
+- Bot-Tokens und Query-Secrets AES-256-GCM verschlüsselt
+- öffentliche User dürfen standardmäßig keine privaten/LAN/localhost-Ziele abfragen (SSRF-Schutz)
+- Admin kann private Ziele pro Status-Bot erlauben
 
-## Was das Panel kann
+### Custom Bot Hosting
 
-- Login ausschließlich mit Discord (`identify`)
-- Admin-/Viewer-Freigabe über Discord User IDs
-- beliebig mehrere Servereinträge / Discord Bot Accounts
-- pro Gameserver eigener Discord Bot Token
-- WARDOGS Status über `GET /v1/status`
-- Spielerzahl und maximale Slots
-- aktuelle Map
-- rotierende Discord-Aktivitäten, z. B.:
-  - `{players}/{max} Spieler online`
-  - `Map: {map}`
-  - `Server: {server}`
-- eigener Wechsel-Timer und eigener RCON-Update-Timer
-- Offline-Text, wenn der Gameserver nicht erreichbar ist
-- RCON-Test und Bot-Neustart direkt im Panel
-- Bot-Einladelink
-- Bot Tokens und RCON-Passwörter verschlüsselt in `data/db.json`
-- Sessions persistent in `data/sessions.json`
-- Docker Restart Policy `unless-stopped`
-- Caddy Reverse Proxy
-- Backup- und Diagnose-Skripte
+Custom Bot Uploads sind standardmäßig **gesperrt** (`customBotLimit = 0`). Ein Admin kann einem Benutzer im Bereich **Benutzer** Upload-Slots geben.
 
----
+- ZIP Upload
+- Node.js 22 oder Python 3.13
+- ENV-Variablen verschlüsselt gespeichert
+- normale User-Uploads bleiben zuerst `pending`
+- **Admin muss jeden Upload freigeben**, bevor er laufen kann
+- Bot läuft danach in einem eigenen Docker-Container
+- 256 MB RAM, 0.5 CPU, PID-Limit
+- read-only Root-FS + kleine tmpfs-Bereiche
+- `cap-drop ALL`, `no-new-privileges`
+- keine Host-Verzeichnisse und kein Docker-Socket im hochgeladenen Bot
+- Logs im Panel
 
-# Schnellinstallation über GitHub auf Debian
+Der interne `runner` besitzt für die Containerverwaltung Zugriff auf den Docker-Socket. Er ist **nicht öffentlich erreichbar** und akzeptiert nur Requests mit einem zufälligen Shared Secret vom Panel. Trotzdem gilt: fremden Code vor der Freigabe prüfen.
 
-Empfohlen: Debian 12/13 VPS mit Root- oder sudo-Zugang. Das Projekt wird einmal in ein GitHub Repository hochgeladen. Danach muss keine ZIP-Datei mehr auf den VPS kopiert werden.
+## Installation auf Debian VPS
 
-## 1. Repository klonen + Setup starten
-
-Für ein öffentliches Repository kannst du auf dem VPS direkt diese eine Zeile verwenden:
+Repo klonen:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && sudo git clone https://github.com/DEINNAME/wardogs-status-panel.git /opt/wardogs-status-panel && cd /opt/wardogs-status-panel && sudo ./setup-vps.sh
+cd /opt
+git clone https://github.com/DEINNAME/wardogs-status-panel.git server-status-hub
+cd server-status-hub
+chmod +x *.sh
+./setup-vps.sh
 ```
 
-`DEINNAME` und den Repository-Namen entsprechend ersetzen. Für ein privates Repository empfiehlt sich ein SSH Deploy Key. Details stehen in `GITHUB-DEPLOY.md`.
+Das Setup bietet zwei Modi:
 
-## 2. Spätere Updates direkt von GitHub
+1. **Direkt über IP:3000** – sinnvoll wenn 80/443 bereits belegt sind.
+2. **Domain + HTTPS über Caddy** – benötigt freie Ports 80/443.
 
-Nach einem Push zu GitHub genügt auf dem VPS:
-
-```bash
-cd /opt/wardogs-status-panel && sudo ./update.sh
-```
-
-Das Update-Skript macht `git pull --ff-only` und baut/startet danach den Docker-Stack neu. `.env` und `data/` bleiben lokal auf dem VPS erhalten.
-
-Das Setup fragt dich nach:
-
-1. öffentlicher Panel-URL
-2. Discord OAuth Client ID
-3. Discord OAuth Client Secret
-4. deiner Discord User ID
-
-Secrets für Sessions und Verschlüsselung erzeugt das Skript automatisch.
-
----
-
-# Panel per IP aufrufen
-
-Beim Setup beispielsweise eingeben:
+Bei Direktmodus lautet die URL z. B.:
 
 ```text
-http://203.0.113.10
+http://159.195.109.20:3000
 ```
 
-Danach lautet der Panel-Aufruf:
+Discord Redirect:
 
 ```text
-http://203.0.113.10
+http://159.195.109.20:3000/auth/discord/callback
 ```
 
-Discord OAuth Redirect URI:
+Bei Domainmodus z. B.:
 
 ```text
-http://203.0.113.10/auth/discord/callback
+https://status.example.com/auth/discord/callback
 ```
 
-Diese Redirect URI exakt im Discord Developer Portal eintragen.
+## Discord OAuth Application
 
-**Hinweis:** Für ein dauerhaft öffentlich erreichbares Panel ist der Domain-Modus mit HTTPS deutlich empfehlenswerter.
+Im Discord Developer Portal eine Application für den Panel-Login verwenden. Unter OAuth2 -> Redirects exakt die vom Setup ausgegebene Callback-URL eintragen. Das Panel fordert nur `identify` an.
 
----
+Die Status-Bots selbst sind separate reguläre Discord Bot Accounts. Jeder Status-Bot benötigt seinen eigenen Bot Token.
 
-# Panel per Domain + HTTPS aufrufen
+## User-Modell
 
-Beispiel:
+Erster Login eines neuen Discord Accounts:
 
 ```text
-https://bots.example.com
+role = user
+statusBotLimit = 1
+customBotLimit = 0
 ```
 
-Vorher einen DNS `A`-Record setzen:
+Accounts in `ADMIN_DISCORD_IDS` werden automatisch Admins.
+
+Im Adminbereich `/users` kannst du z. B. setzen:
 
 ```text
-bots.example.com -> DEINE_VPS_IP
+User A: Status 1 / Custom 0
+User B: Status 5 / Custom 1
+User C: Status 10 / Custom 3
 ```
 
-Am VPS müssen TCP-Port **80 und 443** erreichbar sein. Caddy holt und erneuert das TLS-Zertifikat automatisch.
+## FiveM
 
-Discord OAuth Redirect URI:
+Basis-URL z. B.:
 
 ```text
-https://bots.example.com/auth/discord/callback
+http://1.2.3.4:30120
 ```
 
-Diese URI exakt im Discord Developer Portal unter **OAuth2 -> Redirects** eintragen.
+Das Panel liest `dynamic.json` und `players.json`.
 
----
+## WARDOGS
 
-# Discord-Anwendung für den Panel-Login
-
-Du brauchst eine Discord Application für den Login des Panels.
-
-Im Discord Developer Portal:
-
-1. Application erstellen/öffnen
-2. **OAuth2** öffnen
-3. unter **Redirects** die Callback-URL eintragen
-4. Client ID und Client Secret beim Setup angeben
-
-Das Panel fordert beim Login ausschließlich den Scope `identify` an.
-
-Diese Login-Application ist unabhängig von den Status-Bots. Für jeden Gameserver, der als eigener Bot in Discord erscheinen soll, benötigst du einen regulären Discord Bot Token.
-
----
-
-# Ersten Gameserver hinzufügen
-
-Nach dem Discord-Login:
-
-**Server hinzufügen** und eintragen:
-
-- Anzeigename
-- Discord Bot Token
-- WARDOGS RCON URL, z. B. `http://10.0.0.5:7776`
-- RCON Passwort
-- RCON Update-Intervall
-- Status-Wechselintervall
-- Statuszeilen
-- Offline-Text
-
-Beispiel für die Statusrotation:
+Basis-URL z. B.:
 
 ```text
-{players}/{max} Spieler online
-Map: {map}
+http://1.2.3.4:7776
 ```
 
-Dann wechselt Discord beispielsweise zwischen:
+Dazu RCON/Bearer-Passwort. Abfrage: `/v1/status`.
+
+## GameDig
+
+Beispiel Minecraft:
 
 ```text
-24/100 Spieler online
+Game-ID: minecraft
+Host: play.example.com
+Port: 25565
 ```
 
-und:
+GameDig unterstützt sehr viele Game-Query-Protokolle. Je nach Spiel ist statt des Gameports ein Query-Port nötig.
+
+## Generische JSON API
+
+Beispiel JSON:
+
+```json
+{
+  "players": { "current": 12, "max": 64 },
+  "map": "Arena",
+  "serverName": "EU #1"
+}
+```
+
+Standardpfade:
 
 ```text
-Map: Carentan
+players.current
+players.max
+map
+serverName
 ```
 
-Unterstützte Platzhalter:
+Optional kann ein Bearer Token gespeichert werden.
+
+## Custom Bot ZIP Format
+
+Node Beispiel:
 
 ```text
-{players}
-{max}
-{map}
-{server}
+my-bot.zip
+├── index.js
+└── package.json
 ```
 
----
+Entrypoint: `index.js`
 
-# Docker-Verwaltung
+Python Beispiel:
 
-Status:
-
-```bash
-docker compose ps
+```text
+my-bot.zip
+├── bot.py
+└── requirements.txt
 ```
 
-Logs des Panels und der Bots:
+Entrypoint: `bot.py`
 
-```bash
-docker compose logs -f wardogs-panel
+Secrets nicht in die ZIP packen. Im Panel als ENV eintragen:
+
+```text
+DISCORD_TOKEN=...
+API_KEY=...
 ```
 
-Caddy/HTTPS Logs:
+## Update von GitHub
 
 ```bash
-docker compose logs -f caddy
-```
-
-Neustart:
-
-```bash
-docker compose restart wardogs-panel
-```
-
-Kompletten Stack neu bauen/starten:
-
-```bash
-docker compose up -d --build
-```
-
-Stoppen:
-
-```bash
-docker compose down
-```
-
-Die Bot-Konfiguration bleibt in `./data` erhalten.
-
----
-
-# Diagnose
-
-```bash
-./doctor.sh
-```
-
-Das prüft u. a.:
-
-- Docker
-- Docker Compose
-- `.env`
-- PUBLIC_URL
-- OAuth Client ID
-- Admin-ID
-- Compose-Konfiguration
-- Containerstatus
-- letzte Panel-Logs
-
----
-
-# Backup
-
-```bash
-./backup.sh
-```
-
-Das sichert:
-
-- `.env`
-- `data/db.json`
-- `data/sessions.json`
-
-in `./backups/`.
-
-**Wichtig:** `APP_ENCRYPTION_KEY` aus `.env` wird zum Entschlüsseln der gespeicherten Bot Tokens/RCON-Passwörter benötigt. Deshalb gehört `.env` unbedingt ins Backup, aber niemals öffentlich auf GitHub.
-
----
-
-# Update
-
-Neue Projektdateien über die vorhandenen kopieren, `.env` und `data/` behalten und anschließend:
-
-```bash
+cd /opt/server-status-hub
 ./update.sh
 ```
 
----
+Das Skript führt `git pull --ff-only` aus, korrigiert die Rechte für `data/` und `custom-bots/` und baut den Stack neu.
 
-# Firewall
+Wenn dein bestehender Clone noch `/opt/wardogs-status-panel` heißt, ist das ebenfalls okay:
 
-Für Domain/HTTP(S)-Zugriff benötigt der VPS eingehend:
-
-```text
-TCP 80
-TCP 443
-UDP 443 optional (HTTP/3)
+```bash
+cd /opt/wardogs-status-panel
+./update.sh
 ```
 
-Port 3000 wird **nicht öffentlich veröffentlicht**. Er ist nur innerhalb des Docker-Netzwerks zwischen Caddy und dem Panel erreichbar.
+## Rechte-Fix
 
-Der VPS benötigt ausgehend Zugriff auf:
-
-- Discord API/Gateway
-- deine WARDOGS RCON-Adressen
-
----
-
-# Verzeichnisstruktur
+Das Setup und `update.sh` setzen automatisch:
 
 ```text
-wardogs-status-panel-v2.0/
-├── Caddyfile
-├── compose.yaml
-├── Dockerfile
-├── setup-vps.sh
-├── doctor.sh
-├── backup.sh
-├── update.sh
-├── .env.example
-├── data/
-├── public/
-└── src/
+data/        -> UID/GID 1000:1000
+custom-bots/ -> UID/GID 1000:1000
 ```
 
----
+Damit tritt der frühere Fehler `EACCES: permission denied, open '/app/data/db.tmp'` nicht mehr auf.
 
-# Sicherheit
+## Diagnose / Backup
 
-- Login ausschließlich per Discord OAuth2
-- Login-CSRF-Schutz über OAuth `state`
-- Formular-CSRF-Schutz
-- Login-/Request-Rate-Limits
-- HTTP Security Header via Helmet
-- Bot Tokens/RCON-Passwörter AES-256-GCM verschlüsselt
-- `.env` wird mit Dateirechten `600` erstellt
-- Datenverzeichnis wird mit restriktiven Rechten angelegt
-- Status-Bots sind normale Discord Bot Accounts, keine Self-Bots
-- bei Domain-Nutzung HTTPS via Caddy
+```bash
+./doctor.sh
+./backup.sh
+```
 
+Backup enthält `.env`, Datenbank und Custom-Bot-Uploads und damit sensible Daten. Nicht öffentlich hochladen.
+
+## Architektur
+
+```text
+Internet
+   |
+   +--> :3000 direkt ODER Caddy :80/:443
+                |
+          Server Status Hub
+            |        |
+            |        +--> Discord Status Bots
+            |        +--> FiveM/WARDOGS/GameDig/JSON Queries
+            |
+            +--> interner Runner ----> Docker Socket
+                      |
+                      +--> isolierter Custom Bot #1
+                      +--> isolierter Custom Bot #2
+```
+
+`data/`, `custom-bots/` und `.env` sind in `.gitignore` und dürfen nicht nach GitHub gepusht werden.

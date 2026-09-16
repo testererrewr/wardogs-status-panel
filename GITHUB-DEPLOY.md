@@ -1,79 +1,37 @@
-# GitHub → Debian VPS Deployment
+# GitHub Deploy
 
-Dieses Repository ist so vorbereitet, dass **keine ZIP-Datei mehr auf den VPS kopiert werden muss**.
+## Bestehendes GitHub Repository aktualisieren
 
-## 1. Repository auf GitHub anlegen
-
-Auf GitHub ein neues Repository erstellen, z. B.:
+Entpacke die neue Version lokal und ersetze die Projektdateien im Repository. **Nicht** hochladen:
 
 ```text
-wardogs-status-panel
+.env
+data/
+custom-bots/
+backups/
 ```
 
-Den Inhalt dieses Projektordners in das Repository hochladen. Wichtig: **niemals `.env`, `data/db.json`, Backups oder echte Tokens committen**. Diese Dateien sind bereits durch `.gitignore` ausgeschlossen.
+Dann committen/pushen.
 
-## 2. Erstinstallation auf dem VPS
-
-### Öffentliches GitHub-Repository
-
-Auf einem frischen Debian-VPS reicht anschließend:
+Auf dem VPS:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && sudo git clone https://github.com/DEINNAME/wardogs-status-panel.git /opt/wardogs-status-panel && cd /opt/wardogs-status-panel && sudo ./setup-vps.sh
+cd /opt/wardogs-status-panel   # oder dein Clone-Pfad
+./update.sh
 ```
 
-`DEINNAME` durch deinen GitHub-Benutzernamen bzw. deine Organisation ersetzen.
+`update.sh` zieht GitHub, korrigiert automatisch die Schreibrechte der persistenten Ordner und baut Panel + Runner neu.
 
-### Privates Repository
-
-Für private Repositories am besten einen SSH Deploy Key verwenden und dann über SSH klonen:
+## Neuinstallation
 
 ```bash
-git clone git@github.com:DEINNAME/wardogs-status-panel.git /opt/wardogs-status-panel
-```
-
-Danach:
-
-```bash
-cd /opt/wardogs-status-panel
+sudo apt update
+sudo apt install -y git
+cd /opt
+sudo git clone https://github.com/USER/REPO.git server-status-hub
+cd server-status-hub
+sudo chmod +x *.sh
 sudo ./setup-vps.sh
 ```
 
-## 3. Spätere Updates
-
-Wenn du Änderungen zu GitHub gepusht hast, auf dem VPS nur noch:
-
-```bash
-cd /opt/wardogs-status-panel && sudo ./update.sh
-```
-
-`update.sh` führt automatisch aus:
-
-1. `git pull --ff-only`
-2. Docker Images aktualisieren
-3. Panel neu bauen
-4. Container neu starten
-
-Die lokale `.env` und der Ordner `data/` bleiben dabei erhalten und werden **nicht** aus GitHub überschrieben.
-
-## 4. Status prüfen
-
-```bash
-cd /opt/wardogs-status-panel
-sudo ./doctor.sh
-```
-
-Logs:
-
-```bash
-docker compose logs -f wardogs-panel
-```
-
-## 5. Backup vor größeren Änderungen
-
-```bash
-cd /opt/wardogs-status-panel
-sudo ./backup.sh
-```
-
-Wichtig: Das Backup enthält auch Material, das zum Entschlüsseln der gespeicherten Bot-/RCON-Secrets notwendig ist. Sicher verwahren.
+Für private Repositories SSH Deploy Key verwenden.

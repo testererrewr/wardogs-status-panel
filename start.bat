@@ -1,21 +1,10 @@
 @echo off
-cd /d "%~dp0"
-if not exist .env (
-  echo FEHLER: .env fehlt. Kopiere zuerst .env.example nach .env und trage die Werte ein.
-  pause
-  exit /b 1
-)
-call npm install --no-audit --no-fund
+cd /d %~dp0
+where docker >nul 2>nul
 if errorlevel 1 (
-  echo.
-  echo npm install ist fehlgeschlagen.
+  echo Docker Desktop wird fuer Server Status Hub v3 benoetigt.
   pause
   exit /b 1
 )
-call npm start
-if errorlevel 1 (
-  echo.
-  echo Das Panel wurde mit einem Fehler beendet.
-  pause
-  exit /b 1
-)
+docker compose up -d --build
+if errorlevel 1 pause

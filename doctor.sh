@@ -1,47 +1,17 @@
 #!/usr/bin/env bash
 set -u
 cd "$(dirname "$0")"
-FAIL=0
-
-ok(){ printf '  [OK] %s\n' "$1"; }
-warn(){ printf '  [!!] %s\n' "$1"; FAIL=1; }
-
-echo "WARDOGS Panel Diagnose"
-echo
-
-if command -v docker >/dev/null 2>&1; then ok "Docker gefunden"; else warn "Docker fehlt"; fi
-
-if docker compose version >/dev/null 2>&1; then
-  COMPOSE=(docker compose); ok "docker compose verfügbar"
-elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE=(docker-compose); ok "docker-compose verfügbar"
-else
-  warn "Docker Compose fehlt"
-  COMPOSE=()
-fi
-
+echo "=== Server Status Hub Diagnose ==="
+command -v docker >/dev/null && echo "[OK] Docker" || echo "[FEHLER] Docker fehlt"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "[FEHLER] Compose fehlt"; exit 1; fi
+[[ -f .env ]] && echo "[OK] .env" || echo "[FEHLER] .env fehlt"
 if [[ -f .env ]]; then
-  ok ".env vorhanden"
-else
-  warn ".env fehlt (setup-vps.sh ausführen)"
+  grep -E '^(PUBLIC_URL|PANEL_BIND|COMPOSE_PROFILES|ALLOW_PUBLIC_REGISTRATION|DEFAULT_STATUS_BOT_LIMIT)=' .env || true
 fi
-
-if [[ -f .env ]]; then
-  PUBLIC_URL="$(grep -E '^PUBLIC_URL=' .env | head -1 | cut -d= -f2-)"
-  CLIENT_ID="$(grep -E '^DISCORD_OAUTH_CLIENT_ID=' .env | head -1 | cut -d= -f2-)"
-  ADMIN_IDS="$(grep -E '^ADMIN_DISCORD_IDS=' .env | head -1 | cut -d= -f2-)"
-  [[ "$PUBLIC_URL" =~ ^https?:// ]] && ok "PUBLIC_URL: $PUBLIC_URL" || warn "PUBLIC_URL ungültig"
-  [[ -n "$CLIENT_ID" ]] && ok "Discord OAuth Client ID gesetzt" || warn "Discord OAuth Client ID fehlt"
-  [[ -n "$ADMIN_IDS" ]] && ok "Mindestens ein Panel-Admin gesetzt" || warn "ADMIN_DISCORD_IDS fehlt"
-  echo "  OAuth Redirect: ${PUBLIC_URL%/}/auth/discord/callback"
-fi
-
-if ((${#COMPOSE[@]})); then
-  if "${COMPOSE[@]}" config >/dev/null 2>&1; then ok "Compose-Konfiguration gültig"; else warn "Compose-Konfiguration ungültig"; fi
-  echo
-  "${COMPOSE[@]}" ps 2>/dev/null || true
-  echo
-  if "${COMPOSE[@]}" logs --tail=25 wardogs-panel 2>/dev/null; then :; fi
-fi
-
-exit "$FAIL"
+for d in data custom-bots; do
+  mkdir -p "$d"
+  echo "[$d] owner=$(stat -c '%u:%g' "$d" 2>/dev/null || echo '?') perms=$(stat -c '%a' "$d" 2>/dev/null || echo '?')"
+done
+echo; "${COMPOSE[@]}" ps || true
+echo; echo "--- Panel Logs ---"; "${COMPOSE[@]}" logs --tail=80 server-status-hub 2>/dev/null || true
+echo; echo "--- Runner Logs ---"; "${COMPOSE[@]}" logs --tail=50 runner 2>/dev/null || true
