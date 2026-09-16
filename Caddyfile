@@ -1,0 +1,4 @@
+{$PUBLIC_URL} {
+    encode zstd gzip
+    reverse_proxy wardogs-panel:3000
+}

@@ -1,0 +1,24 @@
+{
+  "name": "wardogs-discord-status-panel",
+  "version": "2.1.0",
+  "private": true,
+  "description": "GitHub-deployable single-VPS WARDOGS Discord status bot panel with Discord OAuth login and Caddy reverse proxy.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/index.js && node --check src/bot-manager.js && node --check src/db.js && node --check src/crypto.js && node --check src/wardogs.js && node --check src/html.js && node --check src/file-session-store.js",
+    "keygen": "node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "express-session": "^1.18.2",
+    "helmet": "^8.1.0"
+  }
+}

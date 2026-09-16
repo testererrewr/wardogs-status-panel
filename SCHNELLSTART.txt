@@ -1,0 +1,27 @@
+WARDOGS STATUS PANEL v2.1 - GITHUB + DEBIAN VPS
+================================================
+
+1) Diesen Ordner in ein GitHub Repository hochladen.
+   WICHTIG: Keine .env und keine data/db.json hochladen.
+
+2) Auf dem Debian VPS (öffentliches Repo):
+
+sudo apt-get update && sudo apt-get install -y git && sudo git clone https://github.com/DEINNAME/wardogs-status-panel.git /opt/wardogs-status-panel && cd /opt/wardogs-status-panel && sudo ./setup-vps.sh
+
+3) Discord OAuth Redirect URI exakt eintragen:
+
+https://DEINE-DOMAIN/auth/discord/callback
+
+oder bei IP-Betrieb:
+
+http://DEINE-IP/auth/discord/callback
+
+4) Spätere Updates nach einem GitHub Push:
+
+cd /opt/wardogs-status-panel && sudo ./update.sh
+
+5) Diagnose:
+
+cd /opt/wardogs-status-panel && sudo ./doctor.sh
+
+Ausführliche Anleitung: README.md und GITHUB-DEPLOY.md
