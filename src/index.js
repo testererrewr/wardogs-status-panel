@@ -11,7 +11,8 @@ import {
   listStatusNodes, getStatusNode, upsertStatusNode, deleteStatusNode, getSiteSettings, updateSiteSettings,
   listSupporters, upsertSupporter, deleteSupporter, listBotServices, getBotService, upsertBotService, deleteBotService,
   createPaypalPurchase, getPaypalPurchase, getPaypalPurchaseByOrder, updatePaypalPurchase, rememberPaypalWebhookEvent, paypalWebhookEventSeen,
-  createPaypalSubscriptionRecord, getPaypalSubscriptionRecord, getPaypalSubscriptionByPaypalId, listPaypalSubscriptionsForUser, updatePaypalSubscriptionRecord
+  createPaypalSubscriptionRecord, getPaypalSubscriptionRecord, getPaypalSubscriptionByPaypalId, listPaypalSubscriptionsForUser, updatePaypalSubscriptionRecord,
+  createStripePurchase, getStripePurchase, getStripePurchaseBySession, updateStripePurchase, createStripeSubscriptionRecord, getStripeSubscriptionRecord, getStripeSubscriptionByStripeId, getStripeSubscriptionBySession, listStripeSubscriptionsForUser, updateStripeSubscriptionRecord, rememberStripeWebhookEvent, stripeWebhookEventSeen
 } from './db.js';
 import { encryptSecret, decryptSecret } from './crypto.js';
 import { fetchServerStatus, gameTypeLabel } from './server-query.js';
@@ -25,6 +26,7 @@ import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
 import { verifyFreeBoostForUser, refreshDueFreeBoosts, freeBoostRanges, recalculateStoredFreeBoostLimits } from './free-boost.js';
 import { paypalConfigured, paypalEnvironment, paypalCredentialState, createCheckoutOrder, getCheckoutOrder, captureCheckoutOrder, extractCompletedCapture, verifyWebhook, ensureWebhook, ensureSubscriptionCatalog, createSubscription, getSubscription, cancelSubscription } from './paypal.js';
+import { stripeConfigured, stripeCredentialState, testStripeConnection, createStripeCheckout, retrieveStripeCheckout, retrieveStripeSubscription, cancelStripeSubscriptionAtPeriodEnd, verifyStripeWebhook, ensureStripeWebhook } from './stripe.js';
 import { runLifecycleSweep, renewFreeAccess, freeRenewState, markPremiumDowngrade, FREE_RENEW_DAYS, GRACE_DAYS } from './lifecycle.js';
 
 const required = ['SESSION_SECRET', 'APP_ENCRYPTION_KEY', 'STATUS_NODE_JOIN_SECRET'];
@@ -45,7 +47,7 @@ assignLegacyOwnership(firstAdmin);
 
 if (process.env.TRUST_PROXY !== 'false') app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '256kb', verify: (req, res, buf) => { if (req.originalUrl === '/webhooks/stripe') req.rawBody = Buffer.from(buf); } }));
 app.use(express.urlencoded({ extended: false, limit: '128kb' }));
 app.use(express.static('public', { maxAge: 0, etag: true }));
 const canonical = new URL(baseUrl);
@@ -145,6 +147,31 @@ function paypalSubscriptionReady(settings = getSiteSettings(), planId = '') {
   if (planId) return Boolean(sub.amounts[planId] && sub.planIds[planId]);
   return ['premium5','premium10','premium15','premium20'].some((id) => sub.amounts[id] && sub.planIds[id]);
 }
+function stripeAutoConfig(settings = getSiteSettings()) {
+  const raw = settings.premiumSales?.stripeAuto || {};
+  const currency = /^[A-Z]{3}$/.test(String(raw.currency || '').toUpperCase()) ? String(raw.currency).toUpperCase() : 'EUR';
+  const accessDays = Math.max(1, Math.min(3650, Number(raw.accessDays) || 30));
+  const amounts = {};
+  for (const id of ['premium5','premium10','premium15','premium20']) amounts[id] = normalizedMoney(raw.amounts?.[id]);
+  return { enabled: raw.enabled === true, currency, accessDays, amounts };
+}
+function stripeSubscriptionConfig(settings = getSiteSettings()) {
+  const raw = settings.premiumSales?.stripeSubscription || {};
+  const currency = stripeAutoConfig(settings).currency;
+  const amounts = {};
+  for (const id of ['premium5','premium10','premium15','premium20']) amounts[id] = normalizedMoney(raw.amounts?.[id]);
+  return { enabled: raw.enabled !== false, currency, amounts };
+}
+function stripeAutoReady(settings = getSiteSettings(), planId = '') {
+  const cfg = stripeAutoConfig(settings);
+  if (!cfg.enabled || !stripeConfigured(settings)) return false;
+  return planId ? Boolean(cfg.amounts[planId]) : Object.values(cfg.amounts).some(Boolean);
+}
+function stripeSubscriptionReady(settings = getSiteSettings(), planId = '') {
+  const cfg = stripeSubscriptionConfig(settings);
+  if (!cfg.enabled || !stripeConfigured(settings)) return false;
+  return planId ? Boolean(cfg.amounts[planId]) : Object.values(cfg.amounts).some(Boolean);
+}
 function subscriptionEntitlementExpiry(details, fallbackMs = 32 * 86400_000) {
   const next = Date.parse(details?.billing_info?.next_billing_time || '');
   return new Date(Number.isFinite(next) ? next : Date.now() + fallbackMs).toISOString();
@@ -214,6 +241,55 @@ function revokePaypalPurchase(purchase, reason) {
     markPremiumDowngrade(user.discordId);
     rebalanceAssignments();
   }
+}
+function stripeExpiryFromSubscription(details, fallbackMs = 32 * 86400_000) {
+  const end = Number(details?.current_period_end || 0) * 1000;
+  return new Date(end > Date.now() ? end : Date.now() + fallbackMs).toISOString();
+}
+function applyStripePurchase(purchase, session) {
+  runLifecycleSweep();
+  const fresh = getStripePurchase(purchase?.id || '');
+  if (!fresh) throw new Error('Stripe purchase not found');
+  if (fresh.appliedAt) return fresh;
+  if (String(session?.payment_status || '').toLowerCase() !== 'paid') throw new Error('Stripe payment is not completed');
+  if (String(session?.client_reference_id || '') && String(session.client_reference_id) !== fresh.id) throw new Error('Stripe purchase reference mismatch');
+  const paid = Number(session?.amount_total || 0) / 100;
+  if (!moneyMatches(paid.toFixed(2), fresh.amount) || String(session?.currency || '').toUpperCase() !== String(fresh.currency || '').toUpperCase()) throw new Error('Stripe amount mismatch');
+  const user = findUser(fresh.userDiscordId);
+  if (!user) throw new Error('User for Stripe purchase not found');
+  const days = Math.max(1, Math.min(3650, Number(fresh.accessDays) || 30));
+  const now = Date.now();
+  const existingExpiry = Date.parse(user.planExpiresAt || '');
+  const base = user.planId === fresh.planId && Number.isFinite(existingExpiry) && existingExpiry > now ? existingExpiry : now;
+  const expiresAt = new Date(base + days * 86400_000).toISOString();
+  upsertUser({ discordId:user.discordId, planId:fresh.planId, planExpiresAt:expiresAt, premiumSource:{ provider:'stripe', purchaseId:fresh.id, sessionId:session.id || fresh.sessionId || '', paymentIntentId: typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '' }, premiumDowngradeStartedAt:null, premiumDowngradeUntil:null, premiumDowngradeKeepServerId:null, freeRenewGraceStartedAt:null });
+  const updated = updateStripePurchase(fresh.id, { status:'completed', sessionId:session.id || fresh.sessionId || '', paymentIntentId: typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '', completedAt:fresh.completedAt || new Date().toISOString(), appliedAt:new Date().toISOString(), entitlementExpiresAt:expiresAt });
+  rebalanceAssignments();
+  return updated;
+}
+async function applyStripeSubscription(record, sessionOrSubscription, reason='subscription') {
+  runLifecycleSweep();
+  const fresh = getStripeSubscriptionRecord(record?.id || '');
+  if (!fresh) throw new Error('Stripe subscription record not found');
+  const user = findUser(fresh.userDiscordId);
+  if (!user) throw new Error('User for Stripe subscription not found');
+  let subscription = sessionOrSubscription;
+  if (sessionOrSubscription?.object === 'checkout.session') {
+    const sid = typeof sessionOrSubscription.subscription === 'string' ? sessionOrSubscription.subscription : sessionOrSubscription.subscription?.id;
+    if (!sid) throw new Error('Stripe subscription ID missing');
+    subscription = await retrieveStripeSubscription(sid);
+  }
+  const sid = String(subscription?.id || fresh.subscriptionId || '');
+  const status = String(subscription?.status || fresh.status || '').toUpperCase();
+  if (!['ACTIVE','TRIALING'].includes(status)) return updateStripeSubscriptionRecord(fresh.id, { status, subscriptionId:sid, lastSyncAt:new Date().toISOString() });
+  const expiresAt = stripeExpiryFromSubscription(subscription);
+  upsertUser({ discordId:user.discordId, planId:fresh.planId, planExpiresAt:expiresAt, premiumSource:{ provider:'stripe_subscription', recordId:fresh.id, subscriptionId:sid, reason }, premiumDowngradeStartedAt:null, premiumDowngradeUntil:null, premiumDowngradeKeepServerId:null, freeRenewGraceStartedAt:null });
+  const updated = updateStripeSubscriptionRecord(fresh.id, { status:'ACTIVE', subscriptionId:sid, customerId: typeof subscription?.customer === 'string' ? subscription.customer : subscription?.customer?.id || fresh.customerId || '', entitlementExpiresAt:expiresAt, currentPeriodEnd: subscription?.current_period_end || null, cancelAtPeriodEnd:Boolean(subscription?.cancel_at_period_end), activatedAt:fresh.activatedAt || new Date().toISOString(), lastSyncAt:new Date().toISOString() });
+  rebalanceAssignments();
+  return updated;
+}
+function stripeInvoiceSubscriptionId(invoice) {
+  return String(invoice?.subscription || invoice?.parent?.subscription_details?.subscription || invoice?.lines?.data?.[0]?.parent?.subscription_item_details?.subscription || '');
 }
 function purchaseFromPaypalEvent(event) {
   const resource = event?.resource || {};
@@ -454,11 +530,55 @@ app.get('/bot-services', (req, res) => {
   render(req,res,tr(lang,'Bot Services','Bot Services'),`<div class="pagehead"><div><h1>${tr(lang,'Bots as a Service','Bots as a Service')}</h1><p>${tr(lang,'Einzelne, von status-hub.lol betriebene Spezial-Bots. Diese Produkte sind unabhängig von deinem Status-Bot-Limit.','Individual specialist bots operated by status-hub.lol. These products are separate from your status-bot quota.')}</p></div></div><section class="service-grid">${cards || `<div class="panel empty">${tr(lang,'Noch keine Bot Services veröffentlicht.','No bot services published yet.')}</div>`}</section><div class="panel help service-note"><strong>${tr(lang,'Wichtig','Important')}:</strong> ${tr(lang,'Status-Bot-Pläne und Custom-Bot-Freigaben bleiben davon getrennt. Kaufbare Bot Services sind eigene Managed-Produkte.','Status-bot plans and custom-bot permissions remain separate. Purchasable bot services are independent managed products.')}</div>`);
 });
 
+app.post('/stripe/checkout/:planId', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), checkCsrf, async (req, res) => {
+  const user=currentUser(req); const planId=String(req.params.planId||'');
+  if(!PLANS[planId]||planId==='free') return res.status(400).send('Invalid premium plan');
+  const activeStripe=listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
+  const activePaypal=listPaypalSubscriptionsForUser(user.discordId).find((x)=>String(x.status||'').toUpperCase()==='ACTIVE'&&!x.cancelledAt);
+  if(activeStripe||activePaypal){flash(req,'err',l(req,'Du hast bereits ein aktives monatliches Abo. Verwalte es zuerst unter „Your Account“.','You already have an active monthly subscription. Manage it under “Your Account” first.'));return res.redirect('/account');}
+  const settings=getSiteSettings(), cfg=stripeAutoConfig(settings);
+  if(!stripeAutoReady(settings,planId)){flash(req,'err',l(req,'Stripe Einmalzahlung ist für diesen Plan noch nicht eingerichtet.','Stripe one-time payment is not configured for this plan yet.'));return res.redirect('/plans');}
+  const record=createStripePurchase({id:crypto.randomUUID(),provider:'stripe',userDiscordId:user.discordId,planId,amount:cfg.amounts[planId],currency:cfg.currency,accessDays:cfg.accessDays,status:'creating'});
+  try{
+    const session=await createStripeCheckout({recordId:record.id,userDiscordId:user.discordId,planId,amount:record.amount,currency:record.currency,accessDays:record.accessDays,recurring:false,successUrl:`${baseUrl}/stripe/return?record=${encodeURIComponent(record.id)}`,cancelUrl:`${baseUrl}/stripe/cancel?record=${encodeURIComponent(record.id)}`,settings});
+    updateStripePurchase(record.id,{sessionId:session.id,status:'approval_pending'}); return res.redirect(session.url);
+  }catch(error){updateStripePurchase(record.id,{status:'failed',error:String(error.message||error).slice(0,500)});flash(req,'err',`Stripe: ${error.message}`);return res.redirect('/plans');}
+});
+
+app.get('/stripe/return', requireLogin, rateLimit({ windowMs:60_000, limit:20 }), async (req,res)=>{
+  try{
+    const user=currentUser(req), record=getStripePurchase(String(req.query.record||''))||getStripePurchaseBySession(String(req.query.session_id||''));
+    if(!record||record.userDiscordId!==user.discordId) throw new Error('Stripe purchase not found');
+    const sessionId=String(req.query.session_id||record.sessionId||''); if(!sessionId) throw new Error('Stripe session ID missing');
+    const session=await retrieveStripeCheckout(sessionId); applyStripePurchase(record,session);
+    flash(req,'ok',l(req,`Stripe-Zahlung erfolgreich. ${PLANS[record.planId].label} wurde automatisch freigeschaltet.`,`Stripe payment successful. ${PLANS[record.planId].label} was activated automatically.`));
+  }catch(error){flash(req,'err',`Stripe: ${error.message}`);} res.redirect('/plans');
+});
+app.get('/stripe/cancel', requireLogin, (req,res)=>{const user=currentUser(req),record=getStripePurchase(String(req.query.record||''));if(record&&record.userDiscordId===user.discordId&&!record.appliedAt)updateStripePurchase(record.id,{status:'cancelled'});flash(req,'err',l(req,'Stripe-Zahlung abgebrochen.','Stripe payment cancelled.'));res.redirect('/plans');});
+
+app.post('/stripe/subscribe/:planId', requireLogin, rateLimit({ windowMs:60_000, limit:10 }), checkCsrf, async (req,res)=>{
+  const user=currentUser(req),planId=String(req.params.planId||''); if(!PLANS[planId]||planId==='free')return res.status(400).send('Invalid premium plan');
+  const settings=getSiteSettings(),cfg=stripeSubscriptionConfig(settings);
+  if(!stripeSubscriptionReady(settings,planId)){flash(req,'err',l(req,'Stripe-Abo ist für diesen Plan noch nicht eingerichtet.','Stripe subscription is not configured for this plan yet.'));return res.redirect('/plans');}
+  const existingStripe=listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING','CREATING','APPROVAL_PENDING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
+  const existingPaypal=listPaypalSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','APPROVAL_PENDING','CREATING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
+  if(existingStripe||existingPaypal){flash(req,'err',l(req,'Du hast bereits ein aktives oder offenes Abo. Verwalte es zuerst unter „Your Account“.','You already have an active or pending subscription. Manage it under “Your Account” first.'));return res.redirect('/account');}
+  const record=createStripeSubscriptionRecord({id:crypto.randomUUID(),provider:'stripe_subscription',userDiscordId:user.discordId,planId,amount:cfg.amounts[planId],currency:cfg.currency,status:'creating'});
+  try{
+    const session=await createStripeCheckout({recordId:record.id,userDiscordId:user.discordId,planId,amount:record.amount,currency:record.currency,recurring:true,successUrl:`${baseUrl}/stripe/subscription/return?record=${encodeURIComponent(record.id)}`,cancelUrl:`${baseUrl}/stripe/subscription/cancel?record=${encodeURIComponent(record.id)}`,settings});
+    updateStripeSubscriptionRecord(record.id,{sessionId:session.id,status:'APPROVAL_PENDING'});return res.redirect(session.url);
+  }catch(error){updateStripeSubscriptionRecord(record.id,{status:'FAILED',error:String(error.message||error).slice(0,500)});flash(req,'err',`Stripe: ${error.message}`);return res.redirect('/plans');}
+});
+app.get('/stripe/subscription/return', requireLogin, rateLimit({windowMs:60_000,limit:20}), async(req,res)=>{
+  try{const user=currentUser(req),record=getStripeSubscriptionRecord(String(req.query.record||''))||getStripeSubscriptionBySession(String(req.query.session_id||''));if(!record||record.userDiscordId!==user.discordId)throw new Error('Stripe subscription not found');const session=await retrieveStripeCheckout(String(req.query.session_id||record.sessionId||''));updateStripeSubscriptionRecord(record.id,{sessionId:session.id,subscriptionId:typeof session.subscription==='string'?session.subscription:session.subscription?.id||'',customerId:typeof session.customer==='string'?session.customer:session.customer?.id||'',status:'CHECKOUT_COMPLETED'});await applyStripeSubscription(record,session,'checkout');flash(req,'ok',l(req,'Stripe-Abo aktiviert.','Stripe subscription activated.'));}catch(error){flash(req,'err',`Stripe: ${error.message}`);}res.redirect('/account');
+});
+app.get('/stripe/subscription/cancel', requireLogin, (req,res)=>{const user=currentUser(req),record=getStripeSubscriptionRecord(String(req.query.record||''));if(record&&record.userDiscordId===user.discordId&&!record.activatedAt)updateStripeSubscriptionRecord(record.id,{status:'CANCELLED_BEFORE_APPROVAL',cancelledAt:new Date().toISOString()});flash(req,'err',l(req,'Stripe-Aboabschluss abgebrochen.','Stripe subscription checkout cancelled.'));res.redirect('/plans');});
+
 app.post('/paypal/checkout/:planId', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), checkCsrf, async (req, res) => {
   const user = currentUser(req);
   const planId = String(req.params.planId || '');
   if (!PLANS[planId] || planId === 'free') return res.status(400).send('Invalid premium plan');
-  const activeSubscription = listPaypalSubscriptionsForUser(user.discordId).find((x) => String(x.status || '').toUpperCase() === 'ACTIVE' && !x.cancelledAt);
+  const activeSubscription = listPaypalSubscriptionsForUser(user.discordId).find((x) => String(x.status || '').toUpperCase() === 'ACTIVE' && !x.cancelledAt) || listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING'].includes(String(x.status||'').toUpperCase())&&!x.cancelAtPeriodEnd&&!x.cancelledAt);
   if (activeSubscription) { flash(req,'err',l(req,'Du hast bereits ein aktives monatliches Abo. Kündige oder verwalte es zuerst unter „Your Account“.','You already have an active monthly subscription. Cancel or manage it under “Your Account” first.')); return res.redirect('/account'); }
   const settings = getSiteSettings();
   const auto = paypalAutoConfig(settings);
@@ -512,7 +632,7 @@ app.post('/paypal/subscribe/:planId', requireLogin, rateLimit({ windowMs: 60_000
   const settings = getSiteSettings();
   const sub = paypalSubscriptionConfig(settings);
   if (!paypalSubscriptionReady(settings, planId)) { flash(req,'err',l(req,'PayPal-Abo ist für diesen Plan noch nicht eingerichtet.','PayPal subscription is not configured for this plan yet.')); return res.redirect('/plans'); }
-  const existing = listPaypalSubscriptionsForUser(user.discordId).find((x) => ['ACTIVE','APPROVAL_PENDING','creating'].includes(String(x.status || '').toUpperCase()));
+  const existing = listPaypalSubscriptionsForUser(user.discordId).find((x) => ['ACTIVE','APPROVAL_PENDING','CREATING'].includes(String(x.status || '').toUpperCase())) || listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING','APPROVAL_PENDING','CREATING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
   if (existing) { flash(req,'err',l(req,'Du hast bereits ein aktives oder offenes PayPal-Abo. Verwalte es zuerst unter „Your Account“.','You already have an active or pending PayPal subscription. Manage it under “Your Account” first.')); return res.redirect('/account'); }
   const record = createPaypalSubscriptionRecord({ id: crypto.randomUUID(), provider: 'paypal_subscription', userDiscordId: user.discordId, planId, amount: sub.amounts[planId], currency: sub.currency, paypalPlanId: sub.planIds[planId], status: 'creating' });
   try {
@@ -552,17 +672,22 @@ app.get('/paypal/subscription/cancel', requireLogin, (req, res) => {
 
 app.get('/account', requireLogin, async (req, res) => {
   const lang = langOf(req); const user = currentUser(req); const plan = effectivePlan(user);
-  const subscriptions = listPaypalSubscriptionsForUser(user.discordId);
-  const active = subscriptions.find((x) => ['ACTIVE','APPROVAL_PENDING'].includes(String(x.status || '').toUpperCase())) || subscriptions[0] || null;
-  let subscriptionHtml = `<p class="muted">${tr(lang,'Kein PayPal-Abo vorhanden.','No PayPal subscription.')}</p>`;
-  if (active) {
-    const state = String(active.status || '').toUpperCase();
-    const end = active.entitlementExpiresAt || user.planExpiresAt || '';
-    const canCancel = state === 'ACTIVE' && active.subscriptionId && !active.cancelledAt;
-    subscriptionHtml = `<div class="account-billing"><div><span class="eyebrow">PayPal</span><h3>${esc(PLANS[active.planId]?.label || active.planId)}</h3><p>${tr(lang,'Status','Status')}: <strong>${esc(state)}</strong></p>${active.nextBillingAt ? `<p>${tr(lang,'Nächste Zahlung','Next payment')}: ${esc(new Date(active.nextBillingAt).toLocaleString(localeCode(lang)))}</p>` : ''}${active.cancelledAt && end ? `<p>${tr(lang,'Gekündigt. Premium bleibt bis','Cancelled. Premium remains until')} ${esc(new Date(end).toLocaleString(localeCode(lang)))}</p>` : ''}</div>${canCancel ? `<form method="post" action="/account/subscription/cancel" onsubmit="return confirm('${tr(lang,'Monatliches PayPal-Abo wirklich kündigen? Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Cancel the monthly PayPal subscription? Premium remains active until the end of the already paid period.')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(active.id)}"><button class="button danger" type="submit">${tr(lang,'Abo kündigen','Cancel subscription')}</button></form>` : ''}</div>`;
+  const paypalSubscriptions = listPaypalSubscriptionsForUser(user.discordId);
+  const activePaypal = paypalSubscriptions.find((x) => ['ACTIVE','APPROVAL_PENDING'].includes(String(x.status || '').toUpperCase())) || paypalSubscriptions[0] || null;
+  const stripeSubscriptions = listStripeSubscriptionsForUser(user.discordId);
+  const activeStripe = stripeSubscriptions.find((x) => ['ACTIVE','TRIALING','APPROVAL_PENDING','CHECKOUT_COMPLETED'].includes(String(x.status || '').toUpperCase())) || stripeSubscriptions[0] || null;
+  const billingCards = [];
+  if (activePaypal) {
+    const state = String(activePaypal.status || '').toUpperCase(); const end = activePaypal.entitlementExpiresAt || user.planExpiresAt || ''; const canCancel = state === 'ACTIVE' && activePaypal.subscriptionId && !activePaypal.cancelledAt;
+    billingCards.push(`<div class="account-billing"><div><span class="eyebrow">PayPal</span><h3>${esc(PLANS[activePaypal.planId]?.label || activePaypal.planId)}</h3><p>${tr(lang,'Status','Status')}: <strong>${esc(state)}</strong></p>${activePaypal.nextBillingAt ? `<p>${tr(lang,'Nächste Zahlung','Next payment')}: ${esc(new Date(activePaypal.nextBillingAt).toLocaleString(localeCode(lang)))}</p>` : ''}${activePaypal.cancelledAt && end ? `<p>${tr(lang,'Gekündigt. Premium bleibt bis','Cancelled. Premium remains until')} ${esc(new Date(end).toLocaleString(localeCode(lang)))}</p>` : ''}</div>${canCancel ? `<form method="post" action="/account/subscription/cancel" onsubmit="return confirm('${tr(lang,'Monatliches PayPal-Abo wirklich kündigen? Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Cancel the monthly PayPal subscription? Premium remains active until the end of the already paid period.')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(activePaypal.id)}"><button class="button danger" type="submit">${tr(lang,'Abo kündigen','Cancel subscription')}</button></form>` : ''}</div>`);
   }
+  if (activeStripe) {
+    const state=String(activeStripe.status||'').toUpperCase(); const end=activeStripe.entitlementExpiresAt||user.planExpiresAt||''; const canCancel=['ACTIVE','TRIALING'].includes(state)&&activeStripe.subscriptionId&&!activeStripe.cancelAtPeriodEnd&&!activeStripe.cancelledAt;
+    billingCards.push(`<div class="account-billing"><div><span class="eyebrow">Stripe</span><h3>${esc(PLANS[activeStripe.planId]?.label || activeStripe.planId)}</h3><p>${tr(lang,'Status','Status')}: <strong>${esc(state)}</strong></p>${end?`<p>${tr(lang,'Aktueller Zeitraum bis','Current period until')}: ${esc(new Date(end).toLocaleString(localeCode(lang)))}</p>`:''}${activeStripe.cancelAtPeriodEnd?`<p>${tr(lang,'Gekündigt. Das Abo endet zum Periodenende.','Cancelled. The subscription ends at the period end.')}</p>`:''}</div>${canCancel?`<form method="post" action="/account/stripe-subscription/cancel" onsubmit="return confirm('${tr(lang,'Monatliches Stripe-Abo zum Periodenende kündigen?','Cancel the monthly Stripe subscription at the period end?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(activeStripe.id)}"><button class="button danger" type="submit">${tr(lang,'Abo kündigen','Cancel subscription')}</button></form>`:''}</div>`);
+  }
+  const subscriptionHtml=billingCards.length?billingCards.join(''):`<p class="muted">${tr(lang,'Kein monatliches Abo vorhanden.','No monthly subscription.')}</p>`;
   const expiry = plan.expiresAt ? new Date(plan.expiresAt).toLocaleString(localeCode(lang)) : tr(lang,'Dauerhaft / kein Ablauf','Permanent / no expiry');
-  const source = user.premiumSource?.provider === 'paypal_subscription' ? tr(lang,'Monatliches PayPal-Abo','Monthly PayPal subscription') : user.premiumSource?.provider === 'paypal' ? tr(lang,'PayPal Einmalzahlung','PayPal one-time payment') : tr(lang,'Manuell / Free','Manual / Free');
+  const source = user.premiumSource?.provider === 'paypal_subscription' ? tr(lang,'Monatliches PayPal-Abo','Monthly PayPal subscription') : user.premiumSource?.provider === 'paypal' ? tr(lang,'PayPal Einmalzahlung','PayPal one-time payment') : user.premiumSource?.provider === 'stripe_subscription' ? tr(lang,'Monatliches Stripe-Abo','Monthly Stripe subscription') : user.premiumSource?.provider === 'stripe' ? tr(lang,'Stripe Einmalzahlung','Stripe one-time payment') : tr(lang,'Manuell / Free','Manual / Free');
   const renew=freeRenewState(user); const renewDue=renew.dueAt?new Date(renew.dueAt).toLocaleString(localeCode(lang)):''; const deleteAt=renew.deleteAt?new Date(renew.deleteAt).toLocaleString(localeCode(lang)):'';
   const renewHtml=user.role==='admin'||user.freeRenewExempt?`<article class="panel"><span class="eyebrow">Free Renew</span><h2>${tr(lang,'Nicht erforderlich','Not required')}</h2><p>${tr(lang,'Ein Admin hat die 14-Tage-Verlängerung für diesen Account deaktiviert.','An admin disabled the 14-day renewal requirement for this account.')}</p></article>`:plan.id!=='free'&&!plan.premiumGrace?`<article class="panel"><span class="eyebrow">Free Renew</span><h2>${tr(lang,'In Premium enthalten','Included with Premium')}</h2><p>${tr(lang,'Solange Premium aktiv ist, ist keine Free-Verlängerung nötig.','No free renewal is required while Premium is active.')}</p></article>`:`<article class="panel ${renew.required?'renew-alert':'renew-card'}"><span class="eyebrow">Free Renew</span><h2>${renew.required?tr(lang,'Verlängerung erforderlich','Renewal required'):tr(lang,'14-Tage-Verlängerung','14-day renewal')}</h2><p>${renew.required?tr(lang,'Deine Status-Bots sind pausiert. Verlängere jetzt, damit sie wieder online gehen.','Your status bots are paused. Renew now to bring them back online.'):`${tr(lang,'Nächste Verlängerung spätestens','Renew by')}: ${esc(renewDue)}`}</p>${deleteAt?`<p class="lifecycle-note"><strong>${tr(lang,'Löschung am','Deletion at')}:</strong> ${esc(deleteAt)}</p>`:''}<form method="post" action="/account/renew-free"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button success" type="submit">${tr(lang,`Gratis-Bot für ${FREE_RENEW_DAYS} Tage verlängern`,`Renew free bot for ${FREE_RENEW_DAYS} days`)}</button></form></article>`;
   render(req,res,tr(lang,'Dein Account','Your Account'),`<div class="pagehead"><div><h1>${tr(lang,'Dein Account','Your Account')}</h1><p>${esc(user.globalName || user.username || user.discordId)}</p></div></div><section class="account-grid"><article class="panel"><span class="eyebrow">Plan</span><h2>${esc(plan.label)}</h2><p>${tr(lang,'Status-Bot-Limit','Status bot limit')}: <strong>${esc(plan.statusBotLimit)}</strong></p><p>${tr(lang,'Abrechnung','Billing')}: <strong>${source}</strong></p><p>${tr(lang,'Premium bis','Premium until')}: <strong>${esc(expiry)}</strong></p>${plan.premiumGrace?`<p class="lifecycle-note"><strong>${tr(lang,'7-Tage-Wiederherstellung aktiv','7-day restore window active')}</strong></p>`:''}<a class="button primary" href="/plans">${tr(lang,'Premium verwalten','Manage Premium')}</a></article><article class="panel"><span class="eyebrow">${tr(lang,'Monatliches Abo','Monthly subscription')}</span>${subscriptionHtml}</article>${renewHtml}</section>`);
@@ -589,6 +714,46 @@ app.post('/account/subscription/cancel', requireLogin, checkCsrf, rateLimit({ wi
     flash(req,'ok',l(req,'Abo gekündigt. Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Subscription cancelled. Premium remains active until the end of the already paid period.'));
   } catch (error) { flash(req,'err',`PayPal: ${error.message}`); }
   res.redirect('/account');
+});
+
+app.post('/account/stripe-subscription/cancel', requireLogin, checkCsrf, rateLimit({ windowMs:60_000, limit:5 }), async(req,res)=>{
+  try{
+    const user=currentUser(req),record=getStripeSubscriptionRecord(String(req.body.recordId||''));
+    if(!record||record.userDiscordId!==user.discordId||!record.subscriptionId)throw new Error(l(req,'Abo nicht gefunden.','Subscription not found.'));
+    const details=await cancelStripeSubscriptionAtPeriodEnd(record.subscriptionId);
+    const end=stripeExpiryFromSubscription(details);
+    updateStripeSubscriptionRecord(record.id,{status:String(details.status||'ACTIVE').toUpperCase(),cancelAtPeriodEnd:true,cancelRequestedAt:new Date().toISOString(),entitlementExpiresAt:end,currentPeriodEnd:details.current_period_end||null});
+    if(user.premiumSource?.provider==='stripe_subscription'&&user.premiumSource?.recordId===record.id)upsertUser({discordId:user.discordId,planExpiresAt:end});
+    flash(req,'ok',l(req,'Stripe-Abo gekündigt. Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Stripe subscription cancelled. Premium remains active until the end of the already paid period.'));
+  }catch(error){flash(req,'err',`Stripe: ${error.message}`);}res.redirect('/account');
+});
+
+app.post('/webhooks/stripe', rateLimit({ windowMs:60_000, limit:120 }), async(req,res)=>{
+  try{
+    const settings=getSiteSettings(), sig=String(req.headers['stripe-signature']||'');
+    if(!stripeConfigured(settings)) return res.status(503).send('Stripe not configured');
+    const event=verifyStripeWebhook(req.rawBody||Buffer.from(''),sig,settings);
+    if(stripeWebhookEventSeen(event.id)) return res.status(200).send('OK');
+    const obj=event.data?.object||{};
+    if(event.type==='checkout.session.completed'){
+      const recordId=String(obj.metadata?.recordId||obj.client_reference_id||'');
+      if(obj.mode==='payment'){
+        const record=getStripePurchase(recordId)||getStripePurchaseBySession(String(obj.id||'')); if(record) applyStripePurchase(record,obj);
+      }else if(obj.mode==='subscription'){
+        const record=getStripeSubscriptionRecord(recordId)||getStripeSubscriptionBySession(String(obj.id||''));
+        if(record){updateStripeSubscriptionRecord(record.id,{sessionId:obj.id||record.sessionId,subscriptionId:typeof obj.subscription==='string'?obj.subscription:obj.subscription?.id||'',customerId:typeof obj.customer==='string'?obj.customer:obj.customer?.id||'',status:'CHECKOUT_COMPLETED'});await applyStripeSubscription(record,obj,'checkout_webhook');}
+      }
+    }else if(event.type==='invoice.paid'){
+      const sid=stripeInvoiceSubscriptionId(obj), record=getStripeSubscriptionByStripeId(sid); if(record){const details=await retrieveStripeSubscription(sid,settings);await applyStripeSubscription(record,details,'recurring_payment');updateStripeSubscriptionRecord(record.id,{lastInvoiceId:String(obj.id||''),lastPaymentAt:new Date().toISOString(),lastPaymentAmount:obj.amount_paid!=null?(Number(obj.amount_paid)/100).toFixed(2):''});}
+    }else if(event.type==='invoice.payment_failed'){
+      const sid=stripeInvoiceSubscriptionId(obj),record=getStripeSubscriptionByStripeId(sid);if(record)updateStripeSubscriptionRecord(record.id,{status:'PAST_DUE',lastInvoiceId:String(obj.id||''),lastSyncAt:new Date().toISOString()});
+    }else if(event.type==='customer.subscription.updated'){
+      const record=getStripeSubscriptionByStripeId(String(obj.id||''));if(record){if(['active','trialing'].includes(String(obj.status||'').toLowerCase()))await applyStripeSubscription(record,obj,'subscription_updated');else updateStripeSubscriptionRecord(record.id,{status:String(obj.status||'').toUpperCase(),cancelAtPeriodEnd:Boolean(obj.cancel_at_period_end),currentPeriodEnd:obj.current_period_end||null,lastSyncAt:new Date().toISOString()});}
+    }else if(event.type==='customer.subscription.deleted'){
+      const record=getStripeSubscriptionByStripeId(String(obj.id||''));if(record){const end=stripeExpiryFromSubscription(obj,0);updateStripeSubscriptionRecord(record.id,{status:'CANCELLED',cancelledAt:new Date().toISOString(),entitlementExpiresAt:end,cancelAtPeriodEnd:true,lastSyncAt:new Date().toISOString()});const user=findUser(record.userDiscordId);if(user?.premiumSource?.provider==='stripe_subscription'&&user.premiumSource.recordId===record.id)upsertUser({discordId:user.discordId,planExpiresAt:end});}
+    }
+    rememberStripeWebhookEvent(event.id,event.type);res.status(200).send('OK');
+  }catch(error){console.error('Stripe webhook:',error.message);res.status(400).send('Webhook processing failed');}
 });
 
 app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async (req, res) => {
@@ -644,26 +809,33 @@ app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async 
 });
 
 app.get('/plans', (req, res) => {
-  const lang = langOf(req); const u = currentUser(req); const current = effectivePlan(u); const settings = getSiteSettings(); const sales = settings.premiumSales || {}; const auto = paypalAutoConfig(settings); const sub = paypalSubscriptionConfig(settings); const automatic = paypalAutoReady(settings);
-  const discordContact = sales.discordUserId && validSnowflake(sales.discordUserId) ? `https://discord.com/users/${encodeURIComponent(sales.discordUserId)}` : '';
-  const cards = Object.values(PLANS).map((p) => {
-    const oneTimePrice = p.id !== 'free' && auto.amounts[p.id] ? `${auto.amounts[p.id]} ${auto.currency} / ${auto.accessDays} ${tr(lang,'Tage','days')}` : '';
-    const monthlyPrice = p.id !== 'free' && sub.amounts[p.id] ? `${sub.amounts[p.id]} ${sub.currency} / ${tr(lang,'Monat','month')}` : '';
-    const displayPrice = p.id === 'free' ? tr(lang,'Kostenlos','Free') : (oneTimePrice || monthlyPrice || String(sales.prices?.[p.id] || tr(lang,'Preis auf Anfrage','Price on request')));
-    let action = '';
-    if (p.id !== 'free') {
-      const choices = [];
-      if (automatic && auto.amounts[p.id]) choices.push(u ? `<form method="post" action="/paypal/checkout/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Einmalig','One-time')}</strong><span>${esc(oneTimePrice)}</span><button class="button ghost" type="submit">${tr(lang,'Einmalig kaufen','Buy once')}</button></form>` : `<div class="purchase-choice"><strong>${tr(lang,'Einmalig','One-time')}</strong><span>${esc(oneTimePrice)}</span><a class="button ghost" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
-      if (paypalSubscriptionReady(settings, p.id)) choices.push(u ? `<form method="post" action="/paypal/subscribe/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Monatliches Abo','Monthly subscription')}</strong><span>${esc(monthlyPrice)}</span><button class="button primary" type="submit">${tr(lang,'Monatlich abonnieren','Subscribe monthly')}</button></form>` : `<div class="purchase-choice"><strong>${tr(lang,'Monatliches Abo','Monthly subscription')}</strong><span>${esc(monthlyPrice)}</span><a class="button primary" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
-      if (choices.length) action = `<div class="purchase-options">${choices.join('')}</div>`;
-      else if (/^https?:\/\//i.test(String(sales.paypalUrl || ''))) action = `<a class="button primary" href="${esc(sales.paypalUrl)}" target="_blank" rel="noopener">${tr(lang,'Jetzt mit PayPal kaufen','Buy now with PayPal')}</a>`;
-      else if (discordContact) action = `<a class="button primary" href="${esc(discordContact)}" target="_blank" rel="noopener">${tr(lang,'Auf Discord kaufen','Buy via Discord')}</a>`;
-      else if (sales.discordUsername) action = `<div class="plan-contact">${tr(lang,'Zum Kaufen auf Discord anschreiben','Message on Discord to buy')}: <strong>${esc(sales.discordUsername)}</strong></div>`;
-      else if (settings.supportUrl) action = `<a class="button primary" href="${esc(settings.supportUrl)}" target="_blank" rel="noopener">${tr(lang,'Kaufen / Support','Buy / support')}</a>`;
+  const lang=langOf(req),u=currentUser(req),current=effectivePlan(u),settings=getSiteSettings(),sales=settings.premiumSales||{};
+  const auto=paypalAutoConfig(settings),sub=paypalSubscriptionConfig(settings),automatic=paypalAutoReady(settings);
+  const stripeAuto=stripeAutoConfig(settings),stripeSub=stripeSubscriptionConfig(settings);
+  const discordContact=sales.discordUserId&&validSnowflake(sales.discordUserId)?`https://discord.com/users/${encodeURIComponent(sales.discordUserId)}`:'';
+  const cards=Object.values(PLANS).map((p)=>{
+    const paypalOne=p.id!=='free'&&auto.amounts[p.id]?`${auto.amounts[p.id]} ${auto.currency} / ${auto.accessDays} ${tr(lang,'Tage','days')}`:'';
+    const stripeOne=p.id!=='free'&&stripeAuto.amounts[p.id]?`${stripeAuto.amounts[p.id]} ${stripeAuto.currency} / ${stripeAuto.accessDays} ${tr(lang,'Tage','days')}`:'';
+    const paypalMonth=p.id!=='free'&&sub.amounts[p.id]?`${sub.amounts[p.id]} ${sub.currency} / ${tr(lang,'Monat','month')}`:'';
+    const stripeMonth=p.id!=='free'&&stripeSub.amounts[p.id]?`${stripeSub.amounts[p.id]} ${stripeSub.currency} / ${tr(lang,'Monat','month')}`:'';
+    const displayPrice=p.id==='free'?tr(lang,'Kostenlos','Free'):(paypalOne||stripeOne||paypalMonth||stripeMonth||String(sales.prices?.[p.id]||tr(lang,'Preis auf Anfrage','Price on request')));
+    let action='';
+    if(p.id!=='free'){
+      const choices=[];
+      if(automatic&&auto.amounts[p.id])choices.push(u?`<form method="post" action="/paypal/checkout/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Einmalig · PayPal','One-time · PayPal')}</strong><span>${esc(paypalOne)}</span><button class="button ghost" type="submit">PayPal</button></form>`:`<div class="purchase-choice"><strong>${tr(lang,'Einmalig · PayPal','One-time · PayPal')}</strong><span>${esc(paypalOne)}</span><a class="button ghost" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
+      if(stripeAutoReady(settings,p.id))choices.push(u?`<form method="post" action="/stripe/checkout/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Einmalig · Stripe','One-time · Stripe')}</strong><span>${esc(stripeOne)}</span><button class="button ghost" type="submit">Stripe</button></form>`:`<div class="purchase-choice"><strong>${tr(lang,'Einmalig · Stripe','One-time · Stripe')}</strong><span>${esc(stripeOne)}</span><a class="button ghost" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
+      if(paypalSubscriptionReady(settings,p.id))choices.push(u?`<form method="post" action="/paypal/subscribe/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Monatlich · PayPal','Monthly · PayPal')}</strong><span>${esc(paypalMonth)}</span><button class="button primary" type="submit">PayPal</button></form>`:`<div class="purchase-choice"><strong>${tr(lang,'Monatlich · PayPal','Monthly · PayPal')}</strong><span>${esc(paypalMonth)}</span><a class="button primary" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
+      if(stripeSubscriptionReady(settings,p.id))choices.push(u?`<form method="post" action="/stripe/subscribe/${esc(p.id)}" class="purchase-choice"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><strong>${tr(lang,'Monatlich · Stripe','Monthly · Stripe')}</strong><span>${esc(stripeMonth)}</span><button class="button primary" type="submit">Stripe</button></form>`:`<div class="purchase-choice"><strong>${tr(lang,'Monatlich · Stripe','Monthly · Stripe')}</strong><span>${esc(stripeMonth)}</span><a class="button primary" href="/auth/discord">${tr(lang,'Einloggen','Login')}</a></div>`);
+      if(choices.length)action=`<div class="purchase-options">${choices.join('')}</div>`;
+      else if(/^https?:\/\//i.test(String(sales.paypalUrl||'')))action=`<a class="button primary" href="${esc(sales.paypalUrl)}" target="_blank" rel="noopener">${tr(lang,'Jetzt mit PayPal kaufen','Buy now with PayPal')}</a>`;
+      else if(discordContact)action=`<a class="button primary" href="${esc(discordContact)}" target="_blank" rel="noopener">${tr(lang,'Auf Discord kaufen','Buy via Discord')}</a>`;
+      else if(sales.discordUsername)action=`<div class="plan-contact">${tr(lang,'Zum Kaufen auf Discord anschreiben','Message on Discord to buy')}: <strong>${esc(sales.discordUsername)}</strong></div>`;
+      else if(settings.supportUrl)action=`<a class="button primary" href="${esc(settings.supportUrl)}" target="_blank" rel="noopener">${tr(lang,'Kaufen / Support','Buy / support')}</a>`;
     }
-    return `<article class="panel plan-card ${u && current.id===p.id?'current-plan':''}"><span class="eyebrow">${p.id==='free'?tr(lang,'Kostenlos','Free'):'Premium'}</span><h2>${esc(p.label)}</h2><div class="plan-number">${p.statusBotLimit}</div><p>Status Bot${p.statusBotLimit===1?'':'s'}</p><div class="plan-price">${esc(displayPrice)}</div><ul><li>${tr(lang,'Alle unterstützten Games','All supported games')}</li><li>${tr(lang,'Status-Rotation, Map & Spieler je nach Game','Status rotation, map & players depending on the game')}</li><li>${p.branded?tr(lang,'Powered by status-hub.lol im Free-Status','Powered by status-hub.lol on Free status bots'):tr(lang,'Kein Service-Branding','No service branding')}</li></ul>${u && current.id===p.id?`<div class="actions wrap"><span class="badge online">${tr(lang,'Aktueller Plan','Current plan')}</span></div>`:''}${action}</article>`;
+    return `<article class="panel plan-card ${u&&current.id===p.id?'current-plan':''}"><span class="eyebrow">${p.id==='free'?tr(lang,'Kostenlos','Free'):'Premium'}</span><h2>${esc(p.label)}</h2><div class="plan-number">${p.statusBotLimit}</div><p>Status Bot${p.statusBotLimit===1?'':'s'}</p><div class="plan-price">${esc(displayPrice)}</div><ul><li>${tr(lang,'Alle unterstützten Games','All supported games')}</li><li>${tr(lang,'Status-Rotation, Map & Spieler je nach Game','Status rotation, map & players depending on the game')}</li><li>${p.branded?tr(lang,'Powered by status-hub.lol im Free-Status','Powered by status-hub.lol on Free status bots'):tr(lang,'Kein Service-Branding','No service branding')}</li></ul>${u&&current.id===p.id?`<div class="actions wrap"><span class="badge online">${tr(lang,'Aktueller Plan','Current plan')}</span></div>`:''}${action}</article>`;
   }).join('');
-  const purchaseNote = automatic || paypalSubscriptionReady(settings) ? tr(lang,'Wähle je Plan zwischen Einmalzahlung und monatlichem PayPal-Abo. Abos kannst du jederzeit unter „Your Account“ kündigen.','Choose between a one-time payment and a monthly PayPal subscription for each plan. Subscriptions can be cancelled any time under “Your Account”.') : sales.paypalUrl ? tr(lang,'PayPal-Link ist hinterlegt; Freischaltung erfolgt noch manuell.','A PayPal link is configured; activation is still manual.') : sales.discordUsername ? `${tr(lang,'Aktueller Kaufkontakt','Current purchase contact')}: ${esc(sales.discordUsername)}` : tr(lang,'Kaufkontakt wird noch eingerichtet.','Purchase contact is not configured yet.');
+  const providers=[paypalAutoReady(settings)||paypalSubscriptionReady(settings)?'PayPal':'',stripeAutoReady(settings)||stripeSubscriptionReady(settings)?'Stripe':''].filter(Boolean).join(' & ');
+  const purchaseNote=providers?`${tr(lang,'Verfügbare automatische Zahlungsarten','Available automatic payment methods')}: ${providers}. ${tr(lang,'Einmalzahlung und monatliches Abo können je nach Admin-Einstellung angeboten werden.','One-time payment and monthly subscription can be offered depending on the admin settings.')}`:sales.paypalUrl?tr(lang,'PayPal-Link ist hinterlegt; Freischaltung erfolgt noch manuell.','A PayPal link is configured; activation is still manual.'):sales.discordUsername?`${tr(lang,'Aktueller Kaufkontakt','Current purchase contact')}: ${esc(sales.discordUsername)}`:tr(lang,'Kaufkontakt wird noch eingerichtet.','Purchase contact is not configured yet.');
   render(req,res,'Premium',`<div class="pagehead"><div><h1>Premium</h1><p>${tr(lang,'Free startet mit 1 Bot und kann über Server-Branding auf bis zu 5 Gratis-Bots wachsen. Premium entfernt nur das automatisch hinzugefügte Powered-by-Branding. Deine eigenen Status-Texte bleiben unverändert.','Free starts with 1 bot and can grow to up to 5 free bots through server branding. Premium removes only the automatically added Powered-by branding. Your own status texts remain unchanged.')}</p></div>${u?`<a class="button ghost" href="/account">${tr(lang,'Your Account','Your Account')}</a>`:''}</div><section class="plan-grid">${cards}</section><div class="panel help"><strong>${tr(lang,'Kaufen','Purchase')}:</strong> ${purchaseNote}<br><strong>${tr(lang,'Branding','Branding')}:</strong> ${tr(lang,'Beim Upgrade wird kein eigener User-Text gelöscht oder ergänzt. Nur der vom System dynamisch hinzugefügte „Powered by status-hub.lol“-Eintrag fällt weg.','Upgrading never deletes or adds user-authored text. Only the system-generated “Powered by status-hub.lol” entry disappears.')}<br><strong>Custom Bots:</strong> ${tr(lang,'bleiben unabhängig und werden nur manuell im Backend freigeschaltet.','remain separate and are enabled manually in the backend only.')}</div>`);
 });
 
@@ -884,7 +1056,7 @@ function adminServicesContent(req) {
 }
 
 function adminSettingsContent(req) {
-  const lang=langOf(req),settings=getSiteSettings(),supporters=listSupporters(false),tiers=settings.freeBoost?.tiers||[],teamIds=(settings.teamDiscordIds||[]).join(', '),sales=settings.premiumSales||{},prices=sales.prices||{},auto=paypalAutoConfig(settings),sub=paypalSubscriptionConfig(settings),apiState=paypalCredentialState(settings),discordAuth=discordOAuthConfig(settings);
+  const lang=langOf(req),settings=getSiteSettings(),supporters=listSupporters(false),tiers=settings.freeBoost?.tiers||[],teamIds=(settings.teamDiscordIds||[]).join(', '),sales=settings.premiumSales||{},prices=sales.prices||{},auto=paypalAutoConfig(settings),sub=paypalSubscriptionConfig(settings),apiState=paypalCredentialState(settings),stripeAuto=stripeAutoConfig(settings),stripeSub=stripeSubscriptionConfig(settings),stripeState=stripeCredentialState(settings),discordAuth=discordOAuthConfig(settings);
   const tierValue=(limit,fallback)=>tiers.find((x)=>Number(x.limit)===limit)?.members??fallback;
   const rows=supporters.map((x)=>`<tr><td><strong>${esc(x.displayName)}</strong></td><td>${esc(x.amountLabel||'—')}</td><td><form method="post" action="/admin/supporters/${esc(x.id)}/delete"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Entfernen','Remove')}</button></form></td></tr>`).join('');
   const paypalCredentialStateHtml=apiState.configured?`<span class="badge online">${tr(lang,'PayPal API bereit','PayPal API ready')}</span><span class="badge ${apiState.storedInPanel?'online':'neutral'}">${apiState.storedInPanel?tr(lang,'Im Panel gespeichert','Stored in panel'):tr(lang,'Legacy .env Fallback','Legacy .env fallback')}</span>`:`<span class="badge error">${tr(lang,'PayPal API Zugangsdaten fehlen','PayPal API credentials missing')}</span>`;
@@ -914,6 +1086,17 @@ function adminSettingsContent(req) {
     <label>Premium 5 / ${tr(lang,'Monat','month')}<input name="paypalSubAmountPremium5" inputmode="decimal" value="${esc(sub.amounts.premium5||'')}"></label><label>Premium 10 / ${tr(lang,'Monat','month')}<input name="paypalSubAmountPremium10" inputmode="decimal" value="${esc(sub.amounts.premium10||'')}"></label><label>Premium 15 / ${tr(lang,'Monat','month')}<input name="paypalSubAmountPremium15" inputmode="decimal" value="${esc(sub.amounts.premium15||'')}"></label><label>Premium 20 / ${tr(lang,'Monat','month')}<input name="paypalSubAmountPremium20" inputmode="decimal" value="${esc(sub.amounts.premium20||'')}"></label>
     <div class="span2 help"><strong>${tr(lang,'Abo-Setup','Subscription setup')}:</strong> ${sub.productId ? `<span class="badge online">Product ${esc(sub.productId)}</span>` : `<span class="badge neutral">${tr(lang,'Noch nicht erstellt','Not created yet')}</span>`} <span class="muted small">${tr(lang,'Der PayPal-Setup-Button erstellt/aktualisiert Produkt und Monatspläne automatisch.','The PayPal setup button creates/updates the product and monthly plans automatically.')}</span></div>
     <div class="span2 help"><div class="actions wrap">${paypalCredentialStateHtml}${webhookState}<span class="badge neutral">${esc(apiState.mode)}</span><button class="button primary" type="submit" formaction="/admin/paypal/setup" formmethod="post">${tr(lang,'Speichern & PayPal automatisch einrichten / testen','Save & automatically set up / test PayPal')}</button></div><p class="muted small">${tr(lang,'Client Secret wird verschlüsselt in der Panel-Datenbank gespeichert. Für PayPal ist danach keine SSH- oder .env-Änderung nötig.','The client secret is encrypted in the panel database. No SSH or .env changes are needed for PayPal afterwards.')}</p></div>
+    <div class="span2 admin-subhead"><h3>Premium & Stripe</h3></div>
+    <label>${tr(lang,'Stripe Modus','Stripe mode')}<select name="stripeMode"><option value="test" ${stripeState.mode==='test'?'selected':''}>Test</option><option value="live" ${stripeState.mode==='live'?'selected':''}>Live</option></select></label>
+    <label>Stripe Secret Key<input name="stripeSecretKey" type="password" autocomplete="new-password" placeholder="${stripeState.hasSecret?tr(lang,'Leer lassen = vorhandenen Key behalten','Leave empty to keep current key'):'sk_test_... / sk_live_...'}"></label>
+    <label class="check span2"><input type="checkbox" name="stripeClearCredentials" value="1"> ${tr(lang,'Gespeicherte Stripe Zugangsdaten löschen','Clear stored Stripe credentials')}</label>
+    <label class="check span2"><input type="checkbox" name="stripeAutoEnabled" value="1" ${stripeAuto.enabled?'checked':''}> ${tr(lang,'Automatische Stripe-Freischaltung aktivieren','Enable automatic Stripe activation')}</label>
+    <label>${tr(lang,'Währung','Currency')}<input name="stripeCurrency" maxlength="3" value="${esc(stripeAuto.currency)}" placeholder="EUR"></label><label>${tr(lang,'Premium-Dauer pro Einmalkauf (Tage)','Premium duration per one-time purchase (days)')}<input name="stripeAccessDays" type="number" min="1" max="3650" value="${esc(stripeAuto.accessDays)}"></label>
+    <label>Premium 5 Stripe<input name="stripeAmountPremium5" inputmode="decimal" value="${esc(stripeAuto.amounts.premium5||'')}"></label><label>Premium 10 Stripe<input name="stripeAmountPremium10" inputmode="decimal" value="${esc(stripeAuto.amounts.premium10||'')}"></label><label>Premium 15 Stripe<input name="stripeAmountPremium15" inputmode="decimal" value="${esc(stripeAuto.amounts.premium15||'')}"></label><label>Premium 20 Stripe<input name="stripeAmountPremium20" inputmode="decimal" value="${esc(stripeAuto.amounts.premium20||'')}"></label>
+    <div class="span2 admin-subhead"><h3>${tr(lang,'Monatliche Stripe-Abos','Monthly Stripe subscriptions')}</h3></div>
+    <label class="check span2"><input type="checkbox" name="stripeSubscriptionEnabled" value="1" ${stripeSub.enabled?'checked':''}> ${tr(lang,'Monatliche Stripe-Abos anbieten','Offer monthly Stripe subscriptions')}</label>
+    <label>Premium 5 / ${tr(lang,'Monat','month')}<input name="stripeSubAmountPremium5" inputmode="decimal" value="${esc(stripeSub.amounts.premium5||'')}"></label><label>Premium 10 / ${tr(lang,'Monat','month')}<input name="stripeSubAmountPremium10" inputmode="decimal" value="${esc(stripeSub.amounts.premium10||'')}"></label><label>Premium 15 / ${tr(lang,'Monat','month')}<input name="stripeSubAmountPremium15" inputmode="decimal" value="${esc(stripeSub.amounts.premium15||'')}"></label><label>Premium 20 / ${tr(lang,'Monat','month')}<input name="stripeSubAmountPremium20" inputmode="decimal" value="${esc(stripeSub.amounts.premium20||'')}"></label>
+    <div class="span2 help"><div class="actions wrap"><span class="badge ${stripeState.configured?'online':'error'}">${stripeState.configured?tr(lang,'Stripe API bereit','Stripe API ready'):tr(lang,'Stripe Secret Key fehlt','Stripe Secret Key missing')}</span><span class="badge ${stripeState.hasWebhookSecret?'online':'neutral'}">${stripeState.hasWebhookSecret?tr(lang,'Webhook bereit','Webhook ready'):tr(lang,'Webhook nicht eingerichtet','Webhook not configured')}</span><span class="badge neutral">${esc(stripeState.mode)}</span><button class="button primary" type="submit" formaction="/admin/stripe/setup" formmethod="post">${tr(lang,'Speichern & Stripe automatisch einrichten / testen','Save & automatically set up / test Stripe')}</button></div><p class="muted small">${tr(lang,'Stripe Secret Key und Webhook Secret werden verschlüsselt gespeichert. Der Setup-Button erstellt den Webhook automatisch.','Stripe secret key and webhook secret are stored encrypted. The setup button creates the webhook automatically.')}</p></div>
     <label>PayPal URL (${tr(lang,'Fallback','fallback')})<input name="premiumPaypalUrl" value="${esc(sales.paypalUrl||'')}" placeholder="https://paypal.me/..."></label><label>${tr(lang,'Discord Username für Kauf','Discord username for sales')}<input name="salesDiscordUsername" value="${esc(sales.discordUsername||'')}" placeholder="@username"></label><label>${tr(lang,'Discord User ID für Kauf-Link','Discord user ID for sales link')}<input name="salesDiscordUserId" value="${esc(sales.discordUserId||'')}"></label>
     <label>Premium 5 ${tr(lang,'Anzeige','display')}<input name="pricePremium5" value="${esc(prices.premium5||'')}"></label><label>Premium 10 ${tr(lang,'Anzeige','display')}<input name="pricePremium10" value="${esc(prices.premium10||'')}"></label><label>Premium 15 ${tr(lang,'Anzeige','display')}<input name="pricePremium15" value="${esc(prices.premium15||'')}"></label><label>Premium 20 ${tr(lang,'Anzeige','display')}<input name="pricePremium20" value="${esc(prices.premium20||'')}"></label>
     <div class="span2 admin-subhead"><h3>${tr(lang,'Free-Boost','Free boost')}</h3></div><label>${tr(lang,'Branding-Kategorie','Branding category')}<input name="categoryName" value="${esc(settings.freeBoost?.categoryName||settings.freeBoost?.channelName||'Powered by status-hub.lol')}"></label><label>${tr(lang,'Prüfintervall Stunden','Verification hours')}<input name="verifyHours" type="number" min="1" max="48" value="${esc(settings.freeBoost?.verifyHours||6)}"></label><label>2 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier2" type="number" min="1" value="${esc(tierValue(2,50))}"></label><label>3 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier3" type="number" min="1" value="${esc(tierValue(3,100))}"></label><label>4 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier4" type="number" min="1" value="${esc(tierValue(4,250))}"></label><label>5 Bots ${tr(lang,'ab Mitgliedern','from members')}<input name="tier5" type="number" min="1" value="${esc(tierValue(5,500))}"></label>
@@ -1004,30 +1187,49 @@ app.get('/admin/settings', requireAdmin, (req,res) => res.redirect('/admin?tab=s
 
 function saveAdminSettingsFromBody(req) {
   const current=getSiteSettings();
-  const cleanDomain=String(req.body.serviceDomain||'status-hub.lol').trim().replace(/^https?:\/\//i,'').replace(/\/+$/,'').slice(0,120) || 'status-hub.lol';
+  const cleanDomain=String(req.body.serviceDomain||'status-hub.lol').trim().replace(/^https?:\/\//i,'').replace(/\/+$/,'').slice(0,120)||'status-hub.lol';
   const oldDiscord=current.discordOAuth||{};
   let discordClientId=String(req.body.discordClientId??oldDiscord.clientId??process.env.DISCORD_OAUTH_CLIENT_ID??'').trim().slice(0,100);
-  let discordClientSecretEnc=String(oldDiscord.clientSecretEnc||'');
-  const discordNewSecret=String(req.body.discordClientSecret||'').trim();
-  if(req.body.discordClearCredentials==='1'){discordClientId='';discordClientSecretEnc='';}
-  else if(discordNewSecret) discordClientSecretEnc=encryptSecret(discordNewSecret.slice(0,500));
+  let discordClientSecretEnc=String(oldDiscord.clientSecretEnc||''); const discordNewSecret=String(req.body.discordClientSecret||'').trim();
+  if(req.body.discordClearCredentials==='1'){discordClientId='';discordClientSecretEnc='';} else if(discordNewSecret)discordClientSecretEnc=encryptSecret(discordNewSecret.slice(0,500));
   const discordOAuth={enabled:req.body.discordOAuthEnabled==='1',allowRegistration:req.body.discordAllowRegistration==='1',clientId:discordClientId,clientSecretEnc:discordClientSecretEnc};
   const defaults={2:50,3:100,4:250,5:500};
   const values=[2,3,4,5].map((limit)=>({limit,members:Math.max(1,Number(req.body[`tier${limit}`])||defaults[limit])})).sort((a,b)=>a.members-b.members);
   const teamDiscordIds=String(req.body.teamDiscordIds||'').split(',').map((x)=>x.trim()).filter((x)=>validSnowflake(x)).slice(0,25);
   const currency=/^[A-Za-z]{3}$/.test(String(req.body.paypalCurrency||''))?String(req.body.paypalCurrency).toUpperCase():'EUR';
-  const oldAuto=paypalAutoConfig(current); const oldSub=paypalSubscriptionConfig(current); const oldApi=current.premiumSales?.paypalApi||{};
+  const oldAuto=paypalAutoConfig(current),oldSub=paypalSubscriptionConfig(current),oldApi=current.premiumSales?.paypalApi||{};
   const mode=String(req.body.paypalMode||oldApi.mode||'sandbox').toLowerCase()==='live'?'live':'sandbox';
-  let clientId=String(req.body.paypalClientId??oldApi.clientId??'').trim().slice(0,300);
-  let clientSecretEnc=String(oldApi.clientSecretEnc||'');
-  const newSecret=String(req.body.paypalClientSecret||'').trim(); const clearCredentials=req.body.paypalClearCredentials==='1';
-  if(clearCredentials){clientId='';clientSecretEnc='';}
-  else if(newSecret) clientSecretEnc=encryptSecret(newSecret.slice(0,500));
+  let clientId=String(req.body.paypalClientId??oldApi.clientId??'').trim().slice(0,300),clientSecretEnc=String(oldApi.clientSecretEnc||'');
+  const newSecret=String(req.body.paypalClientSecret||'').trim(),clearCredentials=req.body.paypalClearCredentials==='1';
+  if(clearCredentials){clientId='';clientSecretEnc='';}else if(newSecret)clientSecretEnc=encryptSecret(newSecret.slice(0,500));
   const credentialsChanged=clearCredentials||Boolean(newSecret)||mode!==String(oldApi.mode||'sandbox')||clientId!==String(oldApi.clientId||'');
-  const updated=updateSiteSettings({serviceDomain:cleanDomain,discordOAuth,supportUrl:String(req.body.supportUrl||'').trim().slice(0,500),teamDiscordIds,donationLinks:{paypal:String(req.body.paypal||'').trim().slice(0,500),kofi:String(req.body.kofi||'').trim().slice(0,500),stripe:String(req.body.stripe||'').trim().slice(0,500),customUrl:String(req.body.customUrl||'').trim().slice(0,500),customLabel:String(req.body.customLabel||'').trim().slice(0,80)},premiumSales:{paypalUrl:String(req.body.premiumPaypalUrl||'').trim().slice(0,500),discordUserId:validSnowflake(req.body.salesDiscordUserId)?String(req.body.salesDiscordUserId).trim():'',discordUsername:String(req.body.salesDiscordUsername||'').trim().slice(0,80),prices:{premium5:String(req.body.pricePremium5||'').trim().slice(0,60),premium10:String(req.body.pricePremium10||'').trim().slice(0,60),premium15:String(req.body.pricePremium15||'').trim().slice(0,60),premium20:String(req.body.pricePremium20||'').trim().slice(0,60)},paypalApi:{mode,clientId,clientSecretEnc},paypalAuto:{enabled:req.body.paypalAutoEnabled==='1',currency,accessDays:Math.max(1,Math.min(3650,Number(req.body.paypalAccessDays)||30)),webhookId:credentialsChanged?'':(oldAuto.webhookId||''),amounts:{premium5:normalizedMoney(req.body.paypalAmountPremium5),premium10:normalizedMoney(req.body.paypalAmountPremium10),premium15:normalizedMoney(req.body.paypalAmountPremium15),premium20:normalizedMoney(req.body.paypalAmountPremium20)}},paypalSubscription:{enabled:req.body.paypalSubscriptionEnabled==='1',productId:credentialsChanged?'':(oldSub.productId||''),planIds:credentialsChanged?{}:(oldSub.planIds||{}),planMeta:credentialsChanged?{}:(oldSub.planMeta||{}),amounts:{premium5:normalizedMoney(req.body.paypalSubAmountPremium5),premium10:normalizedMoney(req.body.paypalSubAmountPremium10),premium15:normalizedMoney(req.body.paypalSubAmountPremium15),premium20:normalizedMoney(req.body.paypalSubAmountPremium20)}}},freeBoost:{categoryName:String(req.body.categoryName||'Powered by status-hub.lol').trim().slice(0,100),verifyHours:Math.max(1,Math.min(48,Number(req.body.verifyHours)||6)),tiers:values}});
-  recalculateStoredFreeBoostLimits(updated);
-  rebalanceAssignments();
-  return updated;
+
+  const oldStripeApi=current.premiumSales?.stripeApi||{},oldStripeAuto=stripeAutoConfig(current),oldStripeSub=stripeSubscriptionConfig(current);
+  const stripeMode=String(req.body.stripeMode||oldStripeApi.mode||'test').toLowerCase()==='live'?'live':'test';
+  let stripeSecretKeyEnc=String(oldStripeApi.secretKeyEnc||''),stripeWebhookSecretEnc=String(oldStripeApi.webhookSecretEnc||''),stripeEndpointId=String(oldStripeApi.endpointId||'');
+  const stripeNewKey=String(req.body.stripeSecretKey||'').trim(),stripeClear=req.body.stripeClearCredentials==='1';
+  const stripeCredentialsChanged=stripeClear||Boolean(stripeNewKey)||stripeMode!==String(oldStripeApi.mode||'test');
+  if(stripeClear){stripeSecretKeyEnc='';stripeWebhookSecretEnc='';stripeEndpointId='';}
+  else if(stripeNewKey){stripeSecretKeyEnc=encryptSecret(stripeNewKey.slice(0,500));stripeWebhookSecretEnc='';stripeEndpointId='';}
+  if(stripeCredentialsChanged&&!stripeNewKey&&!stripeClear){stripeWebhookSecretEnc='';stripeEndpointId='';}
+  const stripeCurrency=/^[A-Za-z]{3}$/.test(String(req.body.stripeCurrency||''))?String(req.body.stripeCurrency).toUpperCase():'EUR';
+
+  const updated=updateSiteSettings({
+    serviceDomain:cleanDomain,discordOAuth,supportUrl:String(req.body.supportUrl||'').trim().slice(0,500),teamDiscordIds,
+    donationLinks:{paypal:String(req.body.paypal||'').trim().slice(0,500),kofi:String(req.body.kofi||'').trim().slice(0,500),stripe:String(req.body.stripe||'').trim().slice(0,500),customUrl:String(req.body.customUrl||'').trim().slice(0,500),customLabel:String(req.body.customLabel||'').trim().slice(0,80)},
+    premiumSales:{
+      paypalUrl:String(req.body.premiumPaypalUrl||'').trim().slice(0,500),discordUserId:validSnowflake(req.body.salesDiscordUserId)?String(req.body.salesDiscordUserId).trim():'',discordUsername:String(req.body.salesDiscordUsername||'').trim().slice(0,80),
+      prices:{premium5:String(req.body.pricePremium5||'').trim().slice(0,60),premium10:String(req.body.pricePremium10||'').trim().slice(0,60),premium15:String(req.body.pricePremium15||'').trim().slice(0,60),premium20:String(req.body.pricePremium20||'').trim().slice(0,60)},
+      paypalApi:{mode,clientId,clientSecretEnc},
+      paypalAuto:{enabled:req.body.paypalAutoEnabled==='1',currency,accessDays:Math.max(1,Math.min(3650,Number(req.body.paypalAccessDays)||30)),webhookId:credentialsChanged?'':(oldAuto.webhookId||''),amounts:{premium5:normalizedMoney(req.body.paypalAmountPremium5),premium10:normalizedMoney(req.body.paypalAmountPremium10),premium15:normalizedMoney(req.body.paypalAmountPremium15),premium20:normalizedMoney(req.body.paypalAmountPremium20)}},
+      paypalSubscription:{enabled:req.body.paypalSubscriptionEnabled==='1',productId:credentialsChanged?'':(oldSub.productId||''),planIds:credentialsChanged?{}:(oldSub.planIds||{}),planMeta:credentialsChanged?{}:(oldSub.planMeta||{}),amounts:{premium5:normalizedMoney(req.body.paypalSubAmountPremium5),premium10:normalizedMoney(req.body.paypalSubAmountPremium10),premium15:normalizedMoney(req.body.paypalSubAmountPremium15),premium20:normalizedMoney(req.body.paypalSubAmountPremium20)}},
+      stripeApi:{mode:stripeMode,secretKeyEnc:stripeSecretKeyEnc,webhookSecretEnc:stripeWebhookSecretEnc,endpointId:stripeEndpointId},
+      stripeAuto:{enabled:req.body.stripeAutoEnabled==='1',currency:stripeCurrency,accessDays:Math.max(1,Math.min(3650,Number(req.body.stripeAccessDays)||30)),amounts:{premium5:normalizedMoney(req.body.stripeAmountPremium5),premium10:normalizedMoney(req.body.stripeAmountPremium10),premium15:normalizedMoney(req.body.stripeAmountPremium15),premium20:normalizedMoney(req.body.stripeAmountPremium20)}},
+      stripeSubscription:{enabled:req.body.stripeSubscriptionEnabled==='1',amounts:{premium5:normalizedMoney(req.body.stripeSubAmountPremium5),premium10:normalizedMoney(req.body.stripeSubAmountPremium10),premium15:normalizedMoney(req.body.stripeSubAmountPremium15),premium20:normalizedMoney(req.body.stripeSubAmountPremium20)}}
+    },
+    freeBoost:{categoryName:String(req.body.categoryName||'Powered by status-hub.lol').trim().slice(0,100),verifyHours:Math.max(1,Math.min(48,Number(req.body.verifyHours)||6)),tiers:values}
+  });
+  recalculateStoredFreeBoostLimits(updated);rebalanceAssignments();return updated;
 }
 
 app.post('/admin/settings', requireAdmin, checkCsrf, (req,res) => {
@@ -1060,6 +1262,22 @@ app.post('/admin/paypal/setup', requireAdmin, checkCsrf, rateLimit({ windowMs: 6
     updateSiteSettings({premiumSales:{paypalAuto:{enabled:true,webhookId:webhook.id},...subPatch}});
     flash(req,'ok',l(req,`PayPal ${paypalEnvironment(settings)} verbunden. Webhook und monatliche Abo-Pläne wurden eingerichtet.`,`PayPal ${paypalEnvironment(settings)} connected. Webhook and monthly subscription plans were set up.`));
   } catch(error) { flash(req,'err',`PayPal: ${error.message}`); }
+  res.redirect('/admin?tab=settings#settings');
+});
+
+app.post('/admin/stripe/setup', requireAdmin, checkCsrf, rateLimit({ windowMs:60_000, limit:5 }), async(req,res)=>{
+  try{
+    let settings=saveAdminSettingsFromBody(req);
+    if(!stripeConfigured(settings))throw new Error(l(req,'Stripe Secret Key fehlt in den Admin-Einstellungen.','Stripe Secret Key is missing in the admin settings.'));
+    const state=stripeCredentialState(settings);
+    await testStripeConnection(settings);
+    const useExisting=state.endpointId&&state.hasWebhookSecret?state.endpointId:'';
+    const result=await ensureStripeWebhook({endpointId:useExisting,url:`${baseUrl}/webhooks/stripe`,settings});
+    const patch={premiumSales:{stripeApi:{endpointId:result.endpoint.id}}};
+    if(result.secret)patch.premiumSales.stripeApi.webhookSecretEnc=encryptSecret(result.secret);
+    settings=updateSiteSettings(patch);
+    flash(req,'ok',l(req,`Stripe ${stripeCredentialState(settings).mode} verbunden. Webhook wurde eingerichtet und Checkout ist bereit.`,`Stripe ${stripeCredentialState(settings).mode} connected. Webhook was configured and Checkout is ready.`));
+  }catch(error){flash(req,'err',`Stripe: ${error.message}`);}
   res.redirect('/admin?tab=settings#settings');
 });
 

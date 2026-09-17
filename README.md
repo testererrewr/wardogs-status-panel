@@ -146,3 +146,7 @@ https://status-hub.lol/webhooks/paypal
 ## Discord OAuth settings
 
 Discord OAuth can be changed in **Admin -> Settings**. Existing `.env` credentials are kept as a fallback. The Discord Client Secret is encrypted with `APP_ENCRYPTION_KEY` when stored in the panel database.
+
+## Stripe
+
+Stripe can be configured completely in **Admin → Settings**. The panel supports Test/Live secret keys, automatic webhook setup, one-time Premium purchases, monthly subscriptions, automatic entitlement updates, and cancellation from **Your Account**. Stripe credentials and webhook secrets are encrypted in the panel database.

@@ -28,3 +28,6 @@ Den fertigen Einzeiler im Adminbereich unter `Node Manager` verwenden. Für Remo
 ## Domain
 
 Produktiv wird `PUBLIC_URL=https://status-hub.lol` verwendet. Discord OAuth nutzt `https://status-hub.lol/auth/discord/callback`. PayPal Webhooks nutzen `https://status-hub.lol/webhooks/paypal`.
+
+## v3.11.0
+Stripe is configured in the panel; no Stripe SSH/.env setup is required.
