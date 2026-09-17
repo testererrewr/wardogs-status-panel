@@ -40,7 +40,14 @@ async function accessToken(settings = getSiteSettings()) {
     body: 'grant_type=client_credentials'
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok || !body.access_token) throw new Error(body.error_description || body.message || `PayPal OAuth failed (${response.status})`);
+  if (!response.ok || !body.access_token) {
+    const detail = body.error_description || body.message || body.error || `PayPal OAuth failed (${response.status})`;
+    if (response.status === 401 && /authentication failed|invalid_client/i.test(String(detail))) {
+      const label = cfg.mode === 'sandbox' ? 'Sandbox' : 'Live';
+      throw new Error(`PayPal ${label} credentials rejected. Client ID and Client Secret must come from the same ${label} REST app.`);
+    }
+    throw new Error(detail);
+  }
   return body.access_token;
 }
 

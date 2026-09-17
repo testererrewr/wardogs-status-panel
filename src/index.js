@@ -49,6 +49,7 @@ app.use(express.urlencoded({ extended: false, limit: '128kb' }));
 app.use(express.static('public', { maxAge: 0, etag: true }));
 const canonical = new URL(baseUrl);
 app.use((req, res, next) => {
+  if (req.path.startsWith('/api/status-nodes/') || req.path === '/healthz') return next();
   if (req.method !== 'GET' && req.method !== 'HEAD') return next();
   const host = String(req.get('host') || '');
   const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || '').split(',')[0].trim();
@@ -673,6 +674,7 @@ function adminSettingsContent(req) {
     <label>${tr(lang,'PayPal Modus','PayPal mode')}<select name="paypalMode"><option value="sandbox" ${apiState.mode==='sandbox'?'selected':''}>Sandbox</option><option value="live" ${apiState.mode==='live'?'selected':''}>Live</option></select></label>
     <label>PayPal Client ID<input name="paypalClientId" value="${esc(apiState.clientId||'')}" autocomplete="off" placeholder="Client ID"></label>
     <label class="span2">PayPal Client Secret<input name="paypalClientSecret" type="password" autocomplete="new-password" placeholder="${apiState.hasSecret?tr(lang,'Leer lassen = vorhandenes Secret behalten','Leave empty to keep current secret'):'Client Secret'}"></label>
+    <div class="span2 help">${tr(lang,'Sandbox benötigt die Client ID und das Client Secret einer PayPal Sandbox REST-App. Live-Zugangsdaten funktionieren im Sandbox-Modus nicht.','Sandbox requires the Client ID and Client Secret from a PayPal Sandbox REST app. Live credentials do not work in Sandbox mode.')}</div>
     <label class="check span2"><input type="checkbox" name="paypalClearCredentials" value="1"> ${tr(lang,'Gespeicherte PayPal API-Zugangsdaten löschen','Clear stored PayPal API credentials')}</label>
     <label class="check span2"><input type="checkbox" name="paypalAutoEnabled" value="1" ${auto.enabled?'checked':''}> ${tr(lang,'Automatische PayPal-Freischaltung aktivieren','Enable automatic PayPal activation')}</label>
     <label>${tr(lang,'Währung','Currency')}<input name="paypalCurrency" maxlength="3" value="${esc(auto.currency)}" placeholder="EUR"></label><label>${tr(lang,'Premium-Dauer pro Kauf (Tage)','Premium duration per purchase (days)')}<input name="paypalAccessDays" type="number" min="1" max="3650" value="${esc(auto.accessDays)}"></label>

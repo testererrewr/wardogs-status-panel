@@ -98,8 +98,15 @@ https://status-hub.lol/webhooks/paypal
 ```
 
 
-## v3.9.7
+## v3.9.8
 
 - PayPal Sandbox Checkout ist auch ohne bereits angelegten Webhook testbar.
 - Einzelner Bot-Neustart validiert den gespeicherten Discord Bot Token und startet deaktivierte Bots wieder.
 - Node Manager kann alle aktiven Bots eines Nodes gesammelt neu starten.
+
+
+## v3.9.8
+
+- Fixed internal status-node work API being redirected to the public domain and losing node authentication.
+- Status bots can receive work from the local/remote node again.
+- PayPal now reports a clear Sandbox/Live credential mismatch message.
