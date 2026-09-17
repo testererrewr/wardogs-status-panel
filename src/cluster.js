@@ -124,6 +124,23 @@ export function moveAllFromNode(sourceNodeId, targetNodeId) {
   });
 }
 
+export function restartAllBotsOnNode(nodeId) {
+  return updateDb((db) => {
+    const node = db.statusNodes.find((n) => n.id === nodeId);
+    if (!node) throw new Error('Node not found');
+    const now = Date.now();
+    let restarted = 0;
+    for (const server of db.servers) {
+      if (server.assignedNodeId === nodeId && server.enabled) {
+        server.restartNonce = now + restarted;
+        server.updatedAt = new Date(now).toISOString();
+        restarted += 1;
+      }
+    }
+    return { nodeId, restarted };
+  });
+}
+
 export function drainStatusNode(nodeId) {
   const result = updateDb((db) => {
     const node = db.statusNodes.find((n) => n.id === nodeId);

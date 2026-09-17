@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { syncBots, shutdownBots, runtimeSnapshot, runningBotCount } from './bot-manager.js';
 
-const version = '3.9.5';
+const version = '3.9.7';
 const controlUrl = String(process.env.CONTROL_PLANE_URL || '').replace(/\/+$/, '');
 const joinSecret = String(process.env.STATUS_NODE_JOIN_SECRET || '');
 const nodeId = String(process.env.STATUS_NODE_ID || os.hostname()).trim().slice(0, 80);

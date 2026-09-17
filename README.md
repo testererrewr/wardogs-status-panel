@@ -96,3 +96,10 @@ https://status-hub.lol
 https://status-hub.lol/auth/discord/callback
 https://status-hub.lol/webhooks/paypal
 ```
+
+
+## v3.9.7
+
+- PayPal Sandbox Checkout ist auch ohne bereits angelegten Webhook testbar.
+- Einzelner Bot-Neustart validiert den gespeicherten Discord Bot Token und startet deaktivierte Bots wieder.
+- Node Manager kann alle aktiven Bots eines Nodes gesammelt neu starten.

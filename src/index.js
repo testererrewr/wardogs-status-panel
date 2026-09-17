@@ -21,7 +21,7 @@ import { prepareCustomBot, parseEnvText, deleteCustomBotFiles } from './custom-b
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
-import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode } from './cluster.js';
+import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
 import { verifyFreeBoostForUser, refreshDueFreeBoosts, freeBoostRanges, recalculateStoredFreeBoostLimits } from './free-boost.js';
 import { paypalConfigured, paypalEnvironment, paypalCredentialState, createCheckoutOrder, getCheckoutOrder, captureCheckoutOrder, extractCompletedCapture, verifyWebhook, ensureWebhook } from './paypal.js';
 
@@ -106,7 +106,7 @@ function paypalAutoConfig(settings = getSiteSettings()) {
 }
 function paypalAutoReady(settings = getSiteSettings()) {
   const auto = paypalAutoConfig(settings);
-  return Boolean(auto.enabled && paypalConfigured(settings) && auto.webhookId);
+  return Boolean(auto.enabled && paypalConfigured(settings));
 }
 function moneyMatches(a, b) { return normalizedMoney(a) === normalizedMoney(b); }
 function applyPaypalPurchase(purchase, capture) {
@@ -168,9 +168,14 @@ async function discordApi(path, options = {}) {
   return response.json();
 }
 async function validateBotToken(token) {
-  const bot = await discordApi('/users/@me', { headers: { Authorization: `Bot ${token}` } });
-  if (!bot.bot) throw new Error('Der Discord Token gehört nicht zu einem Bot-Account');
-  return bot;
+  try {
+    const bot = await discordApi('/users/@me', { headers: { Authorization: `Bot ${token}` } });
+    if (!bot.bot) throw new Error('Der Discord Token gehört nicht zu einem Bot-Account');
+    return bot;
+  } catch (error) {
+    if (/Discord API 401/.test(String(error.message))) throw new Error('Discord Bot Token ungültig. Verwende den Bot Token aus Developer Portal → Bot, nicht Application ID oder Client Secret.');
+    throw error;
+  }
 }
 
 function parseTemplates(value, gameType = '') {
@@ -278,7 +283,7 @@ app.get('/api/status-nodes/work', requireStatusNode, (req, res) => {
 app.get('/login', (req, res) => {
   if (currentUser(req)) return res.redirect('/');
   const lang = langOf(req);
-  render(req, res, 'status-hub.lol', `<section class="landing-hero"><div class="landing-copy"><span class="eyebrow">status-hub.lol</span><h1>${tr(lang,'Deine Discord Status-Bots. Einfach gehostet.','Your Discord status bots. Hosted simply.')}</h1><p>${tr(lang,'Erstelle Status-Bots für WARDOGS, FiveM, GameDig, JSON-APIs oder reine Text-Rotation. Ein kostenloser Bot ist inklusive.','Create status bots for WARDOGS, FiveM, GameDig, JSON APIs or text-only rotation. One free bot is included.')}</p><div class="actions wrap"><a class="button discord landing-cta" href="/auth/discord">${tr(lang,'Kostenlos mit Discord starten','Start free with Discord')}</a><a class="button ghost" href="/games">${tr(lang,'Unterstützte Games','Supported games')}</a></div><div class="landing-points"><span>✓ ${tr(lang,'1 Bot kostenlos','1 bot free')}</span><span>✓ ${tr(lang,'Deutsch & Englisch','German & English')}</span><span>✓ ${tr(lang,'Automatisch gehostet','Fully hosted')}</span></div></div><div class="landing-preview panel"><div class="preview-status"><span class="dot online"></span><div><strong>EU Server #1</strong><span>42/100 ${tr(lang,'Spieler online','players online')}</span></div></div><div class="preview-status"><span class="dot online"></span><div><strong>Minecraft</strong><span>Map: survival</span></div></div><div class="preview-status"><span class="dot starting"></span><div><strong>${tr(lang,'Text-Rotation','Text rotation')}</strong><span>Powered by status-hub.lol</span></div></div></div></section><section class="landing-features"><article class="panel"><span class="eyebrow">Games</span><h2>320+</h2><p>${tr(lang,'GameDig plus direkte WARDOGS- und FiveM-Anbindungen.','GameDig plus direct WARDOGS and FiveM integrations.')}</p></article><article class="panel"><span class="eyebrow">Free</span><h2>1–5</h2><p>${tr(lang,'Ein Bot gratis. Mit der Branding-Kategorie sind je nach Servergröße bis zu 5 möglich.','One bot free. With the branding category, server size can unlock up to 5.')}</p></article><article class="panel"><span class="eyebrow">Premium</span><h2>5–20</h2><p>${tr(lang,'Mehr Bots und kein Powered-by-Branding.','More bots and no Powered-by branding.')}</p></article></section><section class="landing-bottom panel"><div><h2>${tr(lang,'In wenigen Minuten online','Online in minutes')}</h2><p>${tr(lang,'Discord Bot Token eintragen, Game auswählen und Status konfigurieren. Hosting und Updates übernimmt der Hub.','Enter a Discord bot token, choose a game and configure the status. The Hub handles hosting and updates.')}</p></div><a class="button primary" href="/auth/discord">${tr(lang,'Jetzt starten','Get started')}</a></section>`);
+  render(req, res, 'status-hub.lol', `<section class="landing-hero"><div class="landing-copy"><span class="eyebrow">status-hub.lol</span><h1>${tr(lang,'Deine Discord Status-Bots. Einfach gehostet.','Your Discord status bots. Hosted simply.')}</h1><p>${tr(lang,'Erstelle Status-Bots für WARDOGS, FiveM, GameDig, JSON-APIs oder reine Text-Rotation. Ein kostenloser Bot ist inklusive.','Create status bots for WARDOGS, FiveM, GameDig, JSON APIs or text-only rotation. One free bot is included.')}</p><div class="actions wrap"><a class="button discord landing-cta" href="/auth/discord">${tr(lang,'Kostenlos mit Discord starten','Start free with Discord')}</a><a class="button ghost" href="/games">${tr(lang,'Unterstützte Games','Supported games')}</a></div><div class="landing-points"><span>✓ ${tr(lang,'1 Bot kostenlos','1 bot free')}</span><span>✓ ${tr(lang,'Deutsch & Englisch','German & English')}</span><span>✓ ${tr(lang,'Automatisch gehostet','Fully hosted')}</span></div></div><div class="landing-preview panel"><div class="preview-status"><span class="dot online"></span><div><strong>EU Server #1</strong><span>42/100 ${tr(lang,'Spieler online','players online')}</span></div></div><div class="preview-status"><span class="dot online"></span><div><strong>Minecraft</strong><span>Map: survival</span></div></div><div class="preview-status"><span class="dot starting"></span><div><strong>${tr(lang,'Text-Rotation','Text rotation')}</strong><span>Powered by status-hub.lol</span></div></div></div></section><section class="landing-features"><article class="panel"><span class="eyebrow">Games</span><h2>${tr(lang,'Hunderte','Hundreds')}</h2><p>${tr(lang,'Spiele verfügbar für deine Status-Bots.','Games available for your status bots.')}</p></article><article class="panel"><span class="eyebrow">Free</span><h2>1–5</h2><p>${tr(lang,'Ein Bot gratis. Mit der Branding-Kategorie sind je nach Servergröße bis zu 5 möglich.','One bot free. With the branding category, server size can unlock up to 5.')}</p></article><article class="panel"><span class="eyebrow">Premium</span><h2>5–20</h2><p>${tr(lang,'Mehr Bots und kein Powered-by-Branding.','More bots and no Powered-by branding.')}</p></article></section><section class="landing-bottom panel"><div><h2>${tr(lang,'In wenigen Minuten online','Online in minutes')}</h2><p>${tr(lang,'Discord Bot Token eintragen, Game auswählen und Status konfigurieren. Hosting und Updates übernimmt der Hub.','Enter a Discord bot token, choose a game and configure the status. The Hub handles hosting and updates.')}</p></div><a class="button primary" href="/auth/discord">${tr(lang,'Jetzt starten','Get started')}</a></section>`);
 });
 
 app.get('/auth/discord', rateLimit({ windowMs: 60_000, limit: 20 }), (req, res) => {
@@ -557,7 +562,20 @@ app.post('/servers/:id/test', requireLogin, checkCsrf, async (req, res) => {
   } catch (error) { flash(req, 'err', `${l(req,'Status-Test fehlgeschlagen','Status test failed')}: ${error.message}`); }
   res.redirect('/');
 });
-app.post('/servers/:id/restart', requireLogin, checkCsrf, async (req, res) => { const s = ownedServer(req, req.params.id); if (!s) return res.status(404).send('Nicht gefunden'); upsertServer({ id: s.id, enabled: true, restartNonce: Date.now() }); rebalanceAssignments(); flash(req,'ok',l(req,'Bot wird gestartet bzw. neu gestartet.','Bot is being started or restarted.')); const fromAdmin=currentUser(req)?.role==='admin' && String(req.get('referer')||'').includes('/admin'); res.redirect(fromAdmin?'/admin?tab=bots#bots':'/'); });
+app.post('/servers/:id/restart', requireLogin, checkCsrf, async (req, res) => {
+  const s = ownedServer(req, req.params.id);
+  if (!s) return res.status(404).send('Nicht gefunden');
+  const fromAdmin=currentUser(req)?.role==='admin' && String(req.get('referer')||'').includes('/admin');
+  try {
+    await validateBotToken(decryptSecret(s.botTokenEnc));
+    upsertServer({ id: s.id, enabled: true, restartNonce: Date.now() });
+    rebalanceAssignments();
+    const fresh = getServer(s.id);
+    if (!fresh?.assignedNodeId) flash(req,'err',l(req,'Bot wurde aktiviert, aber aktuell ist kein freier Status-Node verfügbar.','Bot was enabled, but no free status node is currently available.'));
+    else flash(req,'ok',l(req,'Bot wird jetzt gestartet bzw. neu gestartet.','Bot is now being started or restarted.'));
+  } catch (error) { flash(req,'err',error.message); }
+  res.redirect(fromAdmin?'/admin?tab=bots#bots':'/');
+});
 app.post('/servers/:id/delete', requireLogin, checkCsrf, async (req, res) => { const s = ownedServer(req, req.params.id); if (!s) return res.status(404).send('Nicht gefunden'); deleteServer(s.id); rebalanceAssignments(); flash(req,'ok','Status Bot gelöscht. Der Node stoppt ihn automatisch.'); res.redirect('/'); });
 
 app.get('/custom-bots', requireLogin, async (req, res) => {
@@ -612,7 +630,7 @@ function adminShell(req, active, content) {
 function adminNodesContent(req) {
   rebalanceAssignments();
   const lang=langOf(req),db=readDb(),nodes=listStatusNodes();
-  const rows=nodes.map((n)=>{const healthy=nodeIsHealthy(n),assigned=db.servers.filter((s)=>s.assignedNodeId===n.id).length,m=n.metrics||{},mode=n.disabled?tr(lang,'Deaktiviert','Disabled'):n.acceptNewBots===false?tr(lang,'Keine neuen Bots','No new bots'):tr(lang,'Nimmt Bots an','Accepting bots');return `<tr><td><strong>${esc(n.name||n.id)}</strong><div class="muted small">${esc(n.id)} · ${esc(n.hostname||'')}</div></td><td><span class="badge ${healthy?'online':'error'}">${healthy?'online':'offline'}</span><div class="muted small">${esc(mode)}</div></td><td>${assigned}/${esc(n.capacity||0)}</td><td>${esc(m.rssMb??'—')} MB RSS<div class="muted small">${tr(lang,'frei','free')} ${esc(m.freeMemMb??'—')} MB / ${esc(m.totalMemMb??'—')} MB</div></td><td><form method="post" action="/nodes/${esc(n.id)}" class="nodeform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input name="name" maxlength="100" value="${esc(n.name||'')}"><input name="capacity" type="number" min="1" max="1000" value="${esc(n.capacity||50)}"><label class="check"><input type="checkbox" name="acceptNewBots" value="1" ${n.acceptNewBots!==false?'checked':''}> ${tr(lang,'Neue Bots','New bots')}</label><label class="check"><input type="checkbox" name="disabled" value="1" ${n.disabled?'checked':''}> ${tr(lang,'Deaktiviert','Disabled')}</label><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form><div class="actions wrap"><a class="button ghost smallbtn" href="/nodes/${esc(n.id)}/details">${tr(lang,'Bots verwalten','Manage bots')}</a><form method="post" action="/nodes/${esc(n.id)}/drain"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Drain</button></form></div></td></tr>`}).join('');
+  const rows=nodes.map((n)=>{const healthy=nodeIsHealthy(n),assigned=db.servers.filter((s)=>s.assignedNodeId===n.id).length,m=n.metrics||{},mode=n.disabled?tr(lang,'Deaktiviert','Disabled'):n.acceptNewBots===false?tr(lang,'Keine neuen Bots','No new bots'):tr(lang,'Nimmt Bots an','Accepting bots');return `<tr><td><strong>${esc(n.name||n.id)}</strong><div class="muted small">${esc(n.id)} · ${esc(n.hostname||'')}</div></td><td><span class="badge ${healthy?'online':'error'}">${healthy?'online':'offline'}</span><div class="muted small">${esc(mode)}</div></td><td>${assigned}/${esc(n.capacity||0)}</td><td>${esc(m.rssMb??'—')} MB RSS<div class="muted small">${tr(lang,'frei','free')} ${esc(m.freeMemMb??'—')} MB / ${esc(m.totalMemMb??'—')} MB</div></td><td><form method="post" action="/nodes/${esc(n.id)}" class="nodeform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input name="name" maxlength="100" value="${esc(n.name||'')}"><input name="capacity" type="number" min="1" max="1000" value="${esc(n.capacity||50)}"><label class="check"><input type="checkbox" name="acceptNewBots" value="1" ${n.acceptNewBots!==false?'checked':''}> ${tr(lang,'Neue Bots','New bots')}</label><label class="check"><input type="checkbox" name="disabled" value="1" ${n.disabled?'checked':''}> ${tr(lang,'Deaktiviert','Disabled')}</label><button class="button ghost smallbtn">${tr(lang,'Speichern','Save')}</button></form><div class="actions wrap"><a class="button ghost smallbtn" href="/nodes/${esc(n.id)}/details">${tr(lang,'Bots verwalten','Manage bots')}</a><form method="post" action="/nodes/${esc(n.id)}/restart-all" class="inline" onsubmit="return confirm('${tr(lang,'Alle aktiven Bots auf diesem Node neu starten?','Restart all active bots on this node?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary smallbtn">${tr(lang,'Alle Bots neu starten','Restart all bots')}</button></form><form method="post" action="/nodes/${esc(n.id)}/drain"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Drain</button></form></div></td></tr>`}).join('');
   const installer=String(process.env.NODE_INSTALL_SCRIPT_URL||'https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh');
   const deploy=`curl -fsSL ${installer} | bash -s -- ${baseUrl} ${process.env.STATUS_NODE_JOIN_SECRET} 50 "Worker VPS"`;
   return `<div class="pagehead"><div><h1>${tr(lang,'Node Manager','Node Manager')}</h1><p>${tr(lang,'Neue Bots sperren, Nodes drainen, Kapazitäten setzen und Bots verschieben.','Block new bots, drain nodes, set capacity and move bots.')}</p></div></div><div class="panel node-deploy"><h2>${tr(lang,'Neuen VPS hinzufügen','Add a new VPS')}</h2><pre class="logbox">${esc(deploy)}</pre></div><div class="panel tablewrap"><table><thead><tr><th>Node</th><th>Status</th><th>${tr(lang,'Belegung','Load')}</th><th>RAM</th><th>${tr(lang,'Verwaltung','Management')}</th></tr></thead><tbody>${rows||`<tr><td colspan="5">${tr(lang,'Keine Nodes','No nodes')}</td></tr>`}</tbody></table></div>`;
@@ -684,6 +702,15 @@ app.post('/nodes/:id', requireAdmin, checkCsrf, (req,res) => {
   rebalanceAssignments(); flash(req,'ok',l(req,'Node gespeichert.','Node saved.')); res.redirect('/admin?tab=nodes#nodes');
 });
 
+app.post('/nodes/:id/restart-all', requireAdmin, checkCsrf, (req,res) => {
+  try {
+    const result=restartAllBotsOnNode(req.params.id);
+    flash(req,'ok',l(req,`${result.restarted} aktive Bots werden neu gestartet.`,`${result.restarted} active bots are being restarted.`));
+  } catch(e){ flash(req,'err',e.message); }
+  const ref=String(req.get('referer')||'');
+  res.redirect(ref.includes('/details')?`/nodes/${encodeURIComponent(req.params.id)}/details`:'/admin?tab=nodes#nodes');
+});
+
 app.post('/nodes/:id/drain', requireAdmin, checkCsrf, (req,res) => {
   try { const result=drainStatusNode(req.params.id); flash(req,'ok',l(req,`Node wird gedraint. ${result.released} Bots wurden zur Neuverteilung freigegeben.`,`Node is draining. ${result.released} bots were released for redistribution.`)); }
   catch(e){flash(req,'err',e.message);} res.redirect('/admin?tab=nodes#nodes');
@@ -694,7 +721,7 @@ app.get('/nodes/:id/details', requireAdmin, (req,res) => {
   const assigned=db.servers.filter((s)=>s.assignedNodeId===node.id); const targets=db.statusNodes.filter((n)=>n.id!==node.id && nodeIsHealthy(n));
   const targetOptions=targets.map((n)=>`<option value="${esc(n.id)}">${esc(n.name||n.id)} · ${db.servers.filter((s)=>s.assignedNodeId===n.id).length}/${esc(n.capacity||0)}</option>`).join('');
   const rows=assigned.map((s)=>{const owner=db.users.find((u)=>u.discordId===s.ownerDiscordId);return `<tr><td><strong>${esc(s.name)}</strong><div class="muted small">${esc(owner?.globalName||owner?.username||s.ownerDiscordId||'')}</div></td><td>${esc(s.gameType==='gamedig'?(gameDigMeta(s.queryConfig?.gameId)?.name||s.queryConfig?.gameId):gameTypeLabel(s.gameType))}</td><td><form method="post" action="/servers/${esc(s.id)}/move-node" class="moveform"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><select name="targetNodeId" required><option value="">${tr(lang,'Ziel auswählen','Select target')}</option>${targetOptions}</select><button class="button ghost smallbtn">${tr(lang,'Verschieben','Move')}</button></form></td></tr>`;}).join('');
-  render(req,res,`${node.name||node.id} · ${tr(lang,'Bots','Bots')}`,`<div class="pagehead"><div><h1>${esc(node.name||node.id)}</h1><p>${assigned.length} ${tr(lang,'zugewiesene Status-Bots','assigned status bots')}</p></div><a class="button ghost" href="/nodes">${tr(lang,'Zurück','Back')}</a></div><div class="panel node-actions"><form method="post" action="/nodes/${esc(node.id)}/move-all" class="actions wrap"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><select name="targetNodeId" required><option value="">${tr(lang,'Alle Bots auf Node verschieben …','Move all bots to node …')}</option>${targetOptions}</select><button class="button primary">${tr(lang,'Alle verschieben','Move all')}</button></form></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Game</th><th>${tr(lang,'Aktion','Action')}</th></tr></thead><tbody>${rows||`<tr><td colspan="3">${tr(lang,'Keine Bots auf diesem Node.','No bots on this node.')}</td></tr>`}</tbody></table></div>`);
+  render(req,res,`${node.name||node.id} · ${tr(lang,'Bots','Bots')}`,`<div class="pagehead"><div><h1>${esc(node.name||node.id)}</h1><p>${assigned.length} ${tr(lang,'zugewiesene Status-Bots','assigned status bots')}</p></div><a class="button ghost" href="/nodes">${tr(lang,'Zurück','Back')}</a></div><div class="panel node-actions"><div class="actions wrap"><form method="post" action="/nodes/${esc(node.id)}/restart-all" class="inline" onsubmit="return confirm('${tr(lang,'Alle aktiven Bots auf diesem Node neu starten?','Restart all active bots on this node?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${tr(lang,'Alle Bots neu starten','Restart all bots')}</button></form></div><form method="post" action="/nodes/${esc(node.id)}/move-all" class="actions wrap"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><select name="targetNodeId" required><option value="">${tr(lang,'Alle Bots auf Node verschieben …','Move all bots to node …')}</option>${targetOptions}</select><button class="button primary">${tr(lang,'Alle verschieben','Move all')}</button></form></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Game</th><th>${tr(lang,'Aktion','Action')}</th></tr></thead><tbody>${rows||`<tr><td colspan="3">${tr(lang,'Keine Bots auf diesem Node.','No bots on this node.')}</td></tr>`}</tbody></table></div>`);
 });
 
 app.post('/servers/:id/move-node', requireAdmin, checkCsrf, (req,res)=>{
