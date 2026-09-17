@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import AdmZip from 'adm-zip';
 
 const ROOT = path.resolve('custom-bots');
-const MAX_FILES = 500;
+const MAX_FILES = 5000;
+const MAX_RAW_ENTRIES = 20000;
 const MAX_UNPACKED_BYTES = 100 * 1024 * 1024;
 
 function safeEntry(value, runtime) {
@@ -24,6 +25,12 @@ function cleanZipName(value) {
 function noiseEntry(name) {
   return name === '.DS_Store' || name.endsWith('/.DS_Store') || name === '__MACOSX' || name.startsWith('__MACOSX/');
 }
+
+function ignoredDependencyEntry(name) {
+  const parts = String(name || '').split('/').filter(Boolean);
+  return parts.some((part) => ['node_modules', '.git', '.venv', 'venv', '__pycache__'].includes(part));
+}
+
 
 function detectWrapper(fileNames) {
   if (!fileNames.length || fileNames.some((name) => !name.includes('/'))) return '';
@@ -67,9 +74,14 @@ export function prepareCustomBot({ id = crypto.randomUUID(), buffer, runtime, en
     let zip;
     try { zip = new AdmZip(buffer); } catch { throw new Error('ZIP-Datei ist ungültig'); }
     const rawEntries = zip.getEntries();
-    const entries = rawEntries.filter((item) => !noiseEntry(cleanZipName(item.entryName)));
+    if (rawEntries.length > MAX_RAW_ENTRIES) throw new Error(`ZIP enthält zu viele Einträge (maximal ${MAX_RAW_ENTRIES})`);
+    const entries = rawEntries.filter((item) => {
+      const name = cleanZipName(item.entryName);
+      return !noiseEntry(name) && !ignoredDependencyEntry(name);
+    });
     const files = entries.filter((item) => !item.isDirectory);
-    if (!files.length || files.length > MAX_FILES) throw new Error(`ZIP muss 1 bis ${MAX_FILES} Dateien enthalten`);
+    if (!files.length) throw new Error('ZIP enthält keine verwendbaren Quelldateien');
+    if (files.length > MAX_FILES) throw new Error(`ZIP enthält zu viele Quelldateien (maximal ${MAX_FILES}). node_modules, .git, venv und Cache-Ordner werden automatisch ignoriert.`);
 
     const originalFileNames = files.map((item) => cleanZipName(item.entryName));
     const wrapper = detectWrapper(originalFileNames);
