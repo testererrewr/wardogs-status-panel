@@ -6,8 +6,7 @@ command -v docker >/dev/null && echo "[OK] Docker" || echo "[FEHLER] Docker fehl
 if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "[FEHLER] Compose fehlt"; exit 1; fi
 [[ -f .env ]] && echo "[OK] .env" || echo "[FEHLER] .env fehlt"
 if [[ -f .env ]]; then
-  grep -E '^(PUBLIC_URL|PANEL_BIND|COMPOSE_PROFILES|ALLOW_PUBLIC_REGISTRATION|SERVICE_DOMAIN|LOCAL_STATUS_NODE_MAX_BOTS|STATUS_NODE_MIN_FREE_MB|PAYPAL_MODE)=' .env || true
-  [[ -n "$(sed -n 's/^PAYPAL_CLIENT_ID=//p' .env)" && -n "$(sed -n 's/^PAYPAL_CLIENT_SECRET=//p' .env)" ]] && echo '[OK] PayPal API credentials present' || echo '[INFO] PayPal API credentials not configured'
+  grep -E '^(PUBLIC_URL|PANEL_BIND|COMPOSE_PROFILES|ALLOW_PUBLIC_REGISTRATION|SERVICE_DOMAIN|LOCAL_STATUS_NODE_MAX_BOTS|STATUS_NODE_MIN_FREE_MB)=' .env || true
 fi
 for d in data custom-bots; do
   mkdir -p "$d"

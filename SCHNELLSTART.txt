@@ -1,4 +1,4 @@
-SERVER STATUS HUB v3.8
+SERVER STATUS HUB v3.9.3
 
 UPDATE VPS:
 cd /opt/wardogs-status-panel
@@ -6,12 +6,15 @@ git config core.fileMode false
 git pull --ff-only
 bash ./update.sh
 
-ADMIN:
-Node Manager = Nodes sperren/drainen/Bots verschieben
-Einstellungen = status-hub.lol, Donations, Free-Boost, Supporter
-Benutzer = Premium + Laufzeit + Custom Bot Freigaben
+PAYPAL:
+Admin -> Settings -> Premium & PayPal
+Sandbox/Live + Client ID + Client Secret directly in the panel.
+No PayPal SSH/.env setup required.
 
-FREE:
-1 Bot standardmäßig
-bis 5 Bots mit Branding-Channel ganz oben
-alle Free Bots zeigen Powered by status-hub.lol
+FREE BOOST:
+Top Discord category must be named exactly:
+Powered by status-hub.lol
+Member thresholds are configured in Admin -> Settings.
+
+ADMIN:
+Other users' bots are visible only under Admin -> All bots.

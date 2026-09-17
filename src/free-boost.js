@@ -1,23 +1,21 @@
 import { decryptSecret } from './crypto.js';
 import { readDb, updateDb, upsertUser, getSiteSettings } from './db.js';
 
-function normalizeChannelName(value) {
-  return String(value || '').trim().toLowerCase().replace(/[\s_.]+/g, '-').replace(/-+/g, '-');
+function normalizeName(value) { return String(value || '').trim(); }
+
+function topBrandCategory(channels, expected) {
+  const categories = channels
+    .filter((c) => c && Number(c.type) === 4 && c.parent_id == null)
+    .sort((a, b) => Number(a.position || 0) - Number(b.position || 0) || String(a.id).localeCompare(String(b.id)));
+  if (!categories.length) return null;
+  return normalizeName(categories[0].name) === normalizeName(expected) ? categories[0] : null;
 }
 
-function activeTopChannel(channels, expected) {
-  const root = channels.filter((c) => c && c.parent_id == null && ![10,11,12].includes(Number(c.type))).sort((a,b) => Number(a.position || 0) - Number(b.position || 0) || String(a.id).localeCompare(String(b.id)));
-  if (!root.length) return null;
-  const firstPosition = Number(root[0].position || 0);
-  return root.find((c) => [0,5].includes(Number(c.type)) && Number(c.position || 0) === firstPosition && normalizeChannelName(c.name) === expected) || null;
-}
-
-
-function channelVisibleToEveryone(guildId, channel, roles) {
+function categoryVisibleToEveryone(guildId, category, roles) {
   const everyone = roles.find((r) => r.id === guildId);
   if (!everyone) return false;
   let permissions = BigInt(everyone.permissions || '0');
-  const overwrite = Array.isArray(channel.permission_overwrites) ? channel.permission_overwrites.find((x) => x.id === guildId && Number(x.type) === 0) : null;
+  const overwrite = Array.isArray(category.permission_overwrites) ? category.permission_overwrites.find((x) => x.id === guildId && Number(x.type) === 0) : null;
   if (overwrite) permissions = (permissions & ~BigInt(overwrite.deny || '0')) | BigInt(overwrite.allow || '0');
   return (permissions & 8n) === 8n || (permissions & 1024n) === 1024n;
 }
@@ -27,7 +25,6 @@ async function discordBotApi(token, path) {
   if (!response.ok) throw new Error(`Discord API ${response.status}`);
   return response.json();
 }
-
 
 export function freeBoostRanges(settings = getSiteSettings()) {
   const tiers = (Array.isArray(settings?.freeBoost?.tiers) ? settings.freeBoost.tiers : [])
@@ -82,7 +79,7 @@ export async function verifyFreeBoostForUser(discordId) {
   const settings = db.siteSettings || getSiteSettings();
   const user = db.users.find((u) => u.discordId === discordId);
   if (!user) throw new Error('User not found');
-  const expected = normalizeChannelName(settings?.freeBoost?.channelName || 'Powered by status-hub.lol');
+  const expected = String(settings?.freeBoost?.categoryName || settings?.freeBoost?.channelName || 'Powered by status-hub.lol').trim();
   const servers = db.servers.filter((s) => s.ownerDiscordId === discordId && s.botTokenEnc);
   const seenTokens = new Set();
   let scanned = 0;
@@ -100,10 +97,10 @@ export async function verifyFreeBoostForUser(discordId) {
       for (const guild of guilds) {
         try {
           const channels = await discordBotApi(token, `/guilds/${guild.id}/channels`);
-          const brandChannel = activeTopChannel(channels, expected);
-          if (!brandChannel) continue;
+          const brandCategory = topBrandCategory(channels, expected);
+          if (!brandCategory) continue;
           const roles = await discordBotApi(token, `/guilds/${guild.id}/roles`);
-          if (!channelVisibleToEveryone(guild.id, brandChannel, roles)) continue;
+          if (!categoryVisibleToEveryone(guild.id, brandCategory, roles)) continue;
           let memberCount = Number(guild.approximate_member_count || 0);
           if (!memberCount) {
             const detail = await discordBotApi(token, `/guilds/${guild.id}?with_counts=true`);
@@ -111,7 +108,7 @@ export async function verifyFreeBoostForUser(discordId) {
           }
           const freeBotLimit = freeBoostLimitForMembers(memberCount, settings);
           if (!best || freeBotLimit > best.freeBotLimit || (freeBotLimit === best.freeBotLimit && memberCount > best.memberCount)) {
-            best = { state: 'verified', guildId: guild.id, guildName: guild.name || guild.id, memberCount, freeBotLimit, sourceServerId: server.id, channelName: brandChannel.name };
+            best = { state: 'verified', guildId: guild.id, guildName: guild.name || guild.id, memberCount, freeBotLimit, sourceServerId: server.id, categoryName: brandCategory.name };
           }
         } catch (error) { firstError ||= error; }
       }
@@ -121,7 +118,9 @@ export async function verifyFreeBoostForUser(discordId) {
   if (!scanned && firstError) throw firstError;
   const now = Date.now();
   const verifyHours = Math.max(1, Math.min(48, Number(settings?.freeBoost?.verifyHours || 6)));
-  const result = best ? { ...best, checkedAt: new Date(now).toISOString(), validUntil: new Date(now + verifyHours * 2 * 3600_000).toISOString() } : { state: servers.length ? 'missing-brand' : 'no-bot', guildId: null, guildName: '', memberCount: 0, freeBotLimit: 1, sourceServerId: null, channelName: '', checkedAt: new Date(now).toISOString(), validUntil: null };
+  const result = best
+    ? { ...best, checkedAt: new Date(now).toISOString(), validUntil: new Date(now + verifyHours * 2 * 3600_000).toISOString() }
+    : { state: servers.length ? 'missing-brand' : 'no-bot', guildId: null, guildName: '', memberCount: 0, freeBotLimit: 1, sourceServerId: null, categoryName: '', checkedAt: new Date(now).toISOString(), validUntil: null };
   upsertUser({ discordId, freeBoost: result });
   return result;
 }

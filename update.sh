@@ -30,9 +30,6 @@ if ! grep -q '^DONATE_PAYPAL_URL=' .env; then echo 'DONATE_PAYPAL_URL=' >> .env;
 if ! grep -q '^DONATE_KOFI_URL=' .env; then echo 'DONATE_KOFI_URL=' >> .env; fi
 if ! grep -q '^DONATE_STRIPE_URL=' .env; then echo 'DONATE_STRIPE_URL=' >> .env; fi
 if ! grep -q '^NODE_INSTALL_SCRIPT_URL=' .env; then echo 'NODE_INSTALL_SCRIPT_URL=https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh' >> .env; fi
-if ! grep -q '^PAYPAL_MODE=' .env; then echo 'PAYPAL_MODE=sandbox' >> .env; fi
-if ! grep -q '^PAYPAL_CLIENT_ID=' .env; then echo 'PAYPAL_CLIENT_ID=' >> .env; fi
-if ! grep -q '^PAYPAL_CLIENT_SECRET=' .env; then echo 'PAYPAL_CLIENT_SECRET=' >> .env; fi
 mkdir -p data custom-bots
 chown -R 1000:1000 data custom-bots
 chmod 750 data custom-bots

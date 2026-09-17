@@ -1,6 +1,6 @@
 {
   "name": "server-status-hub",
-  "version": "3.9.0",
+  "version": "3.9.3",
   "private": true,
   "description": "Multi-user Discord status bot hosting platform with automatic PayPal premium checkout, configurable free branding boosts, managed bot services, donations, bilingual UI, node manager, multi-VPS status nodes, GameDig, WARDOGS, FiveM, approved custom bots and text-only rotating status bots.",
   "type": "module",

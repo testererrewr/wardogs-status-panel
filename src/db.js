@@ -30,6 +30,11 @@ function defaultSettings() {
         premium15: '€12.99 / 30 days',
         premium20: '€16.99 / 30 days'
       },
+      paypalApi: {
+        mode: String(process.env.PAYPAL_MODE || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox',
+        clientId: String(process.env.PAYPAL_CLIENT_ID || ''),
+        clientSecretEnc: ''
+      },
       paypalAuto: {
         enabled: false,
         currency: 'EUR',
@@ -44,7 +49,7 @@ function defaultSettings() {
       }
     },
     freeBoost: {
-      channelName: 'Powered by status-hub.lol',
+      categoryName: 'Powered by status-hub.lol',
       verifyHours: 6,
       tiers: [
         { members: 50, limit: 2 },
@@ -77,7 +82,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 10, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 11, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -85,15 +90,15 @@ function mergeSettings(input = {}) {
     ...base,
     ...input,
     donationLinks: { ...base.donationLinks, ...(input.donationLinks || {}) },
-    premiumSales: { ...base.premiumSales, ...(input.premiumSales || {}), prices: { ...base.premiumSales.prices, ...(input.premiumSales?.prices || {}) }, paypalAuto: { ...base.premiumSales.paypalAuto, ...(input.premiumSales?.paypalAuto || {}), amounts: { ...base.premiumSales.paypalAuto.amounts, ...(input.premiumSales?.paypalAuto?.amounts || {}) } } },
-    freeBoost: { ...base.freeBoost, ...(input.freeBoost || {}), tiers: Array.isArray(input.freeBoost?.tiers) && input.freeBoost.tiers.length ? input.freeBoost.tiers : base.freeBoost.tiers },
+    premiumSales: { ...base.premiumSales, ...(input.premiumSales || {}), prices: { ...base.premiumSales.prices, ...(input.premiumSales?.prices || {}) }, paypalApi: { ...base.premiumSales.paypalApi, ...(input.premiumSales?.paypalApi || {}) }, paypalAuto: { ...base.premiumSales.paypalAuto, ...(input.premiumSales?.paypalAuto || {}), amounts: { ...base.premiumSales.paypalAuto.amounts, ...(input.premiumSales?.paypalAuto?.amounts || {}) } } },
+    freeBoost: { ...base.freeBoost, ...(input.freeBoost || {}), categoryName: String(input.freeBoost?.categoryName || input.freeBoost?.channelName || base.freeBoost.categoryName), tiers: Array.isArray(input.freeBoost?.tiers) && input.freeBoost.tiers.length ? input.freeBoost.tiers : base.freeBoost.tiers },
     teamDiscordIds: Array.isArray(input.teamDiscordIds) ? input.teamDiscordIds.filter((x) => /^\d{17,20}$/.test(String(x))) : base.teamDiscordIds
   };
 }
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 10;
+  parsed.version = 11;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -209,7 +214,7 @@ export function upsertStatusNode(node) {
 export function deleteStatusNode(id) { updateDb((db) => { db.statusNodes = (db.statusNodes || []).filter((n) => n.id !== id); for (const s of db.servers) if (s.assignedNodeId === id) s.assignedNodeId = null; }); }
 
 export function getSiteSettings() { return readDb().siteSettings; }
-export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, premiumSales: { ...(db.siteSettings?.premiumSales || {}), ...(patch.premiumSales || {}), prices: { ...(db.siteSettings?.premiumSales?.prices || {}), ...(patch.premiumSales?.prices || {}) }, paypalAuto: { ...(db.siteSettings?.premiumSales?.paypalAuto || {}), ...(patch.premiumSales?.paypalAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.paypalAuto?.amounts || {}), ...(patch.premiumSales?.paypalAuto?.amounts || {}) } } }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }
+export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, premiumSales: { ...(db.siteSettings?.premiumSales || {}), ...(patch.premiumSales || {}), prices: { ...(db.siteSettings?.premiumSales?.prices || {}), ...(patch.premiumSales?.prices || {}) }, paypalApi: { ...(db.siteSettings?.premiumSales?.paypalApi || {}), ...(patch.premiumSales?.paypalApi || {}) }, paypalAuto: { ...(db.siteSettings?.premiumSales?.paypalAuto || {}), ...(patch.premiumSales?.paypalAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.paypalAuto?.amounts || {}), ...(patch.premiumSales?.paypalAuto?.amounts || {}) } } }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }
 
 export function listSupporters(visibleOnly = false) { const rows = readDb().supporters || []; return rows.filter((x) => !visibleOnly || x.visible !== false).sort((a,b) => Number(Boolean(b.featured)) - Number(Boolean(a.featured)) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
 export function upsertSupporter(supporter) {
