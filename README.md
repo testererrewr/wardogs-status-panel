@@ -1,12 +1,22 @@
-# status-hub.lol v3.12.2
+# status-hub.lol v3.12.4
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
 
 
-## v3.12.2
 
-- WARDOGS player Steam64 IDs are fetched automatically from the live player list; all online players are screened at managed-bot startup and joins/reconnects are checked automatically afterward.
+## v3.12.4
+
+- Managed-bot lifecycle operations are serialized per bot so concurrent sync/restart/stop requests cannot create duplicate Discord clients.
+- Stop persists `enabled=false` before disconnecting, preventing a stale background sync from immediately bringing the bot back online.
+- Stopped WARDOGS managed bots now show an explicit **Start** button in both the user management page and admin bot controls.
+- Detection uses a session-aware join tracker: the startup snapshot is baseline-only and each Steam64ID is screened once per confirmed join session.
+- A player must be absent from three consecutive successful player snapshots before a later appearance counts as a new join, protecting against temporary empty/incomplete `/v1/players` responses.
+- Overlapping polling cycles are blocked so slow Steam/RCON requests cannot run duplicate detection passes.
+
+## v3.12.3
+
+- WARDOGS player Steam64 IDs are fetched automatically from the live player list; join/reconnect detection uses those IDs without manual player-ID input.
 - Steam ban/account lookups are batched and WARDOGS playtime uses the fixed Steam App ID `1867240`; users no longer configure an App ID.
 - The WARDOGS Discord management panel, modals and action feedback are English.
 - Detection alerts include an **Ignore** button. Ignored players produce no further detection alerts or auto-bans until removed from the web panel's Detection Ignore List.

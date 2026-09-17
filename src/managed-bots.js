@@ -25,6 +25,17 @@ export const MANAGED_DISCORD_PERMISSION_KEYS = Object.freeze([
 const instances = new Map();
 const runtime = new Map();
 const discordUiState = new Map();
+const lifecycleLocks = new Map();
+
+function withLifecycleLock(id, task) {
+  const key = String(id || '');
+  const previous = lifecycleLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  lifecycleLocks.set(key, current);
+  return current.finally(() => {
+    if (lifecycleLocks.get(key) === current) lifecycleLocks.delete(key);
+  });
+}
 
 function nowIso() { return new Date().toISOString(); }
 function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, ''); }
@@ -49,6 +60,48 @@ function playerSteamId(player) {
     if (normalized) return normalized;
   }
   return '';
+}
+
+export function createManagedJoinTracker() {
+  return { initialized: false, active: new Set(), missing: new Map() };
+}
+
+// Polling APIs can briefly return incomplete/empty player lists. A player is only
+// considered to have left after several consecutive successful snapshots miss them.
+// That prevents the same live session from being screened and alerted repeatedly.
+export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
+  const state = tracker || createManagedJoinTracker();
+  if (!(state.active instanceof Set)) state.active = new Set();
+  if (!(state.missing instanceof Map)) state.missing = new Map();
+  const rows = Array.isArray(players) ? players : [];
+  const current = new Set(rows.map(playerSteamId).filter(Boolean));
+  if (!state.initialized) {
+    state.initialized = true;
+    state.active = new Set(current);
+    state.missing.clear();
+    return [];
+  }
+
+  const candidates = [];
+  for (const player of rows) {
+    const id = playerSteamId(player);
+    if (!id) continue;
+    if (!state.active.has(id)) candidates.push(player);
+    // Mark the join immediately, before any Steam/Discord network work starts.
+    state.active.add(id);
+    state.missing.delete(id);
+  }
+
+  const threshold = Math.max(2, Math.min(10, Number(missingThreshold) || 3));
+  for (const id of [...state.active]) {
+    if (current.has(id)) continue;
+    const misses = Number(state.missing.get(id) || 0) + 1;
+    if (misses >= threshold) {
+      state.active.delete(id);
+      state.missing.delete(id);
+    } else state.missing.set(id, misses);
+  }
+  return candidates;
 }
 function validSteamId(value) { return Boolean(normalizeSteamId64(value)); }
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
@@ -413,22 +466,31 @@ function scheduleControlPanelBottom(botId, client, state) {
 }
 
 async function pollPlayers(bot, state, client) {
+  // Never allow overlapping poll cycles. Slow Steam/RCON requests must not create
+  // a second concurrent detection pass for the same join.
+  if (state.pollInFlight) return;
+  state.pollInFlight = true;
   try {
     const data = await wardogsRequest(bot, '/v1/players');
     const players = Array.isArray(data?.players) ? data.players : [];
-    const current = new Set(players.map(playerSteamId).filter(Boolean));
     const rules = parseManagedRules(bot.rulesText || '');
     const ignored = ignoredSteamIds(bot);
-    const candidates = state.initialized
-      ? players.filter((player) => { const id = playerSteamId(player); return id && !state.seen.has(id) && !ignored.has(id); })
-      : players.filter((player) => { const id = playerSteamId(player); return id && !ignored.has(id); });
 
-    if (!state.initialized) {
-      state.initialized = true;
+    // The first successful snapshot after start/restart is baseline only. Afterwards
+    // a SteamID is screened once when it transitions into a new confirmed session.
+    // Three consecutive successful snapshots must miss a player before a later return
+    // is treated as another join. This absorbs temporary empty/incomplete API results.
+    const candidates = managedJoinCandidates(state.joinTracker, players, 3)
+      .filter((player) => {
+        const id = playerSteamId(player);
+        return id && !ignored.has(id);
+      });
+
+    if (!state.baselineReady && state.joinTracker?.initialized) {
+      state.baselineReady = true;
       state.lastAnnouncementAt = Date.now();
       state.announcementIndex = 0;
     }
-    state.seen = current;
 
     let riskProfiles = new Map();
     if (candidates.length && managedRulesNeedSteam(rules)) {
@@ -436,8 +498,9 @@ async function pollPlayers(bot, state, client) {
         riskProfiles = await getSteamRiskProfiles(bot, candidates.map(playerSteamId), rules);
         setRuntime(bot.id, { lastSteamError: null, lastSteamCheck: nowIso() });
       } catch (error) {
-        for (const player of candidates) state.seen.delete(playerSteamId(player));
         setRuntime(bot.id, { lastSteamError: error.message, lastSteamCheck: nowIso() });
+        // This join has already been consumed by the tracker. A temporary Steam error
+        // must not retry/spam the same player every poll.
         riskProfiles = null;
       }
     }
@@ -483,6 +546,8 @@ async function pollPlayers(bot, state, client) {
     setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null });
   } catch (error) {
     setRuntime(bot.id, { state: 'error', lastCheck: nowIso(), lastError: error.message });
+  } finally {
+    state.pollInFlight = false;
   }
 }
 
@@ -895,14 +960,16 @@ async function handleInteraction(interaction, client, state) {
 
 async function stopOne(id, keepRuntime = true) {
   const active = instances.get(id);
+  // Remove it from the registry first so no status path can treat it as live while
+  // Discord is being disconnected.
+  if (active) instances.delete(id);
   if (active) {
     clearInterval(active.timer);
     clearTimeout(active.state?.panelRepostTimer);
     try { await deleteStoredControlPanel(getManagedBot(id) || { id }, active.client, active.state); } catch {}
-    try { active.client.destroy(); } catch {}
-    instances.delete(id);
+    try { await active.client.destroy(); } catch {}
   }
-  if (keepRuntime) setRuntime(id, { state: 'stopped', botTag: null, players: null, controlPanelMessageId: null });
+  if (keepRuntime) setRuntime(id, { state: 'stopped', botTag: null, players: null, controlPanelMessageId: null, lastError: null });
   else runtime.delete(id);
 }
 
@@ -915,40 +982,82 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { initialized: false, seen: new Set(), panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
-  client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
-  client.on('messageCreate', (message) => {
-    const fresh = getManagedBot(bot.id);
-    if (!fresh?.controlPanelEnabled || !fresh?.enabled || String(message.channelId || '') !== String(fresh.controlPanelChannelId || '')) return;
-    if (state.panelPosting || String(message.id || '') === String(state.panelMessageId || '')) return;
-    scheduleControlPanelBottom(bot.id, client, state);
-  });
-  client.on('error', (error) => setRuntime(bot.id, { lastError: error.message }));
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Discord login timeout')), 20000);
-    client.once('clientReady', () => { clearTimeout(timeout); resolve(); });
-    client.login(token).catch((error) => { clearTimeout(timeout); reject(error); });
-  });
-  if (!bot.controlPanelEnabled && (bot.controlPanelMessageId || bot.controlPanelMessageChannelId)) await deleteStoredControlPanel(bot, client, state);
-  setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
-  await pollPlayers(bot, state, client);
-  const timer = setInterval(() => pollPlayers(getManagedBot(bot.id) || bot, state, client), Math.max(10, Math.min(300, Number(bot.pollSeconds) || 20)) * 1000);
-  timer.unref?.();
-  instances.set(bot.id, { client, timer, signature: signature(bot), state });
-}
-
-export async function syncManagedBots(bots) {
-  const wanted = new Set((bots || []).filter((b) => b.enabled && accessActive(b)).map((b) => b.id));
-  for (const id of [...instances.keys()]) if (!wanted.has(id)) await stopOne(id);
-  for (const bot of bots || []) {
-    if (!bot.enabled || !accessActive(bot)) { if (!instances.has(bot.id)) setRuntime(bot.id, { state: bot.enabled && !accessActive(bot) ? 'access-expired' : 'stopped' }); continue; }
-    const existing = instances.get(bot.id);
-    const sig = signature(bot);
-    if (existing?.signature === sig) continue;
-    try { await startOne(bot); } catch (error) { await stopOne(bot.id, false); setRuntime(bot.id, { state: 'error', lastError: error.message, lastCheck: nowIso() }); }
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  try {
+    client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
+    client.on('messageCreate', (message) => {
+      const fresh = getManagedBot(bot.id);
+      if (!fresh?.controlPanelEnabled || !fresh?.enabled || String(message.channelId || '') !== String(fresh.controlPanelChannelId || '')) return;
+      if (state.panelPosting || String(message.id || '') === String(state.panelMessageId || '')) return;
+      scheduleControlPanelBottom(bot.id, client, state);
+    });
+    client.on('error', (error) => setRuntime(bot.id, { lastError: error.message }));
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Discord login timeout')), 20000);
+      client.once('clientReady', () => { clearTimeout(timeout); resolve(); });
+      client.login(token).catch((error) => { clearTimeout(timeout); reject(error); });
+    });
+    // A stop may have been requested while Discord was logging in. Do not publish a
+    // live instance if the database has already been disabled.
+    const freshBeforeRun = getManagedBot(bot.id) || bot;
+    if (!freshBeforeRun.enabled || !accessActive(freshBeforeRun)) {
+      try { await client.destroy(); } catch {}
+      setRuntime(bot.id, { state: accessActive(freshBeforeRun) ? 'stopped' : 'access-expired' });
+      return;
+    }
+    if (!freshBeforeRun.controlPanelEnabled && (freshBeforeRun.controlPanelMessageId || freshBeforeRun.controlPanelMessageChannelId)) await deleteStoredControlPanel(freshBeforeRun, client, state);
+    setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
+    await pollPlayers(freshBeforeRun, state, client);
+    const timer = setInterval(() => {
+      const fresh = getManagedBot(bot.id);
+      if (!fresh?.enabled || !accessActive(fresh)) return;
+      pollPlayers(fresh, state, client).catch(() => {});
+    }, Math.max(10, Math.min(300, Number(freshBeforeRun.pollSeconds) || 20)) * 1000);
+    timer.unref?.();
+    instances.set(bot.id, { client, timer, signature: signature(freshBeforeRun), state });
+  } catch (error) {
+    try { await client.destroy(); } catch {}
+    throw error;
   }
 }
 
-export async function stopManagedBot(id) { await stopOne(id); }
-export async function restartManagedBot(bot) { await startOne(bot); return managedBotRuntime(bot.id); }
-export async function shutdownManagedBots() { for (const id of [...instances.keys()]) await stopOne(id, false); }
+export async function syncManagedBots(bots) {
+  const snapshots = new Map((bots || []).map((bot) => [bot.id, bot]));
+  const ids = new Set([...instances.keys(), ...snapshots.keys()]);
+  for (const id of ids) {
+    await withLifecycleLock(id, async () => {
+      // Re-read inside the lock. This prevents an old sync snapshot from resurrecting
+      // a bot that the user stopped a moment earlier.
+      const fresh = getManagedBot(id) || snapshots.get(id);
+      if (!fresh || !fresh.enabled || !accessActive(fresh)) {
+        if (instances.has(id)) await stopOne(id);
+        setRuntime(id, { state: fresh?.enabled && !accessActive(fresh) ? 'access-expired' : 'stopped', botTag: null, players: null });
+        return;
+      }
+      const existing = instances.get(id);
+      const sig = signature(fresh);
+      if (existing?.signature === sig) return;
+      try { await startOne(fresh); }
+      catch (error) { await stopOne(id, false); setRuntime(id, { state: 'error', lastError: error.message, lastCheck: nowIso() }); }
+    });
+  }
+}
+
+export async function stopManagedBot(id) {
+  return withLifecycleLock(id, () => stopOne(id));
+}
+export async function restartManagedBot(bot) {
+  return withLifecycleLock(bot.id, async () => {
+    const fresh = getManagedBot(bot.id) || bot;
+    try {
+      await startOne(fresh);
+      return managedBotRuntime(bot.id);
+    } catch (error) {
+      await stopOne(bot.id, false);
+      setRuntime(bot.id, { state: 'error', lastError: error.message, lastCheck: nowIso() });
+      throw error;
+    }
+  });
+}
+
+export async function shutdownManagedBots() { for (const id of [...instances.keys()]) await withLifecycleLock(id, () => stopOne(id, false)); }
