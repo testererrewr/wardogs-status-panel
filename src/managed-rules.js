@@ -22,57 +22,57 @@ export function parseManagedRules(text) {
 
     if ((match = expr.match(/^vac(?:_bans?)?\s*>=\s*(\d{1,3})$/i))) {
       const value = Math.max(1, Math.min(100, Number(match[1])));
-      rules.push({ type: 'vac_bans', op: '>=', value, reason: reason || `VAC-Bans: mindestens ${value}` });
+      rules.push({ type: 'vac_bans', op: '>=', value, reason: reason || `VAC bans: at least ${value}` });
       continue;
     }
     if ((match = expr.match(/^game(?:_?bans?)?\s*>=\s*(\d{1,3})$/i))) {
       const value = Math.max(1, Math.min(100, Number(match[1])));
-      rules.push({ type: 'game_bans', op: '>=', value, reason: reason || `Game-Bans: mindestens ${value}` });
+      rules.push({ type: 'game_bans', op: '>=', value, reason: reason || `Game bans: at least ${value}` });
       continue;
     }
     if ((match = expr.match(/^playtime\s*<\s*(\d{1,6}(?:\.\d{1,2})?)$/i))) {
       const value = Math.max(0.1, Math.min(100000, Number(match[1])));
-      rules.push({ type: 'playtime', op: '<', value, reason: reason || `Spielzeit unter ${value} Stunden` });
+      rules.push({ type: 'playtime', op: '<', value, reason: reason || `Playtime below ${value} hours` });
       continue;
     }
     if ((match = expr.match(/^account(?:_?age)?\s*<\s*(\d{1,5})$/i))) {
       const value = Math.max(1, Math.min(36500, Number(match[1])));
-      rules.push({ type: 'account_age', op: '<', value, reason: reason || `Steam-Konto jünger als ${value} Tage` });
+      rules.push({ type: 'account_age', op: '<', value, reason: reason || `Steam account younger than ${value} days` });
       continue;
     }
     if ((match = expr.match(/^recent(?:_?ban)?\s*<=?\s*(\d{1,5})$/i))) {
       const value = Math.max(0, Math.min(36500, Number(match[1])));
-      rules.push({ type: 'recent_ban', op: '<=', value, reason: reason || `Steam-Ban innerhalb der letzten ${value} Tage` });
+      rules.push({ type: 'recent_ban', op: '<=', value, reason: reason || `Steam ban within the last ${value} days` });
       continue;
     }
     if (/^community(?:_?ban)?\s*=\s*(?:1|true|yes|on)$/i.test(expr)) {
-      rules.push({ type: 'community_ban', op: '=', value: true, reason: reason || 'Steam Community-Ban aktiv' });
+      rules.push({ type: 'community_ban', op: '=', value: true, reason: reason || 'Steam Community ban active' });
       continue;
     }
     if (/^economy(?:_?ban)?\s*=\s*(?:1|true|yes|on)$/i.test(expr)) {
-      rules.push({ type: 'economy_ban', op: '=', value: true, reason: reason || 'Steam Economy-Ban aktiv' });
+      rules.push({ type: 'economy_ban', op: '=', value: true, reason: reason || 'Steam Economy ban active' });
       continue;
     }
     if (/^private(?:_?profile)?\s*=\s*(?:1|true|yes|on)$/i.test(expr)) {
-      rules.push({ type: 'private_profile', op: '=', value: true, reason: reason || 'Steam-Profil ist nicht öffentlich' });
+      rules.push({ type: 'private_profile', op: '=', value: true, reason: reason || 'Steam profile is not public' });
       continue;
     }
 
     // Legacy rules remain readable so old installations do not break on update.
     if ((match = expr.match(/^steam\s*:\s*(\d{17})$/i))) {
-      rules.push({ type: 'steam', value: match[1], reason: reason || `SteamID ${match[1]} ist gesperrt`, legacy: true });
+      rules.push({ type: 'steam', value: match[1], reason: reason || `SteamID ${match[1]} is blocked`, legacy: true });
       continue;
     }
     if ((match = expr.match(/^name\s*:\s*(.+)$/i))) {
       const value = match[1].trim();
       if (!value || value.length > 80) throw new Error(`Regel ${i + 1}: Name-Text ist ungültig`);
-      rules.push({ type: 'name', value, reason: reason || `Spielername enthält „${value}“`, legacy: true });
+      rules.push({ type: 'name', value, reason: reason || `Player name contains "${value}"`, legacy: true });
       continue;
     }
     if ((match = expr.match(/^faction\s*:\s*(.+)$/i))) {
       const value = match[1].trim();
       if (!value || value.length > 80) throw new Error(`Regel ${i + 1}: Fraktion ist ungültig`);
-      rules.push({ type: 'faction', value, reason: reason || `Fraktion entspricht „${value}“`, legacy: true });
+      rules.push({ type: 'faction', value, reason: reason || `Faction equals "${value}"`, legacy: true });
       continue;
     }
     if ((match = expr.match(/^ping\s*(>=|>)\s*(\d{1,5})$/i))) {

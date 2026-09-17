@@ -32,7 +32,8 @@
     kill: lang === 'en' ? 'Kill / respawn' : 'Kill / Respawn',
     setteam: lang === 'en' ? 'Set team' : 'Team setzen',
     match: lang === 'en' ? 'Match control' : 'Match steuern',
-    map: lang === 'en' ? 'Change map' : 'Map wechseln', lighting: 'Lighting'
+    map: lang === 'en' ? 'Change map' : 'Map wechseln', lighting: 'Lighting',
+    ignore: lang === 'en' ? 'Ignore detection alerts' : 'Warnungen ignorieren'
   };
 
   function ruleOptions(selected = 'vac_bans') {

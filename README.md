@@ -1,7 +1,17 @@
-# status-hub.lol v3.12.1
+# status-hub.lol v3.12.2
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
+
+
+## v3.12.2
+
+- WARDOGS player Steam64 IDs are fetched automatically from the live player list; all online players are screened at managed-bot startup and joins/reconnects are checked automatically afterward.
+- Steam ban/account lookups are batched and WARDOGS playtime uses the fixed Steam App ID `1867240`; users no longer configure an App ID.
+- The WARDOGS Discord management panel, modals and action feedback are English.
+- Detection alerts include an **Ignore** button. Ignored players produce no further detection alerts or auto-bans until removed from the web panel's Detection Ignore List.
+- Discord role/user grants include a dedicated Ignore permission.
+- Database version 21 stores the ignore list while preserving existing managed-service and PayPal data.
 
 
 ## v3.12.1
