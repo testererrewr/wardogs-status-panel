@@ -1,4 +1,4 @@
-# status-hub.lol v3.10.0
+# status-hub.lol v3.11.3
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
@@ -155,3 +155,15 @@ Stripe can be configured completely in **Admin → Settings**. The panel support
 ## v3.11.1
 
 Sticky footer, clearer Free account expiry display and improved PayPal subscription setup status.
+
+
+## v3.11.2
+
+WARDOGS supports live faction scores from `/v1/status`. Available status tags: `{score}`, `{team1}`, `{score1}`, `{team2}`, `{score2}`. The WARDOGS form also has an optional automatic score rotation entry. Custom status texts are not changed.
+
+
+## v3.11.3
+
+- Premium uses a dedicated checkout page: **Buy → Checkout → one-time/subscription → PayPal/Stripe**.
+- PayPal subscription setup now distinguishes saved prices from PayPal billing plans and persists created plans before webhook setup.
+- Custom-bot ZIP uploads accept the common outer-folder layout, can auto-detect common entrypoints, default to a 25 MB upload limit and keep a successful upload even when the subsequent Docker build fails.

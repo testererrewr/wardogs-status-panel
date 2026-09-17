@@ -31,3 +31,8 @@ Produktiv wird `PUBLIC_URL=https://status-hub.lol` verwendet. Discord OAuth nutz
 
 ## v3.11.1
 Stripe is configured in the panel; no Stripe SSH/.env setup is required.
+
+
+## v3.11.3
+
+After uploading the v3.11.3 files to GitHub, run the normal update command. The updater also changes an unchanged legacy `CUSTOM_UPLOAD_MAX_MB=5` default to `25`. Existing data, secrets and custom-bot files are preserved.

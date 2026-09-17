@@ -56,7 +56,7 @@ async function isRunning(name) {
 async function build(id, image) {
   const dir = path.join(root, id);
   if (!fs.existsSync(path.join(dir, 'Dockerfile.generated'))) throw new Error('upload files missing');
-  await run('docker', ['build', '--pull', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 180000, cwd: dir });
+  await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
 }
 async function startFresh(id, envObj) {
   const { container, image } = names(id);

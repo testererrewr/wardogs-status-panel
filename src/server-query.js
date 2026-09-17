@@ -71,7 +71,18 @@ async function queryWardogs(server) {
   const current = num(data?.players?.current);
   const max = num(data?.players?.max);
   if (!Number.isFinite(current) || !Number.isFinite(max)) throw new Error('WARDOGS-Antwort enthält keine gültige Spielerzahl');
-  return { current, max, map: data.map || '', serverName: data.serverName || '', ping: null, game: 'WARDOGS' };
+  const factionScores = Array.isArray(data?.factionScores)
+    ? data.factionScores.map((item) => ({ name: String(item?.name || '').trim(), score: num(item?.score, 0) })).filter((item) => item.name)
+    : [];
+  const first = factionScores[0] || { name: '', score: 0 };
+  const second = factionScores[1] || { name: '', score: 0 };
+  const score = factionScores.length === 2
+    ? `${first.name} ${first.score} – ${second.score} ${second.name}`
+    : factionScores.length ? factionScores.map((item) => `${item.name} ${item.score}`).join(' · ') : '';
+  return {
+    current, max, map: data.map || '', serverName: data.serverName || '', ping: null, game: 'WARDOGS',
+    factionScores, score, team1: first.name, score1: first.score, team2: second.name, score2: second.score
+  };
 }
 
 async function queryFiveM(server) {

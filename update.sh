@@ -16,7 +16,7 @@ if [[ -f compose.override.yaml ]] && grep -q "wardogs-panel" compose.override.ya
 if ! grep -q '^RUNNER_SHARED_SECRET=' .env; then echo "RUNNER_SHARED_SECRET=$(openssl rand -hex 48)" >> .env; fi
 if ! grep -q '^RUNNER_URL=' .env; then echo 'RUNNER_URL=http://runner:4000' >> .env; fi
 if ! grep -q '^ALLOW_PUBLIC_REGISTRATION=' .env; then echo 'ALLOW_PUBLIC_REGISTRATION=true' >> .env; fi
-if ! grep -q '^CUSTOM_UPLOAD_MAX_MB=' .env; then echo 'CUSTOM_UPLOAD_MAX_MB=5' >> .env; fi
+if grep -q '^CUSTOM_UPLOAD_MAX_MB=5$' .env; then sed -i 's/^CUSTOM_UPLOAD_MAX_MB=5$/CUSTOM_UPLOAD_MAX_MB=25/' .env; elif ! grep -q '^CUSTOM_UPLOAD_MAX_MB=' .env; then echo 'CUSTOM_UPLOAD_MAX_MB=25' >> .env; fi
 if ! grep -q '^PANEL_BIND=' .env; then echo 'PANEL_BIND=0.0.0.0:3000' >> .env; fi
 if ! grep -q '^STATUS_NODE_JOIN_SECRET=' .env; then echo "STATUS_NODE_JOIN_SECRET=$(openssl rand -hex 48)" >> .env; fi
 if ! grep -q '^LOCAL_STATUS_NODE_MAX_BOTS=' .env; then echo 'LOCAL_STATUS_NODE_MAX_BOTS=50' >> .env; fi

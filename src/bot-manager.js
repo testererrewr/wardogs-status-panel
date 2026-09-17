@@ -10,7 +10,7 @@ function serverSignature(server) {
     id: server.id, enabled: server.enabled, botTokenEnc: server.botTokenEnc || null, botTokenPlain: server.botTokenPlain || null,
     gameType: server.gameType, queryConfig: server.queryConfig || {}, querySecretEnc: server.querySecretEnc || null, querySecretPlain: server.querySecretPlain || null,
     allowPrivateTarget: Boolean(server.allowPrivateTarget), intervalSeconds: server.intervalSeconds, switchSeconds: server.switchSeconds,
-    onlineTemplates: server.onlineTemplates || [], offlineTemplate: server.offlineTemplate || 'Server offline', wardogsSeedingEnabled: Boolean(server.wardogsSeedingEnabled), restartNonce: server.restartNonce || 0, name: server.name
+    onlineTemplates: server.onlineTemplates || [], offlineTemplate: server.offlineTemplate || 'Server offline', wardogsSeedingEnabled: Boolean(server.wardogsSeedingEnabled), wardogsScoreEnabled: Boolean(server.wardogsScoreEnabled), restartNonce: server.restartNonce || 0, name: server.name
   });
 }
 
@@ -27,6 +27,11 @@ function render(template, values) {
     .replaceAll('{map}', String(values.map || 'Unbekannt'))
     .replaceAll('{game}', String(values.game || 'Game'))
     .replaceAll('{ping}', values.ping == null ? '—' : `${values.ping}ms`)
+    .replaceAll('{score}', String(values.score || '—'))
+    .replaceAll('{team1}', String(values.team1 || 'Team 1'))
+    .replaceAll('{score1}', String(values.score1 ?? 0))
+    .replaceAll('{team2}', String(values.team2 || 'Team 2'))
+    .replaceAll('{score2}', String(values.score2 ?? 0))
     .slice(0, 128);
 }
 
@@ -39,6 +44,7 @@ function onlinePresence(server, client, state, advance = false) {
   if (!client.user || !state.latestStatus) return;
   const list = templates(server);
   if (server.gameType === 'wardogs' && server.wardogsSeedingEnabled && Number(state.latestStatus.current || 0) >= 1 && !list.some((x) => String(x).trim().toLowerCase() === 'seeding')) list.push('Seeding');
+  if (server.gameType === 'wardogs' && server.wardogsScoreEnabled && state.latestStatus.score && !list.some((x) => /\{(?:score|team1|score1|team2|score2)\}/i.test(String(x)))) list.push('Score: {score}');
   if (advance && list.length > 1) state.rotationIndex = (state.rotationIndex + 1) % list.length;
   const text = render(list[state.rotationIndex || 0], { ...state.latestStatus, name: server.name });
   client.user.setPresence({ status: 'online', activities: [{ name: text, type: ActivityType.Watching }] });
@@ -67,7 +73,7 @@ async function refresh(server, client, state) {
     state.latestStatus = status;
     setRuntime(server.id, {
       state: 'online', botTag: client.user?.tag || null, botId: client.user?.id || null,
-      players: status.current, maxPlayers: status.max, map: status.map, ping: status.ping,
+      players: status.current, maxPlayers: status.max, map: status.map, ping: status.ping, score: status.score || null,
       queryServerName: status.serverName, game: status.game, lastCheck: new Date().toISOString(), lastError: null
     });
     if (!wasOnline) { state.rotationIndex = 0; onlinePresence(server, client, state, false); }

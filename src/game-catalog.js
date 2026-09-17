@@ -161,7 +161,7 @@ export function gameDigPlaceholders(id) { return gameDigMeta(id)?.placeholders |
 
 export function specialCatalogEntries() {
   return [
-    { id: 'wardogs', provider: 'direct', name: 'WARDOGS', category: 'gameserver', defaultPort: 7776, features: ['Spieler', 'Slots', 'Map', 'Servername', 'Online/Offline'], noteDe: 'Direkte /v1/status-Abfrage mit RCON/Bearer-Passwort.', noteEn: 'Direct /v1/status query using an RCON/Bearer password.' },
+    { id: 'wardogs', provider: 'direct', name: 'WARDOGS', category: 'gameserver', defaultPort: 7776, features: ['Spieler', 'Slots', 'Map', 'Servername', 'Punktestand', 'Online/Offline'], noteDe: 'Direkte /v1/status-Abfrage mit RCON/Bearer-Passwort inklusive Live-Punktestand pro Fraktion.', noteEn: 'Direct /v1/status query using an RCON/Bearer password, including live faction scores.' },
     { id: 'fivem-direct', provider: 'direct', name: 'FiveM', category: 'gameserver', defaultPort: 30120, features: ['Spieler', 'Slots', 'Map/Gametype', 'Servername', 'Online/Offline'], noteDe: 'Direkte Abfrage von dynamic.json und players.json. Kein RCON nötig.', noteEn: 'Direct query of dynamic.json and players.json. No RCON required.' },
     { id: 'generic-json', provider: 'json', name: 'Generische JSON API', nameEn: 'Generic JSON API', category: 'api', defaultPort: null, features: ['Spieler*', 'Slots*', 'Map*', 'Servername*', 'Online/Offline'], noteDe: 'Frei konfigurierbare JSON-Pfade. *Felder hängen von deiner API ab.', noteEn: 'Configurable JSON paths. *Fields depend on your API.' }
   ];
