@@ -1022,7 +1022,8 @@ async function startOne(bot) {
 }
 
 export async function syncManagedBots(bots) {
-  const snapshots = new Map((bots || []).map((bot) => [bot.id, bot]));
+  const supported = (bots || []).filter((bot) => String(bot?.serviceId || 'wardogs-warning-bot') === 'wardogs-warning-bot');
+  const snapshots = new Map(supported.map((bot) => [bot.id, bot]));
   const ids = new Set([...instances.keys(), ...snapshots.keys()]);
   for (const id of ids) {
     await withLifecycleLock(id, async () => {

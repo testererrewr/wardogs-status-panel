@@ -40,11 +40,22 @@ function templates(server) {
   return list.length ? list : (server.gameType === 'text_only' ? ['status-hub.lol'] : ['{players}/{max} Spieler online', 'Map: {map}']);
 }
 
+export function wardogsSeedingActive(current) {
+  const players = Number(current);
+  return Number.isFinite(players) && players >= 1 && players <= 20;
+}
+
 function onlinePresence(server, client, state, advance = false) {
   if (!client.user || !state.latestStatus) return;
-  const list = templates(server);
-  if (server.gameType === 'wardogs' && server.wardogsSeedingEnabled && Number(state.latestStatus.current || 0) >= 1 && !list.some((x) => String(x).trim().toLowerCase() === 'seeding')) list.push('Seeding');
+  let list = templates(server);
+  if (server.gameType === 'wardogs' && server.wardogsSeedingEnabled) {
+    // The automatic WARDOGS Seeding presence is valid only while the server has 1-20 players.
+    // Remove an exact Seeding entry first so a previously configured/rotated value cannot leak into 0 or 21+ players.
+    list = list.filter((x) => String(x).trim().toLowerCase() !== 'seeding');
+    if (wardogsSeedingActive(state.latestStatus.current)) list.push('Seeding');
+  }
   if (server.gameType === 'wardogs' && server.wardogsScoreEnabled && state.latestStatus.score && !list.some((x) => /\{(?:score|team1|score1|team2|score2)\}/i.test(String(x)))) list.push('Score: {score}');
+  state.rotationIndex = list.length ? (Math.max(0, Number(state.rotationIndex) || 0) % list.length) : 0;
   if (advance && list.length > 1) state.rotationIndex = (state.rotationIndex + 1) % list.length;
   const text = render(list[state.rotationIndex || 0], { ...state.latestStatus, name: server.name });
   client.user.setPresence({ status: 'online', activities: [{ name: text, type: ActivityType.Watching }] });
@@ -69,14 +80,20 @@ function offlinePresence(server, client) {
 async function refresh(server, client, state) {
   try {
     const status = await fetchServerStatus(server);
-    const wasOnline = Boolean(state.latestStatus);
+    const previousStatus = state.latestStatus;
+    const wasOnline = Boolean(previousStatus);
+    const seedingRangeChanged = server.gameType === 'wardogs'
+      && server.wardogsSeedingEnabled
+      && wasOnline
+      && wardogsSeedingActive(previousStatus?.current) !== wardogsSeedingActive(status.current);
     state.latestStatus = status;
     setRuntime(server.id, {
       state: 'online', botTag: client.user?.tag || null, botId: client.user?.id || null,
       players: status.current, maxPlayers: status.max, map: status.map, ping: status.ping, score: status.score || null,
       queryServerName: status.serverName, game: status.game, lastCheck: new Date().toISOString(), lastError: null
     });
-    if (!wasOnline) { state.rotationIndex = 0; onlinePresence(server, client, state, false); }
+    if (!wasOnline) state.rotationIndex = 0;
+    if (!wasOnline || seedingRangeChanged) onlinePresence(server, client, state, false);
   } catch (error) {
     state.latestStatus = null;
     offlinePresence(server, client);

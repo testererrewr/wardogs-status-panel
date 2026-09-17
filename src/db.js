@@ -105,6 +105,7 @@ function defaultBotServices() {
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
     featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick, Ignore & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings'],
+    category: 'wardogs',
     featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick, Ignore & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
@@ -118,10 +119,32 @@ function defaultBotServices() {
     visible: true,
     featured: true,
     sortOrder: 10
+  }, {
+    id: 'wardogs-playtime-tracker',
+    slug: 'wardogs-playtime-tracker',
+    category: 'wardogs',
+    nameDe: 'WARDOGS Playtime Tracker',
+    nameEn: 'WARDOGS Playtime Tracker',
+    descriptionDe: 'Gehosteter WARDOGS Playtime Tracker. Er erfasst automatisch die Server-Spielzeit jedes Spielers per Steam64ID und zeigt Leaderboards sowie Langzeit-Statistiken im Webpanel und optional in Discord.',
+    descriptionEn: "Hosted WARDOGS playtime tracker. It automatically tracks every player's server playtime by Steam64ID and provides leaderboards plus long-term statistics in the web panel and optionally in Discord.",
+    featuresDe: ['Spielzeit pro Spieler & Steam64ID', 'Top-25 Leaderboard', 'Gesamtspielzeit aller Spieler', 'Discord Top-25 Channel mit 6h Auto-Update', 'Manuelles Leaderboard-Update im Webpanel', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Eigene Instanz & eigenes PayPal-Abo'],
+    featuresEn: ['Playtime per player & Steam64ID', 'Top 25 leaderboard', 'Total tracked player-hours', 'Discord Top 25 channel with 6h auto update', 'Manual leaderboard refresh from the web panel', 'Peak activity by hour of day', 'Most used clan tags', 'Dedicated instance & separate PayPal subscription'],
+    priceLabel: '€1.99 / month',
+    monthlyAmount: '1.99',
+    currency: 'EUR',
+    paypalProductId: '',
+    paypalPlanId: '',
+    paypalPlanMeta: {},
+    status: 'available',
+    purchaseUrl: '',
+    supportUrl: '',
+    visible: true,
+    featured: false,
+    sortOrder: 20
   }];
 }
 
-const emptyDb = () => ({ version: 21, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 23, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -138,7 +161,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 21;
+  parsed.version = 23;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -177,7 +200,7 @@ function migrate(parsed) {
   parsed.servers = parsed.servers.map((s) => s.gameType ? s : ({ ...s, gameType: 'wardogs', queryConfig: { baseUrl: s.rconUrl || '' }, querySecretEnc: s.rconPasswordEnc || null }));
   parsed.statusNodes = parsed.statusNodes.map((n) => ({ ...n, disabled: Boolean(n.disabled), acceptNewBots: n.acceptNewBots !== false }));
   parsed.supporters = parsed.supporters.map((s) => ({ ...s, id: s.id || crypto.randomUUID(), visible: s.visible !== false, featured: Boolean(s.featured) }));
-  parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [], monthlyAmount: String(x.monthlyAmount || ''), currency: /^[A-Z]{3}$/.test(String(x.currency || '').toUpperCase()) ? String(x.currency).toUpperCase() : 'EUR', paypalProductId: String(x.paypalProductId || ''), paypalPlanId: String(x.paypalPlanId || ''), paypalPlanMeta: x.paypalPlanMeta && typeof x.paypalPlanMeta === 'object' ? x.paypalPlanMeta : {} }));
+  parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [], monthlyAmount: String(x.monthlyAmount || ''), currency: /^[A-Z]{3}$/.test(String(x.currency || '').toUpperCase()) ? String(x.currency).toUpperCase() : 'EUR', paypalProductId: String(x.paypalProductId || ''), paypalPlanId: String(x.paypalPlanId || ''), category: String(x.category || 'wardogs').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-') || 'wardogs', paypalPlanMeta: x.paypalPlanMeta && typeof x.paypalPlanMeta === 'object' ? x.paypalPlanMeta : {} }));
   if (previousVersion < 16) {
     const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
     const managedService = defaultBotServices()[0];
@@ -216,6 +239,46 @@ function migrate(parsed) {
     if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: managedService.featuresDe, featuresEn: managedService.featuresEn, updatedAt: migrationNow };
     else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
   }
+  if (previousVersion < 22) {
+    // v3.12.5 supports multiple instances of the same managed bot service.
+    // Older databases only had one instance per user/service, so attach that
+    // legacy instance to the most relevant PayPal service subscription when
+    // accessRecordId was not stored yet. This keeps future recurring payments
+    // tied to the correct existing bot instead of creating a duplicate.
+    const claimed = new Set(parsed.managedBots.map((b) => String(b.accessRecordId || '')).filter(Boolean));
+    for (const bot of parsed.managedBots) {
+      if (bot.adminGrant || bot.accessRecordId) continue;
+      const candidates = parsed.paypalServiceSubscriptions
+        .filter((r) => r.userDiscordId === bot.ownerDiscordId && r.serviceId === String(bot.serviceId || 'wardogs-warning-bot') && !claimed.has(String(r.id || '')))
+        .sort((a,b) => String(b.activatedAt || b.createdAt || '').localeCompare(String(a.activatedAt || a.createdAt || '')));
+      const match = candidates.find((r) => ['ACTIVE','SUSPENDED','CANCELLED','EXPIRED'].includes(String(r.status || '').toUpperCase()) || r.activatedAt) || candidates[0];
+      if (match?.id) { bot.accessRecordId = String(match.id); claimed.add(String(match.id)); }
+    }
+  }
+  if (previousVersion < 23) {
+    // v3.12.7 adds the WARDOGS Playtime Tracker and service categories.
+    // Preserve existing PayPal catalog IDs on already configured services.
+    for (const defaults of defaultBotServices()) {
+      const index = parsed.botServices.findIndex((x) => x.id === defaults.id || x.slug === defaults.slug);
+      if (index >= 0) {
+        const existing = parsed.botServices[index];
+        parsed.botServices[index] = {
+          ...defaults,
+          ...existing,
+          category: defaults.category,
+          descriptionDe: defaults.descriptionDe,
+          descriptionEn: defaults.descriptionEn,
+          featuresDe: defaults.featuresDe,
+          featuresEn: defaults.featuresEn,
+          priceLabel: defaults.priceLabel,
+          monthlyAmount: defaults.monthlyAmount,
+          currency: defaults.currency,
+          status: 'available',
+          updatedAt: migrationNow
+        };
+      } else parsed.botServices.push({ ...defaults, createdAt: migrationNow, updatedAt: migrationNow });
+    }
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -240,8 +303,14 @@ function migrate(parsed) {
     steamAppId: /^\d{1,10}$/.test(String(b.steamAppId || '')) ? String(b.steamAppId) : '1867240',
     ignoredPlayers: (Array.isArray(b.ignoredPlayers) ? b.ignoredPlayers : []).map((entry) => typeof entry === 'string' ? { steamId: entry } : entry).map((entry) => ({ steamId: String(entry?.steamId || ''), name: String(entry?.name || '').slice(0, 100), ignoredAt: entry?.ignoredAt || null, ignoredBy: String(entry?.ignoredBy || '') })).filter((entry) => /^\d{17}$/.test(entry.steamId)).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 500),
     accessSource: String(b.accessSource || ''),
+    accessRecordId: String(b.accessRecordId || ''),
     accessUntil: b.accessUntil || null,
-    adminGrant: Boolean(b.adminGrant)
+    adminGrant: Boolean(b.adminGrant),
+    statsTimezone: String(b.statsTimezone || 'Europe/Vienna').slice(0, 80),
+    leaderboardChannelId: /^\d{17,20}$/.test(String(b.leaderboardChannelId || '')) ? String(b.leaderboardChannelId) : '',
+    leaderboardMessageId: /^\d{17,20}$/.test(String(b.leaderboardMessageId || '')) ? String(b.leaderboardMessageId) : '',
+    lastLeaderboardAt: b.lastLeaderboardAt || null,
+    playtimeStats: b.playtimeStats && typeof b.playtimeStats === 'object' ? b.playtimeStats : null
   }));
   return parsed;
 }
@@ -319,7 +388,9 @@ export function upsertCustomBot(bot) {
 export function deleteCustomBot(id) { updateDb((db) => { db.customBots = db.customBots.filter((b) => b.id !== id); }); }
 
 export function getManagedBot(id) { return (readDb().managedBots || []).find((b) => b.id === id) || null; }
-export function getManagedBotForUserService(discordId, serviceId) { return (readDb().managedBots || []).find((b) => b.ownerDiscordId === discordId && b.serviceId === serviceId) || null; }
+export function listManagedBotsForUserService(discordId, serviceId) { return (readDb().managedBots || []).filter((b) => b.ownerDiscordId === discordId && b.serviceId === serviceId).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
+export function getManagedBotForUserService(discordId, serviceId) { return listManagedBotsForUserService(discordId, serviceId)[0] || null; }
+export function getManagedBotByAccessRecord(accessRecordId) { const id = String(accessRecordId || ''); return id ? (readDb().managedBots || []).find((b) => String(b.accessRecordId || '') === id) || null : null; }
 export function listManagedBotsFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId); }
 export function upsertManagedBot(bot) {
   return updateDb((db) => {
@@ -327,7 +398,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }
@@ -345,7 +416,7 @@ export function upsertStatusNode(node) {
     db.statusNodes.push(entry); return entry;
   });
 }
-export function deleteStatusNode(id) { updateDb((db) => { db.statusNodes = (db.statusNodes || []).filter((n) => n.id !== id); for (const s of db.servers) if (s.assignedNodeId === id) s.assignedNodeId = null; }); }
+export function deleteStatusNode(id) { updateDb((db) => { db.statusNodes = (db.statusNodes || []).filter((n) => n.id !== id); for (const s of [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])]) if (s.assignedNodeId === id) s.assignedNodeId = null; }); }
 
 export function getSiteSettings() { return readDb().siteSettings; }
 export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, premiumSales: { ...(db.siteSettings?.premiumSales || {}), ...(patch.premiumSales || {}), prices: { ...(db.siteSettings?.premiumSales?.prices || {}), ...(patch.premiumSales?.prices || {}) }, paypalApi: { ...(db.siteSettings?.premiumSales?.paypalApi || {}), ...(patch.premiumSales?.paypalApi || {}) }, paypalAuto: { ...(db.siteSettings?.premiumSales?.paypalAuto || {}), ...(patch.premiumSales?.paypalAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.paypalAuto?.amounts || {}), ...(patch.premiumSales?.paypalAuto?.amounts || {}) } }, paypalSubscription: { ...(db.siteSettings?.premiumSales?.paypalSubscription || {}), ...(patch.premiumSales?.paypalSubscription || {}), planIds: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.planIds || {}), ...(patch.premiumSales?.paypalSubscription?.planIds || {}) }, planMeta: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.planMeta || {}), ...(patch.premiumSales?.paypalSubscription?.planMeta || {}) }, amounts: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.amounts || {}), ...(patch.premiumSales?.paypalSubscription?.amounts || {}) } }, stripeApi: { ...(db.siteSettings?.premiumSales?.stripeApi || {}), ...(patch.premiumSales?.stripeApi || {}) }, stripeAuto: { ...(db.siteSettings?.premiumSales?.stripeAuto || {}), ...(patch.premiumSales?.stripeAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.stripeAuto?.amounts || {}), ...(patch.premiumSales?.stripeAuto?.amounts || {}) } }, stripeSubscription: { ...(db.siteSettings?.premiumSales?.stripeSubscription || {}), ...(patch.premiumSales?.stripeSubscription || {}), amounts: { ...(db.siteSettings?.premiumSales?.stripeSubscription?.amounts || {}), ...(patch.premiumSales?.stripeSubscription?.amounts || {}) } } }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }

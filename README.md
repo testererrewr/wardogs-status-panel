@@ -1,4 +1,29 @@
-# status-hub.lol v3.12.4
+# status-hub.lol v3.12.7
+## v3.12.7 – WARDOGS Playtime Tracker & complete Node load stats
+
+- New **WARDOGS Playtime Tracker** managed service for **€1.99/month**.
+- Tracks each player by Steam64ID from the configured WARDOGS server and stores per-player server playtime.
+- Dashboard includes Top 25, total player-hours, current online count, peak hours and common leading clan tags such as `[AUT]`.
+- Optional Discord Top-25 channel updates one persistent leaderboard message every 6 hours; manual refresh is available in the web panel.
+- Discord is optional for the tracker and only required when the Discord leaderboard is configured.
+- Managed bot services now support categories and the public catalog has a category filter; the first category is **WARDOGS**.
+- Service-bot purchases now use a dedicated checkout page before PayPal, showing the selected bot, monthly price and the fact that each purchase creates one separate instance/subscription.
+- Node Manager capacity/load now includes active **Status Bots + Managed Service Bots + approved Custom Bots**, with a per-type breakdown.
+- Database version 23 adds tracker storage/settings while preserving existing service subscription catalog IDs.
+
+## v3.12.6 – WARDOGS seeding range
+
+- The normal WARDOGS status bot shows the automatic **Seeding** presence only at **1-20 players**.
+- At **0 players** and **21+ players**, Seeding is removed from the status rotation.
+
+## v3.12.5 – Multiple instances per managed bot service
+
+- Users can purchase the same managed bot service multiple times.
+- Every instance has its own configuration, Discord bot token, WARDOGS target, runtime and PayPal subscription.
+- Active instances no longer block purchasing another instance.
+- One unfinished PayPal checkout at a time is allowed to prevent accidental duplicate subscriptions.
+- Admins can create multiple free managed-bot instances as well.
+- Database version 22 preserves existing managed bots and links legacy paid instances to their existing service-subscription records.
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
@@ -67,7 +92,7 @@ Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic
 - Free: alle 14 Tage Renew im Account-Dashboard; danach 7 Tage Pause, dann Löschung.
 - Admin kann Free-Renew pro User ausnehmen.
 - User können Status-Bots selbst offline/online schalten.
-- WARDOGS kann optional `Seeding` ab 1 Spieler in die Rotation aufnehmen.
+- WARDOGS kann optional `Seeding` bei 1 bis 20 Spielern in die Rotation aufnehmen.
 - Cookie-Consent ist eingebaut; optionale Kategorien werden erst nach Einwilligung aktiviert. Aktuell sind keine optionalen Tracker integriert.
 
 

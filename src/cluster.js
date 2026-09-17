@@ -54,22 +54,32 @@ export function rebalanceAssignments() {
   const now = Date.now();
   return updateDb((db) => {
     if (!Array.isArray(db.statusNodes)) db.statusNodes = [];
+    if (!Array.isArray(db.managedBots)) db.managedBots = [];
+    if (!Array.isArray(db.customBots)) db.customBots = [];
     const healthy = db.statusNodes.filter((n) => nodeIsHealthy(n, now));
     const capacities = new Map(healthy.map((n) => [n.id, Math.max(1, Number(n.capacity) || 1)]));
     const load = new Map(healthy.map((n) => [n.id, 0]));
-    const entitled = new Set(db.servers.filter((s) => s.enabled && isServerEntitled(s, db, now)).map((s) => s.id));
+    const managedActive = (b) => Boolean(b?.enabled) && (Boolean(b?.adminGrant) || (Number.isFinite(Date.parse(b?.accessUntil || '')) && Date.parse(b.accessUntil) > now));
+    const customActive = (b) => Boolean(b?.enabled) && String(b?.approvalState || '') === 'approved';
+    const work = [
+      ...db.servers.map((item) => ({ item, kind: 'status', eligible: Boolean(item.enabled) && isServerEntitled(item, db, now) })),
+      ...db.managedBots.map((item) => ({ item, kind: 'managed', eligible: managedActive(item) })),
+      ...db.customBots.map((item) => ({ item, kind: 'custom', eligible: customActive(item) }))
+    ];
 
-    for (const s of db.servers) {
-      if (!entitled.has(s.id)) { s.assignedNodeId = null; continue; }
-      if (s.assignedNodeId && capacities.has(s.assignedNodeId)) {
-        const current = load.get(s.assignedNodeId) || 0;
-        if (current < capacities.get(s.assignedNodeId)) load.set(s.assignedNodeId, current + 1);
-        else s.assignedNodeId = null;
-      } else s.assignedNodeId = null;
+    for (const entry of work) {
+      const item = entry.item;
+      if (!entry.eligible) { item.assignedNodeId = null; continue; }
+      if (item.assignedNodeId && capacities.has(item.assignedNodeId)) {
+        const current = load.get(item.assignedNodeId) || 0;
+        if (current < capacities.get(item.assignedNodeId)) load.set(item.assignedNodeId, current + 1);
+        else item.assignedNodeId = null;
+      } else item.assignedNodeId = null;
     }
 
-    for (const s of db.servers) {
-      if (!entitled.has(s.id) || s.assignedNodeId) continue;
+    for (const entry of work) {
+      const item = entry.item;
+      if (!entry.eligible || item.assignedNodeId) continue;
       const candidates = healthy.filter((n) => {
         const hasCapacity = (load.get(n.id) || 0) < capacities.get(n.id);
         const free = Number(n.metrics?.freeMemMb);
@@ -78,9 +88,15 @@ export function rebalanceAssignments() {
       });
       candidates.sort((a, b) => ((load.get(a.id) || 0) / capacities.get(a.id)) - ((load.get(b.id) || 0) / capacities.get(b.id)) || String(a.id).localeCompare(String(b.id)));
       const node = candidates[0];
-      if (node) { s.assignedNodeId = node.id; load.set(node.id, (load.get(node.id) || 0) + 1); }
+      if (node) { item.assignedNodeId = node.id; load.set(node.id, (load.get(node.id) || 0) + 1); }
     }
-    return { healthy: healthy.length, assigned: db.servers.filter((s) => s.assignedNodeId).length };
+    return {
+      healthy: healthy.length,
+      assigned: work.filter((x) => x.item.assignedNodeId).length,
+      status: db.servers.filter((x) => x.assignedNodeId).length,
+      managed: db.managedBots.filter((x) => x.assignedNodeId).length,
+      custom: db.customBots.filter((x) => x.assignedNodeId).length
+    };
   });
 }
 
@@ -91,7 +107,7 @@ function validateTarget(db, targetNodeId, excludeServerIds = []) {
   if (!nodeIsHealthy(target, now)) throw new Error('Target node is offline or disabled');
   const excluded = new Set(excludeServerIds);
   const capacity = Math.max(1, Number(target.capacity) || 1);
-  const assigned = db.servers.filter((s) => s.assignedNodeId === target.id && !excluded.has(s.id)).length;
+  const assigned = [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])].filter((s) => s.assignedNodeId === target.id && !excluded.has(s.id)).length;
   const free = Number(target.metrics?.freeMemMb);
   if (Number.isFinite(free) && free < minFreeMb) throw new Error(`Target node has less than ${minFreeMb} MB free RAM`);
   return { target, capacity, assigned };
@@ -113,14 +129,14 @@ export function moveServerToNode(serverId, targetNodeId) {
 export function moveAllFromNode(sourceNodeId, targetNodeId) {
   return updateDb((db) => {
     if (sourceNodeId === targetNodeId) throw new Error('Source and target node are identical');
-    const servers = db.servers.filter((s) => s.assignedNodeId === sourceNodeId);
-    const { target, capacity, assigned } = validateTarget(db, targetNodeId, servers.map((s) => s.id));
-    if (assigned + servers.length > capacity) throw new Error('Target node does not have enough capacity for all bots');
-    for (const server of servers) {
-      server.assignedNodeId = target.id;
-      server.lastManualMoveAt = new Date().toISOString();
+    const bots = [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])].filter((s) => s.assignedNodeId === sourceNodeId);
+    const { target, capacity, assigned } = validateTarget(db, targetNodeId, bots.map((s) => s.id));
+    if (assigned + bots.length > capacity) throw new Error('Target node does not have enough capacity for all bots');
+    for (const bot of bots) {
+      bot.assignedNodeId = target.id;
+      bot.lastManualMoveAt = new Date().toISOString();
     }
-    return { moved: servers.length, sourceNodeId, targetNodeId: target.id };
+    return { moved: bots.length, sourceNodeId, targetNodeId: target.id };
   });
 }
 
@@ -130,10 +146,10 @@ export function restartAllBotsOnNode(nodeId) {
     if (!node) throw new Error('Node not found');
     const now = Date.now();
     let restarted = 0;
-    for (const server of db.servers) {
-      if (server.assignedNodeId === nodeId && server.enabled) {
-        server.restartNonce = now + restarted;
-        server.updatedAt = new Date(now).toISOString();
+    for (const bot of [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])]) {
+      if (bot.assignedNodeId === nodeId && bot.enabled) {
+        bot.restartNonce = now + restarted;
+        bot.updatedAt = new Date(now).toISOString();
         restarted += 1;
       }
     }
@@ -147,8 +163,8 @@ export function drainStatusNode(nodeId) {
     if (!node) throw new Error('Node not found');
     node.acceptNewBots = false;
     let released = 0;
-    for (const server of db.servers) {
-      if (server.assignedNodeId === nodeId) { server.assignedNodeId = null; released += 1; }
+    for (const bot of [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])]) {
+      if (bot.assignedNodeId === nodeId) { bot.assignedNodeId = null; released += 1; }
     }
     return { nodeId, released };
   });
@@ -158,7 +174,7 @@ export function drainStatusNode(nodeId) {
 
 export function nodeAssignmentSummary() {
   const db = readDb();
-  return (db.statusNodes || []).map((node) => ({ ...node, healthy: nodeIsHealthy(node), assigned: db.servers.filter((s) => s.assignedNodeId === node.id).length }));
+  return (db.statusNodes || []).map((node) => ({ ...node, healthy: nodeIsHealthy(node), assigned: [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])].filter((s) => s.assignedNodeId === node.id).length }));
 }
 
 export function materializeWorkForNode(nodeId) {
