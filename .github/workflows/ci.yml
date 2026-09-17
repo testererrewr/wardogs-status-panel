@@ -18,3 +18,10 @@ jobs:
           PUBLIC_URL: http://127.0.0.1:3000
           PANEL_BIND: 127.0.0.1:3000
           RUNNER_SHARED_SECRET: ci-test-secret
+          STATUS_NODE_JOIN_SECRET: ci-node-secret
+      - run: docker compose --env-file .env -f compose.node.yaml config
+        env:
+          CONTROL_PLANE_URL: https://status.example.com
+          STATUS_NODE_JOIN_SECRET: ci-node-secret
+          STATUS_NODE_ID: ci-node
+          STATUS_NODE_NAME: CI Node
