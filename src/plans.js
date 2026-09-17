@@ -16,31 +16,40 @@ function validBoostLimit(user, now) {
 }
 
 export function effectivePlan(user, now = Date.now()) {
-  if (user?.role === 'admin') return { id: 'admin', label: 'Admin', statusBotLimit: Infinity, branded: false, expiresAt: null, expired: false, freeBoostLimit: 1 };
-  if (!user) return { ...PLANS.free, expiresAt: null, expired: false, freeBoostLimit: 1 };
-  let raw = planById(user.planId || 'free');
+  if (user?.role === 'admin') return { id: 'admin', label: 'Admin', statusBotLimit: Infinity, branded: false, expiresAt: null, expired: false, freeBoostLimit: 1, renewalRequired: false, premiumGrace: false };
+  if (!user) return { ...PLANS.free, expiresAt: null, expired: false, freeBoostLimit: 1, renewalRequired: false, premiumGrace: false };
+  const configured = planById(user.planId || 'free');
   const expiresAt = user.planExpiresAt ? Date.parse(user.planExpiresAt) : NaN;
-  const expired = Number.isFinite(expiresAt) && expiresAt <= now;
-  if (expired) raw = PLANS.free;
-  const boostLimit = raw.id === 'free' ? validBoostLimit(user, now) : 1;
-  let statusBotLimit = raw.id === 'free' ? Math.max(raw.statusBotLimit, boostLimit) : raw.statusBotLimit;
+  const expired = configured.id !== 'free' && Number.isFinite(expiresAt) && expiresAt <= now;
+  const graceUntil = Date.parse(user.premiumDowngradeUntil || '');
+  const premiumGrace = expired || (Number.isFinite(graceUntil) && graceUntil > now);
+  let raw = expired ? PLANS.free : configured;
+  const boostLimit = raw.id === 'free' && !premiumGrace ? validBoostLimit(user, now) : 1;
+  let statusBotLimit = premiumGrace ? 1 : (raw.id === 'free' ? Math.max(raw.statusBotLimit, boostLimit) : raw.statusBotLimit);
+  const renewedAt = Date.parse(user.freeRenewedAt || '');
+  const renewalRequired = raw.id === 'free' && !premiumGrace && !user.freeRenewExempt && Number.isFinite(renewedAt) && now >= renewedAt + 14 * 86400_000;
   const hasOverride = user.statusBotLimitOverride !== null && user.statusBotLimitOverride !== undefined && String(user.statusBotLimitOverride).trim() !== '';
   const override = hasOverride ? Number(user.statusBotLimitOverride) : NaN;
-  if (Number.isFinite(override) && override >= 0) statusBotLimit = override;
+  if (!renewalRequired && !premiumGrace && Number.isFinite(override) && override >= 0) statusBotLimit = override;
+  if (renewalRequired) statusBotLimit = 0;
   return {
     ...raw,
-    label: raw.id === 'free' && boostLimit > 1 ? `Free + Boost (${boostLimit})` : raw.label,
+    label: premiumGrace ? 'Free · 7 day grace' : raw.id === 'free' && boostLimit > 1 ? `Free + Boost (${boostLimit})` : raw.label,
     statusBotLimit,
     expiresAt: user.planExpiresAt || null,
     expired,
-    freeBoostLimit: boostLimit
+    freeBoostLimit: boostLimit,
+    renewalRequired,
+    premiumGrace
   };
 }
 
 export function isServerEntitled(server, db, now = Date.now()) {
   const owner = db.users.find((u) => u.discordId === server.ownerDiscordId);
   if (owner?.role === 'admin') return true;
-  const limit = effectivePlan(owner, now).statusBotLimit;
+  const plan = effectivePlan(owner, now);
+  if (plan.premiumGrace && owner?.premiumDowngradeKeepServerId) return server.id === owner.premiumDowngradeKeepServerId;
+  const limit = plan.statusBotLimit;
   const owned = db.servers.filter((s) => s.ownerDiscordId === server.ownerDiscordId).sort((a, b) => Number(Boolean(b.enabled)) - Number(Boolean(a.enabled)) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')) || String(a.id).localeCompare(String(b.id)));
   const index = owned.findIndex((s) => s.id === server.id);
   return index >= 0 && index < limit;

@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { getSiteSettings } from './db.js';
 import { decryptSecret } from './crypto.js';
 
+const PREMIUM_IDS = ['premium5', 'premium10', 'premium15', 'premium20'];
+
 function credentials(settings = getSiteSettings()) {
   const api = settings?.premiumSales?.paypalApi || {};
   const mode = String(api.mode || process.env.PAYPAL_MODE || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox';
@@ -15,8 +17,7 @@ function credentials(settings = getSiteSettings()) {
 }
 
 function baseUrl(settings) {
-  const cfg = credentials(settings);
-  return cfg.mode === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+  return credentials(settings).mode === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 }
 
 export function paypalEnvironment(settings = getSiteSettings()) { return credentials(settings).mode; }
@@ -91,6 +92,72 @@ export function extractCompletedCapture(order) {
   return { orderId: order?.id || '', status: capture?.status || order?.status || '', captureId: capture?.id || '', customId: capture?.custom_id || pu?.custom_id || '', amount: capture?.amount?.value || pu?.amount?.value || '', currency: capture?.amount?.currency_code || pu?.amount?.currency_code || '' };
 }
 
+export async function createSubscriptionProduct({ settings = getSiteSettings() } = {}) {
+  return api('/v1/catalogs/products', {
+    method: 'POST', requestId: crypto.randomUUID(), settings,
+    body: { name: 'status-hub.lol Premium', description: 'Monthly status-hub.lol Premium subscription', type: 'SERVICE', category: 'SOFTWARE', home_url: 'https://status-hub.lol' }
+  });
+}
+
+export async function createSubscriptionPlan({ productId, planId, amount, currency, settings = getSiteSettings() }) {
+  const names = { premium5: 'Premium 5', premium10: 'Premium 10', premium15: 'Premium 15', premium20: 'Premium 20' };
+  return api('/v1/billing/plans', {
+    method: 'POST', requestId: crypto.randomUUID(), settings,
+    body: {
+      product_id: productId,
+      name: `status-hub.lol ${names[planId] || planId}`,
+      description: `${names[planId] || planId} monthly subscription`,
+      billing_cycles: [{ frequency: { interval_unit: 'MONTH', interval_count: 1 }, tenure_type: 'REGULAR', sequence: 1, total_cycles: 0, pricing_scheme: { fixed_price: { value: amount, currency_code: currency } } }],
+      payment_preferences: { auto_bill_outstanding: true, setup_fee_failure_action: 'CANCEL', payment_failure_threshold: 1 }
+    }
+  });
+}
+
+export async function ensureSubscriptionCatalog({ productId = '', planIds = {}, planMeta = {}, amounts = {}, currency = 'EUR', settings = getSiteSettings() }) {
+  let finalProductId = String(productId || '');
+  if (!finalProductId) {
+    const product = await createSubscriptionProduct({ settings });
+    if (!product?.id) throw new Error('PayPal did not return a product ID');
+    finalProductId = product.id;
+  }
+  const finalPlanIds = { ...planIds };
+  const finalPlanMeta = { ...planMeta };
+  for (const planId of PREMIUM_IDS) {
+    const amount = String(amounts?.[planId] || '').trim();
+    if (!amount) continue;
+    const meta = finalPlanMeta[planId] || {};
+    const unchanged = finalPlanIds[planId] && meta.amount === amount && meta.currency === currency;
+    if (unchanged) continue;
+    const plan = await createSubscriptionPlan({ productId: finalProductId, planId, amount, currency, settings });
+    if (!plan?.id) throw new Error(`PayPal did not return a plan ID for ${planId}`);
+    finalPlanIds[planId] = plan.id;
+    finalPlanMeta[planId] = { amount, currency, createdAt: new Date().toISOString() };
+  }
+  return { productId: finalProductId, planIds: finalPlanIds, planMeta: finalPlanMeta };
+}
+
+export async function createSubscription({ recordId, paypalPlanId, returnUrl, cancelUrl, settings = getSiteSettings() }) {
+  const data = await api('/v1/billing/subscriptions', {
+    method: 'POST', requestId: recordId, settings,
+    body: {
+      plan_id: paypalPlanId,
+      custom_id: recordId,
+      application_context: { brand_name: 'status-hub.lol', shipping_preference: 'NO_SHIPPING', user_action: 'SUBSCRIBE_NOW', return_url: returnUrl, cancel_url: cancelUrl }
+    }
+  });
+  const approvalUrl = data.links?.find((x) => x.rel === 'approve')?.href || '';
+  if (!data.id || !approvalUrl) throw new Error('PayPal did not return a subscription approval URL');
+  return { subscriptionId: data.id, approvalUrl, status: data.status || 'APPROVAL_PENDING' };
+}
+
+export async function getSubscription(subscriptionId, settings = getSiteSettings()) {
+  return api(`/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, { settings });
+}
+
+export async function cancelSubscription(subscriptionId, reason = 'Cancelled by customer', settings = getSiteSettings()) {
+  return api(`/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, { method: 'POST', body: { reason: String(reason).slice(0, 128) || 'Cancelled by customer' }, settings });
+}
+
 export async function verifyWebhook(headers, event, webhookId, settings = getSiteSettings()) {
   if (!webhookId) throw new Error('PayPal webhook ID is not configured');
   const payload = {
@@ -105,11 +172,17 @@ export async function ensureWebhook(existingId, url, settings = getSiteSettings(
   if (existingId) {
     try {
       const current = await api(`/v1/notifications/webhooks/${encodeURIComponent(existingId)}`, { settings });
-      if (current?.id === existingId && current?.url === url) return current;
+      if (current?.id === existingId && current?.url === url) {
+        const hasAll = Array.isArray(current.event_types) && current.event_types.some((x) => x.name === '*');
+        if (!hasAll) {
+          try { await api(`/v1/notifications/webhooks/${encodeURIComponent(existingId)}`, { method: 'PATCH', body: [{ op: 'replace', path: '/event_types', value: [{ name: '*' }] }], settings }); } catch {}
+        }
+        return await api(`/v1/notifications/webhooks/${encodeURIComponent(existingId)}`, { settings });
+      }
     } catch {}
   }
   return api('/v1/notifications/webhooks', {
     method: 'POST', requestId: crypto.randomUUID(), settings,
-    body: { url, event_types: [{ name: 'PAYMENT.CAPTURE.COMPLETED' }, { name: 'PAYMENT.CAPTURE.DENIED' }, { name: 'PAYMENT.CAPTURE.REFUNDED' }, { name: 'PAYMENT.CAPTURE.REVERSED' }] }
+    body: { url, event_types: [{ name: '*' }] }
   });
 }

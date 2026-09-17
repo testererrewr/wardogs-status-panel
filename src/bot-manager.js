@@ -10,7 +10,7 @@ function serverSignature(server) {
     id: server.id, enabled: server.enabled, botTokenEnc: server.botTokenEnc || null, botTokenPlain: server.botTokenPlain || null,
     gameType: server.gameType, queryConfig: server.queryConfig || {}, querySecretEnc: server.querySecretEnc || null, querySecretPlain: server.querySecretPlain || null,
     allowPrivateTarget: Boolean(server.allowPrivateTarget), intervalSeconds: server.intervalSeconds, switchSeconds: server.switchSeconds,
-    onlineTemplates: server.onlineTemplates || [], offlineTemplate: server.offlineTemplate || 'Server offline', restartNonce: server.restartNonce || 0, name: server.name
+    onlineTemplates: server.onlineTemplates || [], offlineTemplate: server.offlineTemplate || 'Server offline', wardogsSeedingEnabled: Boolean(server.wardogsSeedingEnabled), restartNonce: server.restartNonce || 0, name: server.name
   });
 }
 
@@ -38,6 +38,7 @@ function templates(server) {
 function onlinePresence(server, client, state, advance = false) {
   if (!client.user || !state.latestStatus) return;
   const list = templates(server);
+  if (server.gameType === 'wardogs' && server.wardogsSeedingEnabled && Number(state.latestStatus.current || 0) >= 1 && !list.some((x) => String(x).trim().toLowerCase() === 'seeding')) list.push('Seeding');
   if (advance && list.length > 1) state.rotationIndex = (state.rotationIndex + 1) % list.length;
   const text = render(list[state.rotationIndex || 0], { ...state.latestStatus, name: server.name });
   client.user.setPresence({ status: 'online', activities: [{ name: text, type: ActivityType.Watching }] });

@@ -1,39 +1,28 @@
-# status-hub.lol v3.9.5
+# status-hub.lol v3.10.0
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
-## v3.9.5
+## v3.10.0 Lifecycle
 
-- Public header login now opens Discord OAuth directly on every public page.
-- Enabled status bots automatically reconnect after updates and status-node/container restarts.
-- Disabled or paused bots stay stopped.
+- Premium endet: 1 Bot bleibt online, weitere Bots 7 Tage pausiert, danach gelöscht.
+- Premium innerhalb von 7 Tagen erneuert: pausierte Bots kommen automatisch zurück.
+- Free: alle 14 Tage Renew im Account-Dashboard; danach 7 Tage Pause, dann Löschung.
+- Admin kann Free-Renew pro User ausnehmen.
+- User können Status-Bots selbst offline/online schalten.
+- WARDOGS kann optional `Seeding` ab 1 Spieler in die Rotation aufnehmen.
+- Cookie-Consent ist eingebaut; optionale Kategorien werden erst nach Einwilligung aktiviert. Aktuell sind keine optionalen Tracker integriert.
 
-## v3.9.3
 
-- Free Boost now checks the top Discord category named `Powered by status-hub.lol` instead of a text channel.
-- The branding category must be the top category and visible to `@everyone`.
-- PayPal Sandbox/Live mode, Client ID and Client Secret are configured entirely in Admin -> Settings.
-- PayPal Client Secret is encrypted in the panel database; no PayPal `.env` or SSH setup is required.
-- PayPal Sandbox displays the same Buy now checkout button as Live so purchases can be tested end-to-end.
-- Admins see other users' status/custom bots only in Admin -> All bots. The normal dashboard shows only the admin's own bots.
-- Reaching a status/custom bot limit opens a panel popup instead of a plain white 403 page.
-- Games & FAQ is fully bilingual for DE/EN, including special GameDig setup notes and provider labels.
+## v3.10.0
 
-## PayPal
-
-Create a PayPal REST application and open:
-
-```text
-Admin -> Settings -> Premium & PayPal
-```
-
-Enter Sandbox/Live, Client ID, Client Secret, currency, duration and the prices for Premium 5/10/15/20. Then use `Save & automatically set up / test PayPal`. The panel stores the secret encrypted and registers:
-
-```text
-https://status-hub.lol/webhooks/paypal
-```
-
-A completed payment activates the purchased Premium plan automatically. Refund/reversal handling is also supported for entitlements created by the corresponding PayPal purchase.
+- Premium can be purchased as a one-time PayPal payment or a monthly PayPal subscription.
+- New `Your Account` page shows the current plan, billing type, expiry and PayPal subscription state.
+- Users can cancel their monthly PayPal subscription from `Your Account`.
+- Cancelling stops future PayPal charges while Premium remains available until the already-paid period ends.
+- PayPal subscription products and monthly billing plans are created automatically from Admin -> Settings.
+- Monthly prices are configured in the backend for Premium 5/10/15/20.
+- Subscription renewals are processed through verified PayPal webhooks.
+- Premium branding is non-destructive: user-authored status text is never changed. Free branding is appended dynamically at runtime and disappears automatically while Premium is active.
 
 ## Premium
 
@@ -45,7 +34,61 @@ A completed payment activates the purchased Premium plan automatically. Refund/r
 | Premium 15 | 15 | none |
 | Premium 20 | 20 | none |
 
+Each Premium plan can offer both:
+
+- one-time access for the configured number of days
+- a recurring monthly PayPal subscription
+
 Custom bot permissions remain separate and can only be granted by an admin.
+
+## PayPal
+
+Create a PayPal REST application and open:
+
+```text
+Admin -> Settings -> Premium & PayPal
+```
+
+Configure Sandbox/Live, Client ID, Client Secret, currency, one-time prices, monthly subscription prices and the one-time duration. Then use:
+
+```text
+Save & automatically set up / test PayPal
+```
+
+The panel stores the PayPal secret encrypted, registers the webhook and creates the PayPal subscription product/plans automatically. No PayPal SSH or `.env` configuration is required.
+
+Webhook URL:
+
+```text
+https://status-hub.lol/webhooks/paypal
+```
+
+PayPal subscription cancellation is available to the customer under:
+
+```text
+https://status-hub.lol/account
+```
+
+## Branding behavior
+
+Status templates saved by users are never modified when a plan changes.
+
+For Free users, the node materializes the runtime status list as:
+
+```text
+user text 1
+user text 2
+Powered by status-hub.lol
+```
+
+For Premium users, it materializes only:
+
+```text
+user text 1
+user text 2
+```
+
+No custom text is deleted and no replacement text is added during a Premium purchase.
 
 ## Free Boost
 
@@ -55,19 +98,20 @@ Every Free account starts with one status bot. To unlock additional free status 
 Powered by status-hub.lol
 ```
 
-The category must be visible to `@everyone`. Member thresholds for 2/3/4/5 total free bots are configured in the admin settings.
+The category must be visible to `@everyone`. Member thresholds for 2/3/4/5 total free bots are configured in Admin -> Settings.
 
 ## Admin
 
 The Admin Control Center contains:
 
-- All bots: every user's status bots and custom bots
-- Nodes: capacities, accept-new-bots, disable, drain and bot moves
-- Users & plans: Premium duration, overrides and custom bot slots
-- Bot services: managed products
-- Settings: PayPal, Free Boost, domain, donations and team IDs
+- All bots
+- Nodes
+- Users & plans
+- Bot services
+- Settings
+- PayPal one-time and monthly subscription configuration
 
-Normal `/` and `/custom-bots` pages show only the logged-in user's own bots, even for admins.
+Normal user pages show only the logged-in user's own bots.
 
 ## Install
 
@@ -93,20 +137,12 @@ bash ./update.sh
 
 ```text
 https://status-hub.lol
+https://status-hub.lol/account
 https://status-hub.lol/auth/discord/callback
 https://status-hub.lol/webhooks/paypal
 ```
 
 
-## v3.9.8
+## Discord OAuth settings
 
-- PayPal Sandbox Checkout ist auch ohne bereits angelegten Webhook testbar.
-- Einzelner Bot-Neustart validiert den gespeicherten Discord Bot Token und startet deaktivierte Bots wieder.
-- Node Manager kann alle aktiven Bots eines Nodes gesammelt neu starten.
-
-
-## v3.9.8
-
-- Fixed internal status-node work API being redirected to the public domain and losing node authentication.
-- Status bots can receive work from the local/remote node again.
-- PayPal now reports a clear Sandbox/Live credential mismatch message.
+Discord OAuth can be changed in **Admin -> Settings**. Existing `.env` credentials are kept as a fallback. The Discord Client Secret is encrypted with `APP_ENCRYPTION_KEY` when stored in the panel database.
