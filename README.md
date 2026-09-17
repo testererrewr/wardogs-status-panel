@@ -1,5 +1,25 @@
-# status-hub.lol v3.12.17
+# status-hub.lol v3.12.20
 
+## v3.12.20 – JOIN Seeding server-name fix & welcome whisper reliability
+
+- WARDOGS Management Bot: **JOIN Seeding** is appended to the actual WARDOGS game-server name while 1–20 players are online and removed again at 0 or 21+ players. It never changes the Discord bot nickname. Existing management bots keep the setting enabled and it can be disabled in settings.
+- Join welcome whispers now use a dedicated 5-second join/spawn watcher instead of relying on the slower detection poll. Existing online players remain baseline-only; a real leave/rejoin gets one fresh welcome.
+- Spawn-ready welcome delivery retries clear WARDOGS readiness errors for up to two minutes and only marks a welcome complete after a successful whisper response.
+- WARDOGS Playtime Tracker: one tracker instance can monitor up to 12 WARDOGS servers at once, each with its own encrypted RCON password.
+- Playtime dashboard adds per-server stats plus player search by name or Steam64ID with total playtime, sessions, last activity and a server-by-server breakdown.
+- Legacy single-server tracker data migrates automatically into the first tracker server.
+- Database schema version 29.
+
+## v3.12.18 – Security hardening
+
+- Layered request/write/OAuth/upload rate limiting and HTTP anti-Slowloris timeouts.
+- Browser hardening with CSP, HSTS on HTTPS, privacy headers and no-store responses for dynamic panel pages.
+- Full local DB and session files encrypted at rest with `APP_ENCRYPTION_KEY`.
+- Custom-bot ZIPs reject common secret files; custom-bot logs redact configured ENV secrets and common credential patterns.
+- Main panel, status node and runner containers use read-only root filesystems, dropped capabilities, `no-new-privileges` and PID limits.
+- Backups, `.env`, database and custom-bot files use stricter filesystem permissions.
+- Included `SECURITY.md` and `security-check.sh` for production hardening checks.
+- Application-level protection does not replace upstream/provider DDoS mitigation for volumetric attacks.
 
 ## v3.12.17 – Service feature-list cleanup
 

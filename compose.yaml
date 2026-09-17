@@ -9,6 +9,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./custom-bots:/app/custom-bots
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
     depends_on:
       - runner
     healthcheck:
@@ -20,7 +28,7 @@ services:
 
   status-node:
     build: .
-    command: ["npm", "run", "status-node"]
+    command: ["node", "src/status-node.js"]
     restart: unless-stopped
     depends_on:
       server-status-hub:
@@ -35,6 +43,14 @@ services:
       STATUS_NODE_TOKEN_FILE: /node-data/token
     volumes:
       - status_node_data:/node-data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 192
 
   runner:
     build:
@@ -49,6 +65,15 @@ services:
     volumes:
       - ./custom-bots:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
+      - /root/.docker:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 192
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "--header", "X-Runner-Secret: ${RUNNER_SHARED_SECRET}", "http://127.0.0.1:4000/healthz"]
       interval: 30s

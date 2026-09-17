@@ -79,11 +79,16 @@ CUSTOM_UPLOAD_MAX_MB=25
 TRUST_PROXY=${TRUST_PROXY}
 COOKIE_SECURE=${COOKIE_SECURE}
 COMPOSE_PROFILES=${COMPOSE_PROFILES}
+SECURITY_GLOBAL_LIMIT=1200
+SECURITY_WRITE_LIMIT=180
+ADMIN_IP_ALLOWLIST=
 ENVEOF
 chmod 600 .env
 mkdir -p data custom-bots
 chown -R 1000:1000 data custom-bots
 chmod 750 data custom-bots
+find data -type f -exec chmod 600 {} + 2>/dev/null || true
+find custom-bots -type f -exec chmod 600 {} + 2>/dev/null || true
 touch data/.gitkeep custom-bots/.gitkeep || true
 echo
 echo "Discord OAuth Redirect URI:"

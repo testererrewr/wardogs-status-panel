@@ -24,7 +24,7 @@ import { FileSessionStore } from './file-session-store.js';
 import { prepareCustomBot, parseEnvText, deleteCustomBotFiles } from './custom-bots.js';
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
 import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, temporaryBanManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, whisperManagedFaction, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64, normalizeManagedBanDiscordLink, formatManagedBanDuration } from './managed-bots.js';
-import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
+import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, playtimeTrackerServers, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
@@ -42,6 +42,8 @@ const baseUrl = String(process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 if (!/^https?:\/\//i.test(baseUrl)) throw new Error('PUBLIC_URL muss mit http:// oder https:// beginnen');
 const redirectUri = `${baseUrl}/auth/discord/callback`;
 const secureCookie = process.env.COOKIE_SECURE === 'true' || baseUrl.startsWith('https://');
+const sessionCookieName = secureCookie ? '__Host-serverhub.sid' : 'serverhub.sid';
+const adminIpAllowlist = new Set(String(process.env.ADMIN_IP_ALLOWLIST || '').split(',').map((x) => x.trim()).filter(Boolean));
 const bootstrapAdmins = new Set((process.env.ADMIN_DISCORD_IDS || '').split(',').map((x) => x.trim()).filter(Boolean));
 const firstAdmin = [...bootstrapAdmins][0] || '';
 const uploadMaxMb = Math.min(25, Math.max(1, Number(process.env.CUSTOM_UPLOAD_MAX_MB || 25)));
@@ -69,11 +71,50 @@ function managedConfigFile(req, res, next) {
 
 assignLegacyOwnership(firstAdmin);
 
-if (process.env.TRUST_PROXY !== 'false') app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
+const trustProxy = process.env.TRUST_PROXY === 'true';
+if (trustProxy) app.set('trust proxy', 1);
+app.disable('x-powered-by');
+const securityRateLimit = (name, windowMs, limit, extra = {}) => rateLimit({
+  windowMs, limit, standardHeaders: 'draft-8', legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' },
+  ...extra
+});
+const skipInfrastructureLimits = (req) => req.path === '/healthz' || req.path.startsWith('/webhooks/') || req.path.startsWith('/api/status-nodes/');
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      upgradeInsecureRequests: secureCookie ? [] : null
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'no-referrer' },
+  hsts: secureCookie ? { maxAge: 15552000, includeSubDomains: false, preload: false } : false
+}));
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=(), bluetooth=(), browsing-topics=()');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  next();
+});
 app.use(express.json({ limit: '256kb', verify: (req, res, buf) => { if (req.originalUrl === '/webhooks/stripe') req.rawBody = Buffer.from(buf); } }));
-app.use(express.urlencoded({ extended: false, limit: '128kb' }));
-app.use(express.static('public', { maxAge: 0, etag: true }));
+app.use(express.urlencoded({ extended: false, limit: '128kb', parameterLimit: 300 }));
+app.use(express.static('public', { maxAge: 0, etag: true, dotfiles: 'deny', fallthrough: true }));
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 const canonical = new URL(baseUrl);
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/status-nodes/') || req.path === '/healthz') return next();
@@ -85,15 +126,21 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 3000, standardHeaders: 'draft-8', legacyHeaders: false }));
+app.use(securityRateLimit('global', 10 * 60 * 1000, Number(process.env.SECURITY_GLOBAL_LIMIT || 1200), { skip: skipInfrastructureLimits }));
+app.use(securityRateLimit('writes', 5 * 60 * 1000, Number(process.env.SECURITY_WRITE_LIMIT || 180), {
+  skip: (req) => skipInfrastructureLimits(req) || ['GET','HEAD','OPTIONS'].includes(req.method)
+}));
 app.use(session({
   store: new FileSessionStore({ file: 'data/sessions.json' }),
-  name: 'serverhub.sid', secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'lax', secure: secureCookie, maxAge: 7 * 24 * 60 * 60 * 1000 }
+  name: sessionCookieName, secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false, rolling: true,
+  proxy: trustProxy,
+  cookie: { httpOnly: true, sameSite: 'lax', secure: secureCookie, priority: 'high', path: '/', maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
 function csrf(req) { if (!req.session.csrf) req.session.csrf = crypto.randomBytes(24).toString('base64url'); return req.session.csrf; }
 function checkCsrf(req, res, next) {
+  const origin = String(req.get('origin') || '').trim();
+  if (origin && origin !== canonical.origin) return res.status(403).send('Ungültige Request-Origin.');
   const a = Buffer.from(String(req.body?._csrf || '')); const b = Buffer.from(String(req.session.csrf || ''));
   if (!a.length || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).send('Ungültiges CSRF-Token. Seite neu laden.');
   next();
@@ -113,7 +160,7 @@ function cookieValue(req, name) { const raw=String(req.headers.cookie||'').split
 function cookieConsent(req) { try { const value=JSON.parse(Buffer.from(cookieValue(req,'sh_cookie_consent'),'base64url').toString('utf8')); return value&&value.v===1?value:null; } catch { return null; } }
 function render(req, res, title, body) { const settings=getSiteSettings(); res.send(layout({ title, body, user: currentUser(req), csrf: csrf(req), flash: takeFlash(req), lang: langOf(req), serviceDomain: settings.serviceDomain || 'status-hub.lol', cookieConsent: cookieConsent(req) })); }
 function requireLogin(req, res, next) { if (!currentUser(req)) return res.redirect('/login'); next(); }
-function requireAdmin(req, res, next) { const u = currentUser(req); if (!u) return res.redirect('/login'); if (u.role !== 'admin') return res.status(403).send('Keine Berechtigung'); next(); }
+function requireAdmin(req, res, next) { const u = currentUser(req); if (!u) return res.redirect('/login'); if (u.role !== 'admin') return res.status(403).send('Keine Berechtigung'); const ip=String(req.ip||'').replace(/^::ffff:/,''); if (adminIpAllowlist.size && !adminIpAllowlist.has(ip)) return res.status(403).send('Admin access is not allowed from this IP.'); next(); }
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
 function isAdmin(req) { return currentUser(req)?.role === 'admin'; }
 function statusLimit(user) { return effectivePlan(user).statusBotLimit; }
@@ -261,6 +308,7 @@ function applyPaypalServiceSubscription(record, details, reason = 'service_subsc
       name: `${service.nameDe || service.nameEn || 'Managed Bot'} #${instanceNumber}`,
       enabled: false,
       autoBanEnabled: false,
+      seedingNameEnabled: service.id === 'wardogs-warning-bot',
       welcomeWhisperEnabled: false,
       welcomeWhisperMessage: 'Hello {player}, welcome to the server! Join our Discord.',
       pollSeconds: service.id === PLAYTIME_SERVICE_ID ? 30 : 20,
@@ -582,7 +630,7 @@ app.get('/login', (req, res) => {
   render(req, res, 'status-hub.lol', `<section class="landing-hero"><div class="landing-copy"><span class="eyebrow">status-hub.lol</span><h1>${tr(lang,'Deine Discord Status-Bots. Einfach gehostet.','Your Discord status bots. Hosted simply.')}</h1><p>${tr(lang,'Erstelle Status-Bots für WARDOGS, FiveM, GameDig, JSON-APIs oder reine Text-Rotation. Ein kostenloser Bot ist inklusive.','Create status bots for WARDOGS, FiveM, GameDig, JSON APIs or text-only rotation. One free bot is included.')}</p><div class="actions wrap"><a class="button discord landing-cta" href="/auth/discord">${tr(lang,'Kostenlos mit Discord starten','Start free with Discord')}</a><a class="button ghost" href="/games">${tr(lang,'Unterstützte Games','Supported games')}</a></div><div class="landing-points"><span>✓ ${tr(lang,'1 Bot kostenlos','1 bot free')}</span><span>✓ ${tr(lang,'Deutsch & Englisch','German & English')}</span><span>✓ ${tr(lang,'Automatisch gehostet','Fully hosted')}</span></div></div><div class="landing-preview panel"><div class="preview-status"><span class="dot online"></span><div><strong>EU Server #1</strong><span>42/100 ${tr(lang,'Spieler online','players online')}</span></div></div><div class="preview-status"><span class="dot online"></span><div><strong>Minecraft</strong><span>Map: survival</span></div></div><div class="preview-status"><span class="dot starting"></span><div><strong>${tr(lang,'Text-Rotation','Text rotation')}</strong><span>Powered by status-hub.lol</span></div></div></div></section><section class="landing-features"><article class="panel"><span class="eyebrow">Games</span><h2>${tr(lang,'Hunderte','Hundreds')}</h2><p>${tr(lang,'Spiele verfügbar für deine Status-Bots.','Games available for your status bots.')}</p></article><article class="panel"><span class="eyebrow">Free</span><h2>1–5</h2><p>${tr(lang,'Ein Bot gratis. Mit der Branding-Kategorie sind je nach Servergröße bis zu 5 möglich.','One bot free. With the branding category, server size can unlock up to 5.')}</p></article><article class="panel"><span class="eyebrow">Premium</span><h2>5–20</h2><p>${tr(lang,'Mehr Bots und kein Powered-by-Branding.','More bots and no Powered-by branding.')}</p></article></section><section class="landing-bottom panel"><div><h2>${tr(lang,'In wenigen Minuten online','Online in minutes')}</h2><p>${tr(lang,'Discord Bot Token eintragen, Game auswählen und Status konfigurieren. Hosting und Updates übernimmt der Hub.','Enter a Discord bot token, choose a game and configure the status. The Hub handles hosting and updates.')}</p></div><a class="button primary" href="/auth/discord">${tr(lang,'Jetzt starten','Get started')}</a></section>`);
 });
 
-app.get('/auth/discord', rateLimit({ windowMs: 60_000, limit: 20 }), (req, res) => {
+app.get('/auth/discord', securityRateLimit('oauth-start', 10 * 60_000, 15), (req, res) => {
   const oauth = discordOAuthConfig();
   if (!oauth.enabled || !oauth.configured) {
     flash(req, 'err', l(req, 'Discord Login ist derzeit nicht eingerichtet oder deaktiviert.', 'Discord login is currently not configured or disabled.'));
@@ -590,20 +638,21 @@ app.get('/auth/discord', rateLimit({ windowMs: 60_000, limit: 20 }), (req, res) 
   }
   const returnTo = String(req.query.returnTo || '').trim();
   if (returnTo.startsWith('/') && !returnTo.startsWith('//')) req.session.oauthReturnTo = returnTo.slice(0, 500);
-  const state = crypto.randomBytes(24).toString('base64url'); req.session.oauthState = state;
+  const state = crypto.randomBytes(24).toString('base64url'); req.session.oauthState = state; req.session.oauthStateCreatedAt = Date.now();
   const params = new URLSearchParams({ client_id: oauth.clientId, response_type: 'code', redirect_uri: oauth.redirectUri, scope: 'identify', state });
   res.redirect(`https://discord.com/oauth2/authorize?${params}`);
 });
 
-app.get('/auth/discord/callback', rateLimit({ windowMs: 60_000, limit: 30 }), async (req, res) => {
+app.get('/auth/discord/callback', securityRateLimit('oauth-callback', 10 * 60_000, 20), async (req, res) => {
   try {
     const oauth = discordOAuthConfig();
     if (!oauth.enabled || !oauth.configured) throw new Error(l(req, 'Discord OAuth ist nicht vollständig eingerichtet.', 'Discord OAuth is not fully configured.'));
     const { code, state } = req.query;
-    if (!code || !state || state !== req.session.oauthState) throw new Error('OAuth state ungültig');
+    if (!code || !state || state !== req.session.oauthState || !Number.isFinite(Number(req.session.oauthStateCreatedAt)) || Date.now() - Number(req.session.oauthStateCreatedAt) > 10 * 60_000) throw new Error('OAuth state ungültig oder abgelaufen');
     const returnTo = String(req.session.oauthReturnTo || '/');
     const previousLang = req.session.lang;
     delete req.session.oauthState;
+    delete req.session.oauthStateCreatedAt;
     delete req.session.oauthReturnTo;
     const form = new URLSearchParams({ client_id: oauth.clientId, client_secret: oauth.clientSecret, grant_type: 'authorization_code', code: String(code), redirect_uri: oauth.redirectUri });
     const tokenResponse = await fetch('https://discord.com/api/v10/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
@@ -631,10 +680,13 @@ app.get('/auth/discord/callback', rateLimit({ windowMs: 60_000, limit: 30 }), as
       req.session.csrf = crypto.randomBytes(24).toString('base64url');
       res.redirect(returnTo.startsWith('/') && !returnTo.startsWith('//') ? returnTo : '/');
     });
-  } catch (error) { res.status(500).send(`Discord Login fehlgeschlagen: ${esc(error.message)}`); }
+  } catch (error) {
+    console.error('Discord OAuth failed:', String(error?.message || error).slice(0, 300));
+    res.status(500).send(l(req, 'Discord Login fehlgeschlagen. Bitte später erneut versuchen.', 'Discord login failed. Please try again later.'));
+  }
 });
 
-app.post('/logout', requireLogin, checkCsrf, (req, res) => req.session.destroy(() => res.redirect('/login')));
+app.post('/logout', requireLogin, checkCsrf, (req, res) => req.session.destroy(() => { res.clearCookie(sessionCookieName, { path: '/' }); res.redirect('/login'); }));
 
 
 app.post('/cookies/preferences', checkCsrf, (req,res) => {
@@ -647,7 +699,7 @@ app.post('/cookies/preferences', checkCsrf, (req,res) => {
 
 app.get('/cookies', (req,res) => {
   const lang=langOf(req); const pref=cookieConsent(req)||{necessary:true,analytics:false,marketing:false};
-  render(req,res,tr(lang,'Cookie-Einstellungen','Cookie settings'),`<div class="pagehead"><div><h1>${tr(lang,'Cookie-Einstellungen','Cookie settings')}</h1><p>${tr(lang,'Du kannst optionale Cookies jederzeit ablehnen oder deine Auswahl ändern.','You can reject optional cookies or change your choice at any time.')}</p></div></div><section class="panel"><h2>${tr(lang,'Kategorien','Categories')}</h2><form method="post" action="/cookies/preferences" class="formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="mode" value="custom"><input type="hidden" name="returnTo" value="/cookies"><label class="check span2"><input type="checkbox" checked disabled> <strong>${tr(lang,'Notwendig','Necessary')}</strong> · ${tr(lang,'Login, Session, CSRF-Schutz und Cookie-Auswahl. Immer aktiv.','Login, session, CSRF protection and cookie choice. Always active.')}</label><label class="check span2"><input type="checkbox" name="analytics" value="1" ${pref.analytics?'checked':''}> <strong>Analytics</strong> · ${tr(lang,'Optionale Reichweitenmessung. Derzeit ist kein Analytics-Dienst eingebunden.','Optional audience measurement. No analytics service is currently integrated.')}</label><label class="check span2"><input type="checkbox" name="marketing" value="1" ${pref.marketing?'checked':''}> <strong>Marketing</strong> · ${tr(lang,'Optionale Marketing-/Tracking-Dienste. Derzeit sind keine Marketing-Tracker eingebunden.','Optional marketing/tracking services. No marketing trackers are currently integrated.')}</label><div class="span2 actions"><button class="button ghost" type="submit" name="choice" value="reject">${tr(lang,'Optionale ablehnen','Reject optional')}</button><button class="button primary">${tr(lang,'Auswahl speichern','Save choices')}</button><button class="button ghost" type="submit" name="choice" value="accept">${tr(lang,'Alle akzeptieren','Accept all')}</button></div></form></section><section class="panel"><h2>${tr(lang,'Verwendete Cookies','Cookies in use')}</h2><div class="tablewrap"><table class="cookie-table"><thead><tr><th>Name</th><th>${tr(lang,'Zweck','Purpose')}</th><th>${tr(lang,'Dauer','Duration')}</th></tr></thead><tbody><tr><td><code>serverhub.sid</code></td><td>${tr(lang,'Notwendige Anmeldung, Session und Sicherheitsfunktionen.','Necessary login, session and security functions.')}</td><td>7 ${tr(lang,'Tage','days')}</td></tr><tr><td><code>sh_cookie_consent</code></td><td>${tr(lang,'Speichert deine Cookie-Auswahl.','Stores your cookie choices.')}</td><td>180 ${tr(lang,'Tage','days')}</td></tr></tbody></table></div><p class="muted small">${tr(lang,'Optionale Cookies werden erst nach Einwilligung gesetzt. In der aktuellen Version werden keine optionalen Analyse- oder Marketing-Cookies geladen.','Optional cookies are only set after consent. The current version does not load optional analytics or marketing cookies.')}</p></section>`);
+  render(req,res,tr(lang,'Cookie-Einstellungen','Cookie settings'),`<div class="pagehead"><div><h1>${tr(lang,'Cookie-Einstellungen','Cookie settings')}</h1><p>${tr(lang,'Du kannst optionale Cookies jederzeit ablehnen oder deine Auswahl ändern.','You can reject optional cookies or change your choice at any time.')}</p></div></div><section class="panel"><h2>${tr(lang,'Kategorien','Categories')}</h2><form method="post" action="/cookies/preferences" class="formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="mode" value="custom"><input type="hidden" name="returnTo" value="/cookies"><label class="check span2"><input type="checkbox" checked disabled> <strong>${tr(lang,'Notwendig','Necessary')}</strong> · ${tr(lang,'Login, Session, CSRF-Schutz und Cookie-Auswahl. Immer aktiv.','Login, session, CSRF protection and cookie choice. Always active.')}</label><label class="check span2"><input type="checkbox" name="analytics" value="1" ${pref.analytics?'checked':''}> <strong>Analytics</strong> · ${tr(lang,'Optionale Reichweitenmessung. Derzeit ist kein Analytics-Dienst eingebunden.','Optional audience measurement. No analytics service is currently integrated.')}</label><label class="check span2"><input type="checkbox" name="marketing" value="1" ${pref.marketing?'checked':''}> <strong>Marketing</strong> · ${tr(lang,'Optionale Marketing-/Tracking-Dienste. Derzeit sind keine Marketing-Tracker eingebunden.','Optional marketing/tracking services. No marketing trackers are currently integrated.')}</label><div class="span2 actions"><button class="button ghost" type="submit" name="choice" value="reject">${tr(lang,'Optionale ablehnen','Reject optional')}</button><button class="button primary">${tr(lang,'Auswahl speichern','Save choices')}</button><button class="button ghost" type="submit" name="choice" value="accept">${tr(lang,'Alle akzeptieren','Accept all')}</button></div></form></section><section class="panel"><h2>${tr(lang,'Verwendete Cookies','Cookies in use')}</h2><div class="tablewrap"><table class="cookie-table"><thead><tr><th>Name</th><th>${tr(lang,'Zweck','Purpose')}</th><th>${tr(lang,'Dauer','Duration')}</th></tr></thead><tbody><tr><td><code>${esc(sessionCookieName)}</code></td><td>${tr(lang,'Notwendige Anmeldung, Session und Sicherheitsfunktionen.','Necessary login, session and security functions.')}</td><td>7 ${tr(lang,'Tage','days')}</td></tr><tr><td><code>sh_cookie_consent</code></td><td>${tr(lang,'Speichert deine Cookie-Auswahl.','Stores your cookie choices.')}</td><td>180 ${tr(lang,'Tage','days')}</td></tr></tbody></table></div><p class="muted small">${tr(lang,'Optionale Cookies werden erst nach Einwilligung gesetzt. In der aktuellen Version werden keine optionalen Analyse- oder Marketing-Cookies geladen.','Optional cookies are only set after consent. The current version does not load optional analytics or marketing cookies.')}</p></section>`);
 });
 
 app.get('/games', (req, res) => {
@@ -905,15 +957,16 @@ function managedBotForm(req, service, bot) {
     <label class="span2">${tr(lang,'Automatische Announcements','Scheduled announcements')}<textarea name="announcementMessages" rows="5" maxlength="10050" placeholder="Welcome to our server!&#10;Read the rules in Discord.&#10;Have fun!">${esc(bot.announcementMessages||'')}</textarea><span class="muted small">${tr(lang,'Eine Nachricht pro Zeile, maximal 200 Zeichen. Die Nachrichten rotieren automatisch.','One message per line, maximum 200 characters. Messages rotate automatically.')}</span></label>
     <label class="check span2"><input type="checkbox" name="welcomeWhisperEnabled" value="1" ${bot.welcomeWhisperEnabled===true?'checked':''}> <strong>${tr(lang,'Join-Welcome-Whisper aktivieren','Enable join welcome whisper')}</strong></label>
     <label class="span2">${tr(lang,'Welcome-Whisper','Welcome whisper')}<textarea name="welcomeWhisperMessage" rows="3" maxlength="200" placeholder="Hello {player}, welcome to the server! Join our Discord: discord.gg/example">${esc(bot.welcomeWhisperMessage||'Hello {player}, welcome to the server! Join our Discord.')}</textarea><span class="muted small">${tr(lang,'Variablen: {player}, {steamid}, {faction}','Variables: {player}, {steamid}, {faction}')}</span></label>
+    <label class="check span2"><input type="checkbox" name="seedingNameEnabled" value="1" ${bot.seedingNameEnabled===true?'checked':''}> <strong>JOIN Seeding</strong> · ${tr(lang,'bei 1–20 Spielern automatisch hinter den WARDOGS-Servernamen setzen','automatically append behind the WARDOGS server name at 1–20 players')}</label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
     <div class="span2 managed-config-block"><strong>${tr(lang,'Ban-Nachrichten','Ban messages')}</strong><label>${tr(lang,'Discord Server / Invite-Link','Discord server / invite link')}<input name="banDiscordLink" maxlength="120" value="${esc(bot.banDiscordLink||'')}" placeholder="https://discord.gg/example"></label></div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Ban Templates','Ban templates')}</strong><button class="button ghost smallbtn" type="button" id="add-ban-template">+ Template</button></div><div id="managed-ban-templates" data-next-index="${managedBanTemplates(bot).length||1}">${banTemplateRows}</div></div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Steam Detection Rules','Steam detection rules')}</strong><button class="button ghost smallbtn" type="button" id="add-managed-rule">+ ${tr(lang,'Regel','Rule')}</button></div><div class="managed-steam-settings"><label>${tr(lang,'Steam Web API Key','Steam Web API key')}<input name="steamWebApiKey" type="password" autocomplete="new-password" placeholder="${bot.steamWebApiKeyEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):hasGlobalSteamKey?tr(lang,'Globaler Key ist konfiguriert','Global key is configured'):tr(lang,'Für Steam-Regeln erforderlich','Required for Steam rules')}"></label></div><div id="managed-rules" class="managed-rules" data-lang="${esc(lang)}" data-next-index="${rules.length}">${ruleRows||`<div class="muted small managed-rule-empty">${tr(lang,'Noch keine Detection Rule aktiv.','No detection rule active yet.')}</div>`}</div></div>
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
-    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
+    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSeedingNameError?`<div class="span2 warning"><strong>JOIN Seeding:</strong> ${esc(rt.lastSeedingNameError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
   </form>
   <section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
-  <script src="/managed.js?v=3.12.17" defer></script>`;
+  <script src="/managed.js?v=3.12.20" defer></script>`;
 }
 
 
@@ -921,14 +974,48 @@ function trackedDuration(seconds) {
   const total=Math.max(0,Math.floor(Number(seconds)||0)),hours=Math.floor(total/3600),minutes=Math.floor((total%3600)/60);
   return `${hours.toLocaleString('de-DE')}h ${minutes}m`;
 }
+function playtimeServersFromBody(req,bot) {
+  const existing=playtimeTrackerServers(bot),byId=new Map(existing.map((row)=>[row.id,row])),byUrl=new Map(existing.map((row)=>[String(row.baseUrl||'').toLowerCase(),row]));
+  const indexes=[...new Set(Object.keys(req.body||{}).map((key)=>{const m=key.match(/^trackerServerPresent_(\d+)$/);return m?Number(m[1]):null;}).filter((x)=>Number.isInteger(x)))].sort((a,b)=>a-b).slice(0,12);
+  if(!indexes.length)throw new Error(l(req,'Mindestens ein WARDOGS Server ist erforderlich.','At least one WARDOGS server is required.'));
+  const rows=[];
+  for(const [position,i] of indexes.entries()){
+    const rawId=String(req.body[`trackerServerId_${i}`]||'').trim();
+    const label=String(req.body[`trackerServerLabel_${i}`]||'').trim().slice(0,80)||`Server ${position+1}`;
+    const base=String(req.body[`trackerServerUrl_${i}`]||'').trim().replace(/\/+$/,'');
+    if(!/^https?:\/\//i.test(base))throw new Error(l(req,`${label}: WARDOGS URL muss mit http:// oder https:// beginnen.`,`${label}: WARDOGS URL must start with http:// or https://.`));
+    const previous=byId.get(rawId)||byUrl.get(base.toLowerCase())||null;
+    const id=previous?.id||crypto.randomUUID();
+    const secret=String(req.body[`trackerServerSecret_${i}`]||'').trim();
+    const secretEnc=secret?encryptSecret(secret):String(previous?.secretEnc||'');
+    if(!secretEnc)throw new Error(l(req,`${label}: RCON/API Passwort fehlt.`,`${label}: RCON/API password is required.`));
+    if(rows.some((row)=>row.baseUrl.toLowerCase()===base.toLowerCase()))throw new Error(l(req,`${label}: Dieser Server wurde doppelt eingetragen.`,`${label}: This server was added twice.`));
+    rows.push({id,label,baseUrl:base,secretEnc});
+  }
+  return rows;
+}
+
+function playtimeTrackerServerRow(req,row,index) {
+  const lang=langOf(req),hasSecret=Boolean(row?.secretEnc);
+  return `<div class="managed-config-block playtime-server-row" data-playtime-server-row>
+    <input type="hidden" name="trackerServerPresent_${index}" value="1"><input type="hidden" name="trackerServerId_${index}" value="${esc(row?.id||'')}">
+    <div class="row between"><strong>${tr(lang,'WARDOGS Server','WARDOGS server')} ${index+1}</strong><button type="button" class="button danger smallbtn" data-remove-playtime-server>×</button></div>
+    <div class="formgrid inner">
+      <label>${tr(lang,'Name','Name')}<input name="trackerServerLabel_${index}" maxlength="80" required value="${esc(row?.label||`Server ${index+1}`)}" placeholder="EU1"></label>
+      <label>WARDOGS API / RCON URL<input name="trackerServerUrl_${index}" required value="${esc(row?.baseUrl||'')}" placeholder="http://server.example.com:7776"></label>
+      <label class="span2">WARDOGS RCON / Bearer Password<input name="trackerServerSecret_${index}" type="password" autocomplete="new-password" placeholder="${hasSecret?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
+    </div>
+  </div>`;
+}
 function playtimeTrackerForm(req,service,bot) {
   const lang=langOf(req),u=currentUser(req),rt=playtimeBotRuntime(bot.id);
+  const servers=playtimeTrackerServers(bot); if(!servers.length)servers.push({id:'',label:'Server 1',baseUrl:'',secretEnc:''});
+  const serverRows=servers.map((row,i)=>playtimeTrackerServerRow(req,row,i)).join('');
   return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid" id="playtime-tracker-config">
     <input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="botId" value="${esc(bot.id)}">
     <label>${tr(lang,'Bot-Name','Bot name')}<input name="name" maxlength="80" required value="${esc(bot.name||service.nameDe||service.nameEn||'WARDOGS Playtime Tracker')}"></label>
     <label>Discord Bot Token (${tr(lang,'optional','optional')})<input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Nur für Discord Top 25 nötig','Only needed for Discord Top 25')}"></label>
-    <label class="span2">WARDOGS API / RCON URL<input name="wardogsBaseUrl" required value="${esc(bot.wardogsBaseUrl||'')}" placeholder="http://server.example.com:7776"></label>
-    <label class="span2">WARDOGS RCON / Bearer Password<input name="wardogsSecret" type="password" autocomplete="new-password" placeholder="${bot.wardogsSecretEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
+    <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Getrackte WARDOGS Server','Tracked WARDOGS servers')}</strong><button type="button" class="button ghost smallbtn" id="add-playtime-server">+ ${tr(lang,'Server','Server')}</button></div><div id="playtime-servers" data-next-index="${servers.length}">${serverRows}</div></div>
     <label>${tr(lang,'Prüfintervall','Poll interval')}<input name="pollSeconds" type="number" min="10" max="300" value="${esc(bot.pollSeconds||30)}"><span class="muted small">10–300 s</span></label>
     <label>${tr(lang,'Statistik-Zeitzone','Statistics timezone')}<input name="statsTimezone" maxlength="80" value="${esc(bot.statsTimezone||'Europe/Vienna')}" placeholder="Europe/Vienna"></label>
     <label class="span2">Discord Top-25 Channel ID (${tr(lang,'optional','optional')})<input name="leaderboardChannelId" inputmode="numeric" value="${esc(bot.leaderboardChannelId||'')}" placeholder="123456789012345678"></label>
@@ -937,19 +1024,24 @@ function playtimeTrackerForm(req,service,bot) {
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
     ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastLeaderboardError?`<div class="span2 warning"><strong>Discord Leaderboard:</strong> ${esc(rt.lastLeaderboardError)}</div>`:''}
-  </form><section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>`;
+  </form><section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
+  <script>(()=>{const box=document.getElementById('playtime-servers'),add=document.getElementById('add-playtime-server');if(!box||!add)return;const remove=(b)=>{if(box.querySelectorAll('[data-playtime-server-row]').length<=1)return;b.closest('[data-playtime-server-row]')?.remove()};box.querySelectorAll('[data-remove-playtime-server]').forEach(b=>b.addEventListener('click',()=>remove(b)));add.addEventListener('click',()=>{const i=Number(box.dataset.nextIndex||0);if(box.querySelectorAll('[data-playtime-server-row]').length>=12)return;box.dataset.nextIndex=String(i+1);const wrap=document.createElement('div');wrap.innerHTML=${JSON.stringify(playtimeTrackerServerRow(req,{id:'',label:'',baseUrl:'',secretEnc:''},999))}.replaceAll('_999','_'+i).replace('WARDOGS Server 1000','WARDOGS Server '+(i+1)).replace('WARDOGS server 1000','WARDOGS server '+(i+1)).replace('value="Server 1000"','value="Server '+(i+1)+'"');const row=wrap.firstElementChild;box.append(row);row.querySelector('[data-remove-playtime-server]')?.addEventListener('click',()=>remove(row.querySelector('[data-remove-playtime-server]')));});})();</script>`;
 }
 function playtimeStatsPanel(req,bot) {
-  const snap=playtimeTrackerSnapshot(bot),token=esc(csrf(req));
+  const snap=playtimeTrackerSnapshot(bot),token=esc(csrf(req)),query=String(req.query.playerq||'').trim().slice(0,100),q=query.toLowerCase();
   const topRows=snap.top25.map((p,i)=>`<tr><td>${i+1}</td><td><strong>${esc(p.name)}</strong><div class="muted small"><a href="https://steamcommunity.com/profiles/${esc(p.steamId)}" target="_blank" rel="noopener">${esc(p.steamId)}</a>${p.online?' · online':''}</div></td><td>${esc(p.clanTag||'—')}</td><td><strong>${esc(trackedDuration(p.totalSeconds))}</strong></td></tr>`).join('');
   const hourRows=snap.hours.map((h)=>`<tr><td>${String(h.hour).padStart(2,'0')}:00–${String((h.hour+1)%24).padStart(2,'0')}:00</td><td>${h.samples?Number(h.averagePlayers).toFixed(1):'0.0'}</td><td>${esc(h.maxPlayers)}</td></tr>`).join('');
   const clanRows=snap.clans.slice(0,15).map((c,i)=>`<tr><td>${i+1}</td><td><strong>${esc(c.tag)}</strong></td><td>${esc(c.players)}</td><td>${esc(trackedDuration(c.totalSeconds))}</td></tr>`).join('');
+  const serverRows=(snap.servers||[]).map((s)=>`<tr><td><strong>${esc(s.label)}</strong></td><td>${esc(s.onlinePlayers)}</td><td>${esc(s.uniquePlayers)}</td><td>${esc(trackedDuration(s.totalSeconds))}</td><td>${s.lastPollAt?esc(new Date(s.lastPollAt).toLocaleString(localeCode(langOf(req)))):'—'}</td></tr>`).join('');
+  const matches=q?snap.rows.filter((p)=>String(p.name||'').toLowerCase().includes(q)||String(p.steamId||'').includes(q)).slice(0,25):[];
+  const searchRows=matches.map((p)=>`<tr><td><strong>${esc(p.name)}</strong><div class="muted small"><a href="https://steamcommunity.com/profiles/${esc(p.steamId)}" target="_blank" rel="noopener">${esc(p.steamId)}</a>${p.online?' · online':''}</div></td><td><strong>${esc(trackedDuration(p.totalSeconds))}</strong></td><td>${esc(p.sessionCount||0)}</td><td>${p.lastSeenAt?esc(new Date(p.lastSeenAt).toLocaleString(localeCode(langOf(req)))):'—'}</td><td>${(p.servers||[]).filter((x)=>x.totalSeconds>0||x.online).map((x)=>`<div><strong>${esc(x.label)}</strong> · ${esc(trackedDuration(x.totalSeconds))}${x.online?' · online':''}</div>`).join('')||'—'}</td></tr>`).join('');
   return `<section class="playtime-dashboard">
     <div class="pagehead compact"><div><span class="eyebrow">WARDOGS Playtime</span><h2>${l(req,'Tracker Statistiken','Tracker statistics')}</h2></div><div class="actions wrap"><form method="post" action="/managed-bots/${esc(bot.id)}/playtime/refresh" class="inline"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="publish" value="0"><button class="button primary">${l(req,'Jetzt aktualisieren','Refresh now')}</button></form>${bot.leaderboardChannelId?`<form method="post" action="/managed-bots/${esc(bot.id)}/playtime/refresh" class="inline"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="publish" value="1"><button class="button ghost">${l(req,'Discord Top 25 aktualisieren','Refresh Discord Top 25')}</button></form>`:''}</div></div>
-    <section class="admin-stats"><article class="panel"><span class="eyebrow">${l(req,'Online','Online')}</span><strong>${esc(snap.onlinePlayers)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Getrackte Spieler','Tracked players')}</span><strong>${esc(snap.uniquePlayers)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Gesamtspielzeit','Total playtime')}</span><strong>${esc(trackedDuration(snap.totalSeconds))}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Zeitzone','Timezone')}</span><strong class="smallstat">${esc(snap.timezone)}</strong></article></section>
+    <section class="admin-stats"><article class="panel"><span class="eyebrow">${l(req,'Online','Online')}</span><strong>${esc(snap.onlinePlayers)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Getrackte Spieler','Tracked players')}</span><strong>${esc(snap.uniquePlayers)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Gesamtspielzeit','Total playtime')}</span><strong>${esc(trackedDuration(snap.totalSeconds))}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Server','Servers')}</span><strong>${esc((snap.servers||[]).length)}</strong></article></section>
+    <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">${l(req,'Spielersuche','Player search')}</span><h2>${l(req,'Spielzeit suchen','Search playtime')}</h2></div></div><form method="get" action="/bot-services/${encodeURIComponent(bot.serviceId)}/manage" class="managed-add-row"><input type="hidden" name="bot" value="${esc(bot.id)}"><input name="playerq" maxlength="100" value="${esc(query)}" placeholder="${l(req,'Name oder Steam64ID','Name or Steam64ID')}"><button class="button primary smallbtn">${l(req,'Suchen','Search')}</button></form>${query?`<table><thead><tr><th>${l(req,'Spieler','Player')}</th><th>${l(req,'Gesamtspielzeit','Total playtime')}</th><th>Sessions</th><th>${l(req,'Letzte Aktivität','Last activity')}</th><th>${l(req,'Server','Servers')}</th></tr></thead><tbody>${searchRows||`<tr><td colspan="5">${l(req,'Kein Spieler gefunden.','No player found.')}</td></tr>`}</tbody></table>`:''}</div>
+    <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">${l(req,'Server','Servers')}</span><h2>${l(req,'Server-Übersicht','Server overview')}</h2></div></div><table><thead><tr><th>${l(req,'Server','Server')}</th><th>${l(req,'Online','Online')}</th><th>${l(req,'Spieler','Players')}</th><th>${l(req,'Spielzeit','Playtime')}</th><th>${l(req,'Letzter Poll','Last poll')}</th></tr></thead><tbody>${serverRows}</tbody></table></div>
     <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">Leaderboard</span><h2>Top 25</h2></div></div><table><thead><tr><th>#</th><th>${l(req,'Spieler','Player')}</th><th>Clan</th><th>${l(req,'Spielzeit','Playtime')}</th></tr></thead><tbody>${topRows||`<tr><td colspan="4">${l(req,'Noch keine Spielzeit erfasst.','No playtime tracked yet.')}</td></tr>`}</tbody></table></div>
     <div class="managed-live-grid"><div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">${l(req,'Aktivität','Activity')}</span><h2>${l(req,'Stärkste Tageszeiten','Peak hours')}</h2></div></div><table><thead><tr><th>${l(req,'Stunde','Hour')}</th><th>Ø ${l(req,'Spieler','Players')}</th><th>Max</th></tr></thead><tbody>${hourRows}</tbody></table></div><div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">Clan Tags</span><h2>${l(req,'Meistgenutzte Tags','Most used tags')}</h2></div></div><table><thead><tr><th>#</th><th>Tag</th><th>${l(req,'Spieler','Players')}</th><th>${l(req,'Spielzeit','Playtime')}</th></tr></thead><tbody>${clanRows||`<tr><td colspan="4">${l(req,'Noch keine Clan-Tags erkannt.','No clan tags detected yet.')}</td></tr>`}</tbody></table></div></div>
-    <div class="panel help"><strong>${l(req,'Letzter Poll','Last poll')}:</strong> ${snap.lastPollAt?esc(new Date(snap.lastPollAt).toLocaleString(localeCode(langOf(req)))):'—'} · <strong>Discord:</strong> ${bot.lastLeaderboardAt?esc(new Date(bot.lastLeaderboardAt).toLocaleString(localeCode(langOf(req)))):l(req,'noch nicht veröffentlicht','not published yet')}</div>
   </section>`;
 }
 
@@ -1063,7 +1155,7 @@ function managedInstancesPanel(req,service,bots,selectedBot,subscriptions){
 app.post('/bot-services/:id/admin-activate', requireAdmin, checkCsrf, (req,res)=>{
   const service=getBotService(req.params.id),user=currentUser(req); if(!supportedManagedService(service))return res.status(404).send('Service not found');
   const existing=managedServicesForUser(user.discordId,service.id);
-  const bot=upsertManagedBot({ownerDiscordId:user.discordId,serviceId:service.id,name:`${service.nameDe||service.nameEn||'WARDOGS Bot'} #${existing.length+1}`,enabled:false,autoBanEnabled:false,welcomeWhisperEnabled:false,welcomeWhisperMessage:'Hello {player}, welcome to the server! Join our Discord.',pollSeconds:service.id===PLAYTIME_SERVICE_ID?30:20,rulesText:'',statsTimezone:'Europe/Vienna',adminGrant:true,accessSource:'admin',accessRecordId:'',accessUntil:null});
+  const bot=upsertManagedBot({ownerDiscordId:user.discordId,serviceId:service.id,name:`${service.nameDe||service.nameEn||'WARDOGS Bot'} #${existing.length+1}`,enabled:false,autoBanEnabled:false,seedingNameEnabled:service.id==='wardogs-warning-bot',welcomeWhisperEnabled:false,welcomeWhisperMessage:'Hello {player}, welcome to the server! Join our Discord.',pollSeconds:service.id===PLAYTIME_SERVICE_ID?30:20,rulesText:'',statsTimezone:'Europe/Vienna',adminGrant:true,accessSource:'admin',accessRecordId:'',accessUntil:null});
   rebalanceAssignments();
   flash(req,'ok',l(req,'Neue Managed-Bot-Instanz wurde für deinen Admin-Account kostenlos angelegt.','A new managed-bot instance was created free for your admin account.'));
   res.redirect(managedManageUrl(service.id,bot.id));
@@ -1148,12 +1240,12 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
   if(service.id===PLAYTIME_SERVICE_ID){
     try{
       const name=String(req.body.name||'').trim().slice(0,80); if(!name)throw new Error(l(req,'Bot-Name fehlt.','Bot name is required.'));
-      const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
+      const playtimeServers=playtimeServersFromBody(req,bot);
       const leaderboardChannelId=String(req.body.leaderboardChannelId||'').trim(); if(leaderboardChannelId&&!validSnowflake(leaderboardChannelId))throw new Error(l(req,'Discord Top-25 Channel ID ist ungültig.','Discord Top 25 channel ID is invalid.'));
       const statsTimezone=String(req.body.statsTimezone||'Europe/Vienna').trim().slice(0,80)||'Europe/Vienna'; try{new Intl.DateTimeFormat('en-US',{timeZone:statsTimezone}).format(new Date());}catch{throw new Error(l(req,'Ungültige IANA-Zeitzone, z. B. Europe/Vienna.','Invalid IANA timezone, e.g. Europe/Vienna.'));}
-      const patch={id:bot.id,name,wardogsBaseUrl,leaderboardChannelId,statsTimezone,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||30)),autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+      const primary=playtimeServers[0];
+      const patch={id:bot.id,name,playtimeServers,wardogsBaseUrl:primary.baseUrl,wardogsSecretEnc:primary.secretEnc,leaderboardChannelId,statsTimezone,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||30)),autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
       const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(leaderboardChannelId&&!bot.botTokenEnc)throw new Error(l(req,'Für den Discord Top-25 Channel ist ein Discord Bot Token erforderlich.','A Discord bot token is required for the Discord Top 25 channel.'));
-      const secret=String(req.body.wardogsSecret||'').trim(); if(secret)patch.wardogsSecretEnc=encryptSecret(secret); else if(!bot.wardogsSecretEnc)throw new Error(l(req,'WARDOGS RCON/API Passwort fehlt.','WARDOGS RCON/API password is required.'));
       bot=upsertManagedBot(patch); rebalanceAssignments(); await syncAllServiceBots();
       flash(req,'ok',l(req,'Playtime Tracker gespeichert.','Playtime tracker saved.'));
     }catch(error){flash(req,'err',error.message);}
@@ -1179,7 +1271,7 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     const welcomeWhisperMessage=String(req.body.welcomeWhisperMessage||'').trim();
     if(welcomeWhisperMessage.length>200)throw new Error(l(req,'Der Welcome-Whisper darf maximal 200 Zeichen lang sein.','The welcome whisper may contain at most 200 characters.'));
     if(welcomeWhisperEnabled&&!welcomeWhisperMessage)throw new Error(l(req,'Für den Join-Welcome-Whisper muss eine Nachricht eingetragen sein.','A message is required when the join welcome whisper is enabled.'));
-    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,banTemplates,banDiscordLink,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,banTemplates,banDiscordLink,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,seedingNameEnabled:req.body.seedingNameEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
     if(patch.announcementEnabled&&!announcementMessages.length)throw new Error(l(req,'Für automatische Announcements muss mindestens eine Nachricht eingetragen sein.','At least one message is required when scheduled announcements are enabled.'));
     const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(!bot.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
     const steamKey=String(req.body.steamWebApiKey||'').trim(); if(steamKey)patch.steamWebApiKeyEnc=encryptSecret(steamKey);
@@ -1193,10 +1285,16 @@ app.post('/bot-services/:id/test', requireLogin, checkCsrf, async(req,res)=>{
   const service=getBotService(req.params.id),user=currentUser(req); if(!supportedManagedService(service))return res.status(404).send('Service not found');
   const old=getManagedBot(String(req.body.botId||'')); if(!old||old.ownerDiscordId!==user.discordId||old.serviceId!==service.id)return res.status(404).send('Managed bot instance not found'); if(!managedAccessActive(old)&&user.role!=='admin')return res.status(403).send('Service access required');
   try{
-    const test={...old,wardogsBaseUrl:String(req.body.wardogsBaseUrl||old.wardogsBaseUrl||'').trim().replace(/\/+$/,''),allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(old.allowPrivateTarget)};
-    const secret=String(req.body.wardogsSecret||'').trim(); if(secret)test.wardogsSecretEnc=encryptSecret(secret);
+    let test={...old,allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(old.allowPrivateTarget)};
+    if(service.id===PLAYTIME_SERVICE_ID){
+      const playtimeServers=playtimeServersFromBody(req,old),primary=playtimeServers[0];
+      test={...test,playtimeServers,wardogsBaseUrl:primary.baseUrl,wardogsSecretEnc:primary.secretEnc};
+    }else{
+      test.wardogsBaseUrl=String(req.body.wardogsBaseUrl||old.wardogsBaseUrl||'').trim().replace(/\/+$/,'');
+      const secret=String(req.body.wardogsSecret||'').trim(); if(secret)test.wardogsSecretEnc=encryptSecret(secret);
+    }
     const token=String(req.body.botToken||'').trim(); if(token)await validateBotToken(token); else if(service.id!==PLAYTIME_SERVICE_ID&&!old.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
-    const result=service.id===PLAYTIME_SERVICE_ID?await testPlaytimeWardogs(test):await testManagedWardogs(test); flash(req,'ok',l(req,`WARDOGS Verbindung OK · ${result.playerCount} Spieler über /v1/players.`,`WARDOGS connection OK · ${result.playerCount} players via /v1/players.`));
+    const result=service.id===PLAYTIME_SERVICE_ID?await testPlaytimeWardogs(test):await testManagedWardogs(test); flash(req,'ok',service.id===PLAYTIME_SERVICE_ID?l(req,`WARDOGS Verbindung OK · ${result.serverCount} Server · ${result.playerCount} Spieler.`,`WARDOGS connection OK · ${result.serverCount} servers · ${result.playerCount} players.`):l(req,`WARDOGS Verbindung OK · ${result.playerCount} Spieler über /v1/players.`,`WARDOGS connection OK · ${result.playerCount} players via /v1/players.`));
   }catch(error){flash(req,'err',`${l(req,'Test fehlgeschlagen','Test failed')}: ${error.message}`);}res.redirect(managedManageUrl(service.id,old.id));
 });
 
@@ -1225,8 +1323,8 @@ app.post('/managed-bots/:id/stop', requireLogin, checkCsrf, async(req,res)=>{con
 
 function managedConfigPayload(bot){
   const base={format:'status-hub-managed-bot-config',version:1,serviceId:String(bot.serviceId||''),name:String(bot.name||''),pollSeconds:Number(bot.pollSeconds||20),autoRecoveryEnabled:bot.autoRecoveryEnabled!==false,wardogsBaseUrl:String(bot.wardogsBaseUrl||'')};
-  if(bot.serviceId===PLAYTIME_SERVICE_ID)return {...base,leaderboardChannelId:String(bot.leaderboardChannelId||''),statsTimezone:String(bot.statsTimezone||'Europe/Vienna')};
-  return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),banDiscordLink:String(bot.banDiscordLink||''),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||'')};
+  if(bot.serviceId===PLAYTIME_SERVICE_ID)return {...base,playtimeServers:playtimeTrackerServers(bot).map((row)=>({id:row.id,label:row.label,baseUrl:row.baseUrl})),leaderboardChannelId:String(bot.leaderboardChannelId||''),statsTimezone:String(bot.statsTimezone||'Europe/Vienna')};
+  return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),banDiscordLink:String(bot.banDiscordLink||''),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||''),seedingNameEnabled:bot.seedingNameEnabled===true};
 }
 app.get('/managed-bots/:id/config/export',requireLogin,(req,res)=>{
   const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');
@@ -1252,6 +1350,12 @@ app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkC
       const channel=String(data.leaderboardChannelId||'').trim();if(channel&&!validSnowflake(channel))throw new Error(l(req,'Discord Top-25 Channel ID in der Config ist ungültig.','Discord Top 25 channel ID in config is invalid.'));
       patch.leaderboardChannelId=channel;
       const tz=String(data.statsTimezone||'Europe/Vienna').trim().slice(0,80)||'Europe/Vienna';new Intl.DateTimeFormat('en-US',{timeZone:tz}).format(new Date());patch.statsTimezone=tz;
+      if(Array.isArray(data.playtimeServers)&&data.playtimeServers.length){
+        const existing=playtimeTrackerServers(bot),byId=new Map(existing.map((row)=>[row.id,row])),byUrl=new Map(existing.map((row)=>[String(row.baseUrl||'').toLowerCase(),row]));
+        patch.playtimeServers=data.playtimeServers.slice(0,12).map((row,index)=>{const url=String(row?.baseUrl||'').trim().replace(/\/+$/,'');if(!/^https?:\/\//i.test(url))throw new Error(l(req,`Server ${index+1}: ungültige WARDOGS URL in der Config.`,`Server ${index+1}: invalid WARDOGS URL in config.`));const id=String(row?.id||'').trim(),old=byId.get(id)||byUrl.get(url.toLowerCase())||null;return{id:old?.id||crypto.randomUUID(),label:String(row?.label||`Server ${index+1}`).trim().slice(0,80)||`Server ${index+1}`,baseUrl:url,secretEnc:String(old?.secretEnc||'')};});
+        const primary=patch.playtimeServers[0];patch.wardogsBaseUrl=primary.baseUrl;if(primary.secretEnc)patch.wardogsSecretEnc=primary.secretEnc;
+        if(patch.playtimeServers.some((row)=>!row.secretEnc))patch.enabled=false;
+      }
     }else{
       const alert=String(data.alertChannelId||'').trim();if(alert&&!validSnowflake(alert))throw new Error(l(req,'Alert Channel ID in der Config ist ungültig.','Alert channel ID in config is invalid.'));if(alert)patch.alertChannelId=alert;
       const mention=String(data.mentionRoleId||'').trim();if(mention&&!validSnowflake(mention))throw new Error(l(req,'Rollen-ID in der Config ist ungültig.','Role ID in config is invalid.'));patch.mentionRoleId=mention;
@@ -1262,7 +1366,7 @@ app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkC
       patch.rulesText=String(data.rulesText||'').slice(0,50000);parseManagedRules(patch.rulesText);
       patch.autoBanEnabled=data.autoBanEnabled===true;
       patch.announcementEnabled=data.announcementEnabled===true;patch.announcementIntervalMinutes=Math.max(1,Math.min(1440,Number(data.announcementIntervalMinutes)||15));patch.announcementMessages=String(data.announcementMessages||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean).slice(0,50).map((x)=>x.slice(0,200)).join('\n');
-      patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);
+      patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);patch.seedingNameEnabled=data.seedingNameEnabled===true;
     }
     upsertManagedBot(patch);await syncAllServiceBots();flash(req,'ok',l(req,'Config importiert. Tokens, Passwörter, Abo-/Besitzdaten und Laufzeitstatistiken wurden nicht überschrieben.','Config imported. Tokens, passwords, subscription/ownership data and runtime statistics were not overwritten.'));
   }catch(error){flash(req,'err',`${l(req,'Config-Import fehlgeschlagen','Config import failed')}: ${error.message}`);}
@@ -1918,7 +2022,7 @@ app.get('/custom-bots/new', requireLogin, (req,res)=>{
   render(req,res,l(req,'Custom Bot hochladen','Upload custom bot'),`<div class="pagehead"><div><h1>${l(req,'Custom Bot hochladen','Upload custom bot')}</h1><p>${l(req,'ZIP mit Sourcecode; jeder Upload benötigt Admin-Freigabe.','ZIP with source code; every upload requires admin approval.')}</p></div></div>${customBotForm({csrf:csrf(req),lang:langOf(req)})}`);
 });
 
-app.post('/custom-bots/new', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), customBotUpload, checkCsrf, async (req,res)=>{
+app.post('/custom-bots/new', requireLogin, securityRateLimit('custom-upload-burst', 60_000, 3), securityRateLimit('custom-upload', 60 * 60_000, 12), customBotUpload, checkCsrf, async (req,res)=>{
   let preparedId='';
   try{
     const u=currentUser(req); const count=readDb().customBots.filter((b)=>b.ownerDiscordId===u.discordId).length;
@@ -1946,7 +2050,7 @@ app.post('/custom-bots/new', requireLogin, rateLimit({ windowMs: 60_000, limit: 
 
 app.post('/custom-bots/:id/approve', requireAdmin, checkCsrf, async (req,res)=>{let b=null;try{b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');const bot=upsertCustomBot({id:b.id,approvalState:'approved',enabled:true,reviewNote:l(req,'Von Admin freigegeben','Approved by admin')});rebalanceAssignments();await ensureCustomBot(bot);flash(req,'ok',l(req,'Custom Bot freigegeben und gestartet.','Custom bot approved and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,approvalState:'approved',enabled:false,reviewNote:l(req,`Freigegeben, Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Approved, start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect('/admin?tab=bots#bots');});
 app.post('/custom-bots/:id/revoke', requireAdmin, checkCsrf, async (req,res)=>{const b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,approvalState:'rejected',enabled:false,reviewNote:l(req,'Freigabe entzogen','Approval revoked')});rebalanceAssignments();flash(req,'ok',l(req,'Freigabe entzogen.','Approval revoked.'));res.redirect('/admin?tab=bots#bots');});
-app.post('/custom-bots/:id/start', requireLogin, checkCsrf, async (req,res)=>{let b=null;const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');try{b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});rebalanceAssignments();await restartCustomBot(bot);upsertCustomBot({id:b.id,reviewNote:''});flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,enabled:false,reviewNote:l(req,`Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
+app.post('/custom-bots/:id/start', requireLogin, securityRateLimit('custom-rebuild', 60 * 60_000, 30), checkCsrf, async (req,res)=>{let b=null;const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');try{b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});rebalanceAssignments();await restartCustomBot(bot);upsertCustomBot({id:b.id,reviewNote:''});flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,enabled:false,reviewNote:l(req,`Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
 app.post('/custom-bots/:id/stop', requireLogin, checkCsrf, async (req,res)=>{const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,enabled:false});rebalanceAssignments();flash(req,'ok',l(req,'Custom Bot gestoppt.','Custom bot stopped.'));res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
 app.get('/custom-bots/:id/source', requireLogin, (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');const file=`custom-bots/${b.id}/source.zip`;res.download(file,`${String(b.name||'custom-bot').replace(/[^A-Za-z0-9._-]+/g,'_')}.zip`);});
 app.get('/custom-bots/:id/logs', requireLogin, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');let logs='';try{logs=(await customBotLogs(b)).logs||'';}catch(e){logs=`Logs unavailable: ${e.message}`;}render(req,res,'Custom Bot Logs',`<div class="pagehead"><div><h1>${esc(b.name)} · Logs</h1></div><a class="button ghost" href="/custom-bots">${l(req,'Zurück','Back')}</a></div><pre class="panel logbox">${esc(logs)}</pre>`);});
@@ -2284,5 +2388,10 @@ const httpServer = app.listen(port, async () => {
   setTimeout(() => { refreshDueFreeBoosts().then(()=>rebalanceAssignments()).catch(()=>{}); }, 5000).unref();
   setInterval(() => { refreshDueFreeBoosts().then(()=>rebalanceAssignments()).catch(()=>{}); }, 15 * 60_000).unref();
 });
+httpServer.headersTimeout = 15_000;
+httpServer.requestTimeout = 30_000;
+httpServer.keepAliveTimeout = 5_000;
+httpServer.maxRequestsPerSocket = 1000;
+httpServer.maxHeadersCount = 100;
 async function shutdown(signal){console.log(`\n${signal}: fahre herunter...`);try{await Promise.all([shutdownManagedBots(),shutdownPlaytimeBots()]);}catch(error){console.error('Managed bot shutdown:',error.message);}httpServer.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();}
 process.on('SIGINT',()=>shutdown('SIGINT')); process.on('SIGTERM',()=>shutdown('SIGTERM'));

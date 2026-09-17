@@ -12,7 +12,7 @@ import {
   TextInputStyle
 } from 'discord.js';
 import { decryptSecret } from './crypto.js';
-import { assertSafeUrl } from './target-safety.js';
+import { safeHttpText } from './target-safety.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
 import { parseManagedRules, evaluateManagedRules, matchManagedRules, managedRulesNeedSteam } from './managed-rules.js';
 import { getSteamRiskProfiles, steamApiKeyAvailable } from './steam-risk.js';
@@ -27,6 +27,9 @@ const runtime = new Map();
 const discordUiState = new Map();
 const lifecycleLocks = new Map();
 const recoveryState = new Map();
+const WELCOME_MAX_ATTEMPTS = 24;
+const WELCOME_RETRY_MS = 5000;
+const SEEDING_SUFFIX = 'JOIN Seeding';
 
 function withLifecycleLock(id, task) {
   const key = String(id || '');
@@ -80,6 +83,14 @@ function playerSteamId(player) {
   return '';
 }
 
+function playerWardogsApiId(player) {
+  for (const key of ['steamId','steamId64','steamID','steamID64','playerSteamId','playerId']) {
+    const raw = String(player?.[key] ?? '').trim();
+    if (raw) return raw;
+  }
+  return playerSteamId(player);
+}
+
 function playerFaction(player) {
   const raw = player?.faction;
   if (raw && typeof raw === 'object') return String(raw.name ?? raw.label ?? raw.id ?? '').trim();
@@ -110,7 +121,8 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
   if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
   if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
-  const activeIds = state.joinTracker?.active instanceof Set ? state.joinTracker.active : new Set();
+  const tracker = state.welcomeJoinTracker || state.joinTracker;
+  const activeIds = tracker?.active instanceof Set ? tracker.active : new Set();
   for (const id of [...state.welcomePending]) if (!activeIds.has(id)) state.welcomePending.delete(id);
   for (const id of [...state.welcomeDelivered]) if (!activeIds.has(id)) state.welcomeDelivered.delete(id);
   for (const id of [...state.welcomeFailed]) if (!activeIds.has(id)) state.welcomeFailed.delete(id);
@@ -133,7 +145,7 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
   for (const steamId of [...state.welcomePending]) {
     const player = bySteamId.get(steamId);
     if (!player || !playerHasFaction(player) || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
-    if (Number(state.welcomeAttempts.get(steamId) || 0) >= 4) continue;
+    if (Number(state.welcomeAttempts.get(steamId) || 0) >= WELCOME_MAX_ATTEMPTS) continue;
     targets.push({ ...player, steamId });
   }
   return targets;
@@ -158,7 +170,7 @@ export function managedWelcomeFailed(state, steamId, { retryable = true } = {}) 
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
   const attempts = Number(state.welcomeAttempts.get(id) || 0) + 1;
   state.welcomeAttempts.set(id, attempts);
-  const retry = Boolean(retryable) && attempts < 4;
+  const retry = Boolean(retryable) && attempts < WELCOME_MAX_ATTEMPTS;
   if (!retry) {
     state.welcomePending.delete(id);
     state.welcomeFailed.add(id);
@@ -256,19 +268,16 @@ export function managedSteamRuleStatus(bot) {
 async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
   if (!root) throw new Error('WARDOGS base URL is missing');
-  const url = await assertSafeUrl(`${root}${pathname}`, { allowPrivate: Boolean(bot?.allowPrivateTarget) });
   let secret = '';
   try { secret = decryptSecret(bot?.wardogsSecretEnc); } catch { secret = ''; }
   if (!secret) throw new Error('WARDOGS RCON/API password is missing');
-  const response = await fetch(url, {
-    method,
-    redirect: 'manual',
+  const response = await safeHttpText(`${root}${pathname}`, {
+    allowPrivate: Boolean(bot?.allowPrivateTarget), method,
     headers: { Accept: 'application/json', Authorization: `Bearer ${secret}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(8000)
+    body: body === undefined ? undefined : JSON.stringify(body), timeoutMs: 8000, maxBytes: 1024 * 1024
   });
   if (response.status >= 300 && response.status < 400) throw new Error('WARDOGS API redirects are not allowed');
-  const text = (await response.text()).slice(0, 1024 * 1024);
+  const text = response.text;
   let data = {};
   if (text) { try { data = JSON.parse(text); } catch { data = { message: text.slice(0, 300) }; } }
   if (!response.ok) {
@@ -280,6 +289,109 @@ async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
     throw error;
   }
   return data;
+}
+
+
+async function wardogsTextRequest(bot, pathname, { method = 'GET', textBody, headers = {} } = {}) {
+  const root = baseUrl(bot?.wardogsBaseUrl);
+  if (!root) throw new Error('WARDOGS base URL is missing');
+  let secret = '';
+  try { secret = decryptSecret(bot?.wardogsSecretEnc); } catch { secret = ''; }
+  if (!secret) throw new Error('WARDOGS RCON/API password is missing');
+  const response = await safeHttpText(`${root}${pathname}`, {
+    allowPrivate: Boolean(bot?.allowPrivateTarget),
+    method,
+    headers: { Accept: 'application/json', Authorization: `Bearer ${secret}`, ...headers },
+    body: textBody,
+    timeoutMs: 8000,
+    maxBytes: 1024 * 1024
+  });
+  if (response.status >= 300 && response.status < 400) throw new Error('WARDOGS API redirects are not allowed');
+  let data = {};
+  if (response.text) {
+    try { data = JSON.parse(response.text); }
+    catch { data = { message: response.text.slice(0, 300) }; }
+  }
+  if (!response.ok) {
+    const detail = data?.error?.message || data?.message || data?.error || 'Error';
+    const error = new Error(`WARDOGS API ${response.status}: ${String(detail).slice(0, 240)}`);
+    error.status = response.status;
+    error.code = String(data?.error?.code || data?.code || '');
+    error.detail = String(detail || '');
+    throw error;
+  }
+  return { data, headers: response.headers || {} };
+}
+
+function managedServerNameWritable(config) {
+  if (config?.writable === false) return { writable: false, lockedBy: 'WARDOGS config is read-only' };
+  const sections = Array.isArray(config?.sections) ? config.sections : [];
+  const section = sections.find((row) => String(row?.section || '').includes('/Script/WDGame.WDGameSession'));
+  const override = Array.isArray(section?.keyOverrides)
+    ? section.keyOverrides.find((row) => String(row?.key || '').toLowerCase() === 'servername')
+    : null;
+  if (override?.writable === false) return { writable: false, lockedBy: String(override?.lockedBy || 'ServerName is fixed by the server host') };
+  return { writable: true, lockedBy: '' };
+}
+
+export function patchWardogsServerNameConfig(text, serverName) {
+  const source = String(text || '');
+  const cleanName = String(serverName || '').replace(/[\r\n\0]/g, ' ').trim();
+  if (!cleanName) throw new Error('WARDOGS server name is empty');
+  const newline = source.includes('\r\n') ? '\r\n' : '\n';
+  const lines = source.split(/\r?\n/);
+  const sectionName = '/Script/WDGame.WDGameSession';
+  let sectionStart = -1;
+  let sectionEnd = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = lines[i].match(/^\s*\[([^\]]+)\]\s*$/);
+    if (!m) continue;
+    if (m[1].trim() === sectionName) {
+      sectionStart = i;
+      for (let j = i + 1; j < lines.length; j += 1) {
+        if (/^\s*\[[^\]]+\]\s*$/.test(lines[j])) { sectionEnd = j; break; }
+      }
+      break;
+    }
+  }
+  if (sectionStart < 0) {
+    if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
+    lines.push(`[${sectionName}]`, `ServerName=${cleanName}`);
+    return lines.join(newline);
+  }
+  for (let i = sectionStart + 1; i < sectionEnd; i += 1) {
+    const match = lines[i].match(/^(\s*ServerName\s*=\s*)(.*?)(\s*)$/i);
+    if (!match) continue;
+    const existing = String(match[2] || '').trim();
+    const quoted = existing.length >= 2 && existing.startsWith('"') && existing.endsWith('"');
+    const value = quoted ? `"${cleanName.replace(/"/g, '')}"` : cleanName;
+    lines[i] = `${match[1]}${value}${match[3]}`;
+    return lines.join(newline);
+  }
+  lines.splice(sectionStart + 1, 0, `ServerName=${cleanName}`);
+  return lines.join(newline);
+}
+
+async function writeManagedServerName(bot, desiredName) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const config = await wardogsRequest(bot, '/v1/config');
+    const writable = managedServerNameWritable(config);
+    if (!writable.writable) throw new Error(`ServerName cannot be changed: ${writable.lockedBy}`);
+    if (typeof config?.text !== 'string') throw new Error('WARDOGS config document is unavailable');
+    const patched = patchWardogsServerNameConfig(config.text, desiredName);
+    if (patched === config.text) return { changed: false, serverName: desiredName };
+    const revision = String(config?.revision || '').trim();
+    const headers = { 'Content-Type': 'text/plain; charset=utf-8' };
+    if (revision) headers['If-Match'] = `"${revision.replace(/^"|"$/g, '')}"`;
+    try {
+      const result = await wardogsTextRequest(bot, '/v1/config?fullApply=true', { method: 'PUT', textBody: patched, headers });
+      return { changed: true, serverName: desiredName, result: result.data };
+    } catch (error) {
+      if (Number(error?.status || 0) === 412 && attempt === 0) continue;
+      throw error;
+    }
+  }
+  throw new Error('WARDOGS config changed concurrently; please retry');
 }
 
 export async function testManagedWardogs(bot) {
@@ -426,15 +538,101 @@ function welcomeWhisperRetryable(error) {
 
 async function sendManagedWelcomeWhisper(bot, state, player, message) {
   const steamId = playerSteamId(player);
-  if (!steamId) return { sent: false, retry: false, attempts: 0, error: new Error('Invalid SteamID64') };
+  const apiId = playerWardogsApiId(player);
+  if (!steamId || !apiId) return { sent: false, retry: false, attempts: 0, error: new Error('Invalid WARDOGS player/SteamID64') };
   try {
-    await whisperManagedPlayer(bot, steamId, message);
+    // Use the exact player identifier returned by /v1/players for the whisper route.
+    // Some WARDOGS builds are stricter here than the other moderation endpoints.
+    await wardogsRequest(bot, `/v1/players/${encodeURIComponent(apiId)}/message`, { method: 'POST', body: { message: String(message || '').slice(0, 200) } });
     managedWelcomeSucceeded(state, steamId);
-    return { sent: true, retry: false, attempts: 1, error: null };
+    return { sent: true, retry: false, attempts: Number(state.welcomeAttempts?.get?.(steamId) || 0) + 1, error: null };
   } catch (error) {
     const outcome = managedWelcomeFailed(state, steamId, { retryable: welcomeWhisperRetryable(error) });
     return { sent: false, ...outcome, error };
   }
+}
+
+async function processManagedWelcomeQueue(bot, state, players = null) {
+  if (bot?.welcomeWhisperEnabled !== true) return;
+  if (!(state.welcomePending instanceof Set) || state.welcomePending.size === 0) return;
+  if (state.welcomeInFlight) return;
+  state.welcomeInFlight = true;
+  try {
+    let rows = Array.isArray(players) ? players : null;
+    if (!rows) {
+      const data = await wardogsRequest(bot, '/v1/players');
+      rows = Array.isArray(data?.players) ? data.players : [];
+    }
+    for (const player of managedWelcomeTargets(state, rows, [])) {
+      const steamId = playerSteamId(player);
+      const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
+      if (!steamId || !message) continue;
+      const result = await sendManagedWelcomeWhisper(bot, state, player, message);
+      if (result.sent) {
+        setRuntime(bot.id, {
+          lastWelcomeWhisperAt: nowIso(),
+          lastWelcomeWhisperPlayer: String(player?.name || steamId),
+          lastWelcomeWhisperError: null,
+          lastWelcomeWhisperAttempts: result.attempts
+        });
+      } else {
+        setRuntime(bot.id, {
+          lastWelcomeWhisperAt: nowIso(),
+          lastWelcomeWhisperPlayer: String(player?.name || steamId),
+          lastWelcomeWhisperError: `${result.error?.message || 'Whisper failed'}${result.retry ? ` · retry ${result.attempts}/${WELCOME_MAX_ATTEMPTS}` : ''}`,
+          lastWelcomeWhisperAttempts: result.attempts
+        });
+      }
+    }
+  } finally {
+    state.welcomeInFlight = false;
+  }
+}
+
+async function pollManagedWelcome(bot, state) {
+  if (bot?.welcomeWhisperEnabled !== true || state.welcomePollInFlight) return;
+  state.welcomePollInFlight = true;
+  try {
+    const data = await wardogsRequest(bot, '/v1/players');
+    const players = Array.isArray(data?.players) ? data.players : [];
+    if (!state.welcomeJoinTracker) state.welcomeJoinTracker = createManagedJoinTracker();
+    // Welcome detection is intentionally separate from risk/detection joins. It polls
+    // faster so a real leave + rejoin does not have to wait for three normal 20s
+    // detection snapshots before it can receive the next welcome.
+    const joined = managedJoinCandidates(state.welcomeJoinTracker, players, 2);
+    managedWelcomeTargets(state, players, joined);
+    await processManagedWelcomeQueue(bot, state, players);
+  } catch (error) {
+    setRuntime(bot.id, { lastWelcomeWhisperError: String(error?.message || error).slice(0, 300) });
+  } finally {
+    state.welcomePollInFlight = false;
+  }
+}
+
+export function managedSeedingServerName(currentName, playerCount, enabled = true) {
+  const current = String(currentName || '').trim();
+  if (!current) return '';
+  const suffixPattern = /\s+JOIN Seeding$/i;
+  const base = current.replace(suffixPattern, '').trim();
+  const seeding = enabled === true && Number(playerCount) >= 1 && Number(playerCount) <= 20;
+  return seeding ? `${base} ${SEEDING_SUFFIX}` : base;
+}
+
+async function updateManagedSeedingServerName(bot, state, playerCount, { force = false } = {}) {
+  const active = bot?.seedingNameEnabled === true && Number(playerCount) >= 1 && Number(playerCount) <= 20;
+  const now = Date.now();
+  // Re-check periodically as well as on threshold changes. This restores the suffix
+  // after a game-server restart without hammering the config endpoint every poll.
+  if (!force && state.seedingServerActive === active && now - Number(state.lastSeedingServerCheckAt || 0) < 60_000) return;
+  state.lastSeedingServerCheckAt = now;
+  const status = await wardogsRequest(bot, '/v1/status');
+  const currentName = String(status?.serverName || '').trim();
+  if (!currentName) throw new Error('WARDOGS status did not return a server name');
+  const desired = managedSeedingServerName(currentName, playerCount, bot?.seedingNameEnabled === true);
+  if (desired && desired !== currentName) await writeManagedServerName(bot, desired);
+  state.seedingServerActive = active;
+  state.seedingServerName = desired || currentName;
+  setRuntime(bot.id, { seedingServerName: desired || currentName, lastSeedingNameError: null });
 }
 
 export async function whisperManagedPlayer(bot, steamId, message) {
@@ -662,7 +860,7 @@ function signature(bot) {
     steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
     announcementMessages: bot.announcementMessages || '', welcomeWhisperEnabled: bot.welcomeWhisperEnabled === true,
-    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', seedingNameEnabled: bot.seedingNameEnabled === true, banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -833,28 +1031,15 @@ async function pollPlayers(bot, state, client) {
       state.announcementIndex = 0;
     }
 
-    if (bot.welcomeWhisperEnabled === true) {
-      for (const player of managedWelcomeTargets(state, players, joinedPlayers)) {
-        const steamId = playerSteamId(player);
-        const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
-        if (!message) continue;
-        const result = await sendManagedWelcomeWhisper(bot, state, player, message);
-        if (result.sent) {
-          setRuntime(bot.id, { lastWelcomeWhisperAt: nowIso(), lastWelcomeWhisperPlayer: String(player?.name || steamId), lastWelcomeWhisperError: null, lastWelcomeWhisperAttempts: 1 });
-        } else {
-          setRuntime(bot.id, {
-            lastWelcomeWhisperAt: nowIso(),
-            lastWelcomeWhisperPlayer: String(player?.name || steamId),
-            lastWelcomeWhisperError: `${result.error?.message || 'Whisper failed'}${result.retry ? ` · retry ${result.attempts}/4 on next poll` : ''}`,
-            lastWelcomeWhisperAttempts: result.attempts
-          });
-        }
-      }
-    } else {
+    try { await updateManagedSeedingServerName(bot, state, players.length); }
+    catch (error) { setRuntime(bot.id, { lastSeedingNameError: String(error?.message || error).slice(0, 240) }); }
+
+    if (bot.welcomeWhisperEnabled !== true) {
       state.welcomePending?.clear?.();
       state.welcomeDelivered?.clear?.();
       state.welcomeFailed?.clear?.();
       state.welcomeAttempts?.clear?.();
+      state.welcomeJoinTracker = createManagedJoinTracker();
     }
 
     let riskProfiles = new Map();
@@ -1382,6 +1567,19 @@ async function handleInteraction(interaction, client, state) {
   await handleModal(interaction);
 }
 
+async function cleanupLegacySeedingDiscordNickname(bot, client) {
+  if (!client?.isReady?.()) return;
+  const desired = String(bot?.name || '').trim().slice(0, 32);
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const member = guild.members.me || await guild.members.fetchMe();
+      const current = String(member?.displayName || '');
+      if (!/\s+JOIN Seeding$/i.test(current)) continue;
+      await member.setNickname(desired || null, 'Remove legacy v3.12.19 seeding nickname');
+    } catch {}
+  }
+}
+
 async function stopOne(id, keepRuntime = true) {
   const active = instances.get(id);
   // Remove it from the registry first so no status path can treat it as live while
@@ -1390,7 +1588,10 @@ async function stopOne(id, keepRuntime = true) {
   if (active) {
     clearInterval(active.timer);
     clearTimeout(active.state?.panelRepostTimer);
-    try { await deleteStoredControlPanel(getManagedBot(id) || { id }, active.client, active.state); } catch {}
+    clearInterval(active.state?.welcomeTimer);
+    const stored = getManagedBot(id) || { id };
+    try { await updateManagedSeedingServerName({ ...stored, seedingNameEnabled: false }, active.state, 0, { force: true }); } catch {}
+    try { await deleteStoredControlPanel(stored, active.client, active.state); } catch {}
     try { await active.client.destroy(); } catch {}
   }
   if (keepRuntime) setRuntime(id, { state: 'stopped', botTag: null, players: null, controlPanelMessageId: null, lastError: null });
@@ -1406,7 +1607,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, seedingServerActive: null, seedingServerName: '', lastSeedingServerCheckAt: 0, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {
@@ -1434,8 +1635,18 @@ async function startOne(bot) {
       return;
     }
     if (!freshBeforeRun.controlPanelEnabled && (freshBeforeRun.controlPanelMessageId || freshBeforeRun.controlPanelMessageChannelId)) await deleteStoredControlPanel(freshBeforeRun, client, state);
+    // v3.12.19 briefly used the Discord guild nickname for JOIN Seeding. Clean that
+    // legacy suffix once; seeding now belongs exclusively to the WARDOGS server name.
+    await cleanupLegacySeedingDiscordNickname(freshBeforeRun, client);
     setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
     await pollPlayers(freshBeforeRun, state, client);
+    if (freshBeforeRun.welcomeWhisperEnabled === true) await pollManagedWelcome(freshBeforeRun, state);
+    state.welcomeTimer = setInterval(() => {
+      const fresh = getManagedBot(bot.id);
+      if (!fresh?.enabled || !accessActive(fresh) || fresh.welcomeWhisperEnabled !== true) return;
+      pollManagedWelcome(fresh, state).catch((error) => setRuntime(bot.id, { lastWelcomeWhisperError: String(error?.message || error).slice(0, 300) }));
+    }, WELCOME_RETRY_MS);
+    state.welcomeTimer.unref?.();
     const timer = setInterval(() => {
       const fresh = getManagedBot(bot.id);
       if (!fresh?.enabled || !accessActive(fresh)) return;

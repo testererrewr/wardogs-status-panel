@@ -1,18 +1,29 @@
 import 'dotenv/config';
 import express from 'express';
+import crypto from 'node:crypto';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 
 const app = express();
-app.use(express.json({ limit: '128kb' }));
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false, hsts: false }));
+app.use(express.json({ limit: '256kb' }));
+app.use(rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false }));
 const port = Number(process.env.RUNNER_PORT || 4000);
 const shared = process.env.RUNNER_SHARED_SECRET || '';
 const root = '/workspace';
 
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
+}
 function validId(id) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(id || '')); }
-function names(id) { return { container: `statushub-custom-${id}`, image: `statushub-custom-${id}:latest` }; }
-function auth(req, res, next) { if (!shared || req.get('X-Runner-Secret') !== shared) return res.status(403).json({ error: 'forbidden' }); next(); }
+function names(id) { return { container: `statushub-custom-${id}`, image: `statushub-custom-${id}:latest`, network: `statushub-net-${id}` }; }
+function auth(req, res, next) { if (!shared || !safeEqual(req.get('X-Runner-Secret'), shared)) return res.status(403).json({ error: 'forbidden' }); next(); }
 app.use(auth);
 
 function run(cmd, args, { timeout = 120000, allowFailure = false, env = process.env, cwd = undefined } = {}) {
@@ -53,19 +64,33 @@ async function isRunning(name) {
   const r = await run('docker', ['inspect', '-f', '{{.State.Running}}', name], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'true';
 }
+async function ensureNetwork(name, id) {
+  const exists = await run('docker', ['network', 'inspect', name], { allowFailure: true, timeout: 15000 });
+  if (exists.code === 0) return;
+  const created = await run('docker', ['network', 'create', '--driver', 'bridge', '--opt', 'com.docker.network.bridge.enable_icc=false', '--label', `server-status-hub.custom=${id}`, name], { allowFailure: true, timeout: 20000 });
+  if (created.code !== 0) {
+    const retry = await run('docker', ['network', 'inspect', name], { allowFailure: true, timeout: 15000 });
+    if (retry.code !== 0) throw new Error('custom bot network could not be created');
+  }
+}
+async function containerUsesNetwork(container, network) {
+  const r = await run('docker', ['inspect', '-f', `{{if index .NetworkSettings.Networks "${network}"}}yes{{else}}no{{end}}`, container], { allowFailure: true, timeout: 15000 });
+  return r.code === 0 && r.out.trim() === 'yes';
+}
 async function build(id, image) {
   const dir = path.join(root, id);
   if (!fs.existsSync(path.join(dir, 'Dockerfile.generated'))) throw new Error('upload files missing');
   await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
 }
 async function startFresh(id, envObj) {
-  const { container, image } = names(id);
+  const { container, image, network } = names(id);
   await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 });
+  await ensureNetwork(network, id);
   await build(id, image);
   const args = ['run', '-d', '--name', container, '--restart', 'unless-stopped',
     '--memory', '256m', '--cpus', '0.50', '--pids-limit', '100', '--read-only',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m', '--tmpfs', '/home/bot:rw,noexec,nosuid,size=16m', '--tmpfs', '/home/node:rw,noexec,nosuid,size=16m', '--tmpfs', '/bot/data:rw,nosuid,size=64m',
-    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--network', 'bridge',
+    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--network', network,
     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2', '--label', `server-status-hub.custom=${id}`];
   for (const [k, v] of Object.entries(validateEnv(envObj))) args.push('-e', `${k}=${v}`);
   args.push(image);
@@ -76,8 +101,12 @@ async function startFresh(id, envObj) {
 app.post('/ensure', async (req, res) => {
   try {
     const id = req.body.id; if (!validId(id)) throw new Error('invalid id');
-    const { container } = names(id);
+    const { container, network } = names(id);
     if (await existsContainer(container)) {
+      if (!(await containerUsesNetwork(container, network))) {
+        await startFresh(id, req.body.env || {});
+        return res.json({ ok: true, running: true, reused: false, migratedNetwork: true });
+      }
       if (!(await isRunning(container))) await run('docker', ['start', container], { timeout: 20000 });
       return res.json({ ok: true, running: true, reused: true });
     }
@@ -95,16 +124,29 @@ app.post('/stop', async (req, res) => {
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.post('/delete', async (req, res) => {
-  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container, image } = names(id); await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 }); await run('docker', ['image', 'rm', '-f', image], { allowFailure: true, timeout: 30000 }); res.json({ ok: true }); }
+  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container, image, network } = names(id); await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 }); await run('docker', ['image', 'rm', '-f', image], { allowFailure: true, timeout: 30000 }); await run('docker', ['network', 'rm', network], { allowFailure: true, timeout: 20000 }); res.json({ ok: true }); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.post('/status', async (req, res) => {
   try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container } = names(id); const exists = await existsContainer(container); res.json({ ok: true, exists, running: exists ? await isRunning(container) : false }); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
+function redactLogs(text, values = []) {
+  let out = String(text || '');
+  for (const value of values.filter((x) => typeof x === 'string' && x.length >= 6).slice(0, 50)) out = out.split(value).join('[REDACTED]');
+  out = out
+    .replace(/((?:token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
+    .replace(/(Bot\s+)[A-Za-z0-9._-]{20,}/gi, '$1[REDACTED]');
+  return out.slice(-50000);
+}
 app.post('/logs', async (req, res) => {
-  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container } = names(id); const r = await run('docker', ['logs', '--tail', '200', container], { allowFailure: true, timeout: 20000 }); res.json({ ok: true, logs: `${r.out}${r.err}`.slice(-50000) }); }
+  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container } = names(id); const r = await run('docker', ['logs', '--tail', '200', container], { allowFailure: true, timeout: 20000 }); res.json({ ok: true, logs: redactLogs(`${r.out}${r.err}`, Array.isArray(req.body.redact) ? req.body.redact.map(String) : []) }); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.get('/healthz', (req, res) => res.json({ ok: true }));
-app.listen(port, '0.0.0.0', () => console.log(`Custom bot runner listening on ${port}`));
+const server = app.listen(port, '0.0.0.0', () => console.log(`Custom bot runner listening on ${port}`));
+server.headersTimeout = 10_000;
+server.requestTimeout = 20_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 500;
+server.maxHeadersCount = 60;

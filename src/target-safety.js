@@ -1,5 +1,7 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
 
 function isPrivateV4(ip) {
   const p = ip.split('.').map(Number);
@@ -26,23 +28,100 @@ export function isPrivateIp(ip) {
   return true;
 }
 
-export async function assertSafeHost(hostname, { allowPrivate = false } = {}) {
+export async function resolveSafeHost(hostname, { allowPrivate = false } = {}) {
   const host = String(hostname || '').trim().replace(/^\[|\]$/g, '');
   if (!host) throw new Error('Host fehlt');
-  if (allowPrivate) return;
-  if (host.toLowerCase() === 'localhost') throw new Error('Private/localhost Ziele sind für diesen Account nicht erlaubt');
+  if (!allowPrivate && host.toLowerCase() === 'localhost') throw new Error('Private/localhost Ziele sind für diesen Account nicht erlaubt');
 
   const literalFamily = net.isIP(host);
-  const addresses = literalFamily ? [{ address: host }] : await dns.lookup(host, { all: true, verbatim: true });
+  const addresses = literalFamily
+    ? [{ address: host, family: literalFamily }]
+    : await dns.lookup(host, { all: true, verbatim: true });
   if (!addresses.length) throw new Error('Host konnte nicht aufgelöst werden');
-  if (addresses.some((x) => isPrivateIp(x.address))) throw new Error('Private/LAN/Loopback Ziele sind für diesen Account nicht erlaubt');
+  const normalized = addresses.map((x) => ({ address: String(x.address), family: Number(x.family || net.isIP(x.address)) })).filter((x) => x.family === 4 || x.family === 6);
+  if (!normalized.length) throw new Error('Host konnte nicht aufgelöst werden');
+  if (!allowPrivate && normalized.some((x) => isPrivateIp(x.address))) throw new Error('Private/LAN/Loopback Ziele sind für diesen Account nicht erlaubt');
+  return normalized;
 }
 
-export async function assertSafeUrl(rawUrl, { allowPrivate = false } = {}) {
+export async function assertSafeHost(hostname, options = {}) {
+  await resolveSafeHost(hostname, options);
+}
+
+export async function resolveSafeUrl(rawUrl, { allowPrivate = false } = {}) {
   let url;
   try { url = new URL(String(rawUrl || '')); } catch { throw new Error('Ungültige URL'); }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Nur http:// und https:// sind erlaubt');
   if (url.username || url.password) throw new Error('Benutzername/Passwort in der URL sind nicht erlaubt');
-  await assertSafeHost(url.hostname, { allowPrivate });
+  const addresses = await resolveSafeHost(url.hostname, { allowPrivate });
+  return { url, addresses };
+}
+
+export async function assertSafeUrl(rawUrl, options = {}) {
+  const { url } = await resolveSafeUrl(rawUrl, options);
   return url;
+}
+
+function pinnedLookup(addresses) {
+  const ordered = [...addresses].sort((a, b) => a.family === b.family ? 0 : a.family === 4 ? -1 : 1);
+  return (hostname, options, callback) => {
+    const opts = typeof options === 'object' && options ? options : {};
+    const family = Number(opts.family || 0);
+    const choices = family === 4 || family === 6 ? ordered.filter((x) => x.family === family) : ordered;
+    const list = choices.length ? choices : ordered;
+    if (opts.all) return callback(null, list.map((x) => ({ address: x.address, family: x.family })));
+    const pick = list[0];
+    callback(null, pick.address, pick.family);
+  };
+}
+
+export async function safeHttpText(rawUrl, { allowPrivate = false, method = 'GET', headers = {}, body, timeoutMs = 8000, maxBytes = 1024 * 1024 } = {}) {
+  const { url, addresses } = await resolveSafeUrl(rawUrl, { allowPrivate });
+  const transport = url.protocol === 'https:' ? https : http;
+  const requestHeaders = { 'Accept-Encoding': 'identity', ...headers };
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const finishReject = (error) => { if (!settled) { settled = true; reject(error); } };
+    const req = transport.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || undefined,
+      path: `${url.pathname}${url.search}`,
+      method,
+      headers: requestHeaders,
+      lookup: pinnedLookup(addresses),
+      autoSelectFamily: true,
+      servername: url.hostname
+    }, (res) => {
+      const chunks = [];
+      let total = 0;
+      res.on('data', (chunk) => {
+        if (settled) return;
+        total += chunk.length;
+        if (total > maxBytes) {
+          settled = true;
+          req.destroy();
+          res.destroy();
+          reject(new Error(`HTTP Antwort ist größer als ${Math.ceil(maxBytes / 1024)} KB`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          status: Number(res.statusCode || 0),
+          ok: Number(res.statusCode || 0) >= 200 && Number(res.statusCode || 0) < 300,
+          headers: res.headers,
+          text: Buffer.concat(chunks).toString('utf8')
+        });
+      });
+      res.on('error', finishReject);
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('HTTP request timed out')));
+    req.on('error', finishReject);
+    if (body !== undefined && body !== null) req.write(body);
+    req.end();
+  });
 }

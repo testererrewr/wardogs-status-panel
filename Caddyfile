@@ -1,4 +1,10 @@
 {$PUBLIC_URL} {
+  header {
+    -Server
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+    Permissions-Policy "camera=(), microphone=(), geolocation=(), usb=(), bluetooth=(), browsing-topics=()"
+  }
   reverse_proxy server-status-hub:3000
   encode zstd gzip
 }

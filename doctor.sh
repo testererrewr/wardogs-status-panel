@@ -16,3 +16,5 @@ echo; "${COMPOSE[@]}" ps || true
 echo; echo "--- Panel Logs ---"; "${COMPOSE[@]}" logs --tail=80 server-status-hub 2>/dev/null || true
 echo; echo "--- Local Status Node Logs ---"; "${COMPOSE[@]}" logs --tail=80 status-node 2>/dev/null || true
 echo; echo "--- Runner Logs ---"; "${COMPOSE[@]}" logs --tail=50 runner 2>/dev/null || true
+
+echo; echo "--- Security Check ---"; bash ./security-check.sh || true

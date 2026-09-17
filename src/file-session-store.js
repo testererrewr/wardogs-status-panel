@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import session from 'express-session';
+import { encryptSecret, decryptSecret } from './crypto.js';
 
 export class FileSessionStore extends session.Store {
   constructor(options = {}) {
@@ -15,7 +16,10 @@ export class FileSessionStore extends session.Store {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     if (!fs.existsSync(this.file)) return;
     try {
-      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      const stored = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      const raw = stored?.format === 'encrypted-v1' && stored?.data
+        ? JSON.parse(decryptSecret(stored.data))
+        : stored;
       for (const [sid, value] of Object.entries(raw || {})) this.sessions.set(sid, value);
       this.prune(false);
     } catch (error) {
@@ -30,7 +34,8 @@ export class FileSessionStore extends session.Store {
 
   persist() {
     const obj = Object.fromEntries(this.sessions.entries());
-    fs.writeFileSync(this.tmp, JSON.stringify(obj), { mode: 0o600 });
+    const payload = { format: 'encrypted-v1', data: encryptSecret(JSON.stringify(obj)) };
+    fs.writeFileSync(this.tmp, JSON.stringify(payload), { mode: 0o600 });
     fs.renameSync(this.tmp, this.file);
     try { fs.chmodSync(this.file, 0o600); } catch {}
   }

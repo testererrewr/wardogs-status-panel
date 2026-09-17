@@ -1,7 +1,7 @@
 import { GameDig } from 'gamedig';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { decryptSecret } from './crypto.js';
-import { assertSafeHost, assertSafeUrl } from './target-safety.js';
+import { resolveSafeHost, safeHttpText } from './target-safety.js';
 
 function baseUrl(value) {
   return String(value || '').trim().replace(/\/+$/, '');
@@ -47,20 +47,15 @@ function getPath(obj, path) {
 }
 
 async function safeJson(url, options = {}, allowPrivate = false, timeoutMs = 7000) {
-  const parsed = await assertSafeUrl(url, { allowPrivate });
-  const response = await fetch(parsed, {
-    ...options,
-    redirect: 'manual',
-    headers: { Accept: 'application/json', ...(options.headers || {}) },
-    signal: AbortSignal.timeout(timeoutMs)
+  const result = await safeHttpText(url, {
+    allowPrivate, method: options.method || 'GET', headers: { Accept: 'application/json', ...(options.headers || {}) },
+    body: options.body, timeoutMs, maxBytes: 1024 * 1024
   });
-  if (response.status >= 300 && response.status < 400) throw new Error('HTTP Redirects sind aus Sicherheitsgründen nicht erlaubt');
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => '')).slice(0, 180);
-    throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
-  }
-  return jsonLimited(response);
+  if (result.status >= 300 && result.status < 400) throw new Error('HTTP Redirects sind aus Sicherheitsgründen nicht erlaubt');
+  if (!result.ok) throw new Error(`HTTP ${result.status}${result.text ? `: ${result.text.slice(0, 180)}` : ''}`);
+  return JSON.parse(result.text || '{}');
 }
+
 
 
 async function queryWardogs(server) {
@@ -88,7 +83,6 @@ async function queryWardogs(server) {
 async function queryFiveM(server) {
   const cfg = server.queryConfig || {};
   const base = baseUrl(cfg.baseUrl);
-  await assertSafeUrl(base, { allowPrivate: Boolean(server.allowPrivateTarget) });
   const [dynamic, players] = await Promise.all([
     safeJson(`${base}/dynamic.json`, {}, Boolean(server.allowPrivateTarget)),
     safeJson(`${base}/players.json`, {}, Boolean(server.allowPrivateTarget)).catch(() => [])
@@ -113,7 +107,7 @@ async function queryGameDig(server) {
   const meta = gameDigMeta(gameId);
   if (!gameId || !meta) throw new Error('Ungültiges oder nicht unterstütztes GameDig-Spiel');
   if (meta.hostMode === 'required' && !host) throw new Error(`${meta.name}: Host / IP fehlt`);
-  if (host) await assertSafeHost(host, { allowPrivate: Boolean(server.allowPrivateTarget) });
+  const resolvedHost = host ? await resolveSafeHost(host, { allowPrivate: Boolean(server.allowPrivateTarget) }) : [];
 
   const query = {
     type: gameId,
@@ -121,7 +115,7 @@ async function queryGameDig(server) {
     socketTimeout: Math.min(5000, Math.max(1000, Number(cfg.socketTimeout) || 2500)),
     attemptTimeout: Math.min(10000, Math.max(2000, Number(cfg.attemptTimeout) || 6000))
   };
-  if (host) query.host = host;
+  if (host) query.host = (resolvedHost.find((x) => x.family === 4) || resolvedHost[0]).address;
   if (cfg.port) query.port = Number(cfg.port);
 
   const defs = gameDigFieldDefs(gameId);

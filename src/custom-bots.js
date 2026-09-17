@@ -9,6 +9,8 @@ const MAX_FILES = 5000;
 const MAX_RAW_ENTRIES = 20000;
 const MAX_UNPACKED_BYTES = 100 * 1024 * 1024;
 const IGNORED_PARTS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__']);
+const SENSITIVE_UPLOAD_NAMES = new Set(['.env', '.env.local', '.env.production', '.npmrc', '.pypirc', '.netrc', 'id_rsa', 'id_ed25519', 'credentials.json']);
+function sensitiveUploadEntry(name) { const parts = String(name || '').split('/').filter(Boolean); const base = String(parts.at(-1) || '').toLowerCase(); return SENSITIVE_UPLOAD_NAMES.has(base) || base.startsWith('.env.') || ['id_ecdsa','id_dsa'].includes(base); }
 
 function validBotId(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(id || ''));
@@ -140,14 +142,17 @@ export function prepareCustomBot({ id = crypto.randomUUID(), buffer, runtime, en
   fs.mkdirSync(path.join(dest, 'src'), { recursive: true });
 
   try {
-    fs.writeFileSync(path.join(dest, 'source.zip'), buffer, { mode: 0o640 });
     let zip;
     try { zip = new AdmZip(buffer); } catch { throw new Error('ZIP-Datei ist ungültig oder beschädigt'); }
     const rawEntries = zip.getEntries();
     if (!Array.isArray(rawEntries) || !rawEntries.length) throw new Error('ZIP-Datei ist leer');
     if (rawEntries.length > MAX_RAW_ENTRIES) throw new Error(`ZIP enthält zu viele Einträge (maximal ${MAX_RAW_ENTRIES})`);
+    const safeRawEntries = rawEntries.map((item) => ({ item, name: cleanZipName(item.entryName, item.isDirectory) }));
+    const sensitive = safeRawEntries.find(({ item, name }) => !item.isDirectory && sensitiveUploadEntry(name));
+    if (sensitive) throw new Error(`ZIP enthält die sensible Datei ${sensitive.name}. Secrets bitte ausschließlich über die ENV-Felder hinterlegen.`);
+    fs.writeFileSync(path.join(dest, 'source.zip'), buffer, { mode: 0o600 });
 
-    const entries = rawEntries.map((item) => ({ item, name: cleanZipName(item.entryName, item.isDirectory) })).filter(({ name }) => name && !noiseEntry(name) && !ignoredDependencyEntry(name));
+    const entries = safeRawEntries.filter(({ name }) => name && !noiseEntry(name) && !ignoredDependencyEntry(name));
     const files = entries.filter(({ item }) => !item.isDirectory);
     if (!files.length) throw new Error('ZIP enthält keine verwendbaren Quelldateien');
     if (files.length > MAX_FILES) throw new Error(`ZIP enthält zu viele Quelldateien (maximal ${MAX_FILES}). node_modules, .git, venv und Cache-Ordner werden automatisch ignoriert.`);
@@ -204,7 +209,7 @@ export function prepareCustomBot({ id = crypto.randomUUID(), buffer, runtime, en
       const out = path.resolve(dest, 'src', name);
       if (!out.startsWith(srcRoot)) throw new Error('ZIP-Pfad außerhalb des Bot-Ordners');
       fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.writeFileSync(out, data, { mode: 0o640 });
+      fs.writeFileSync(out, data, { mode: 0o600 });
     }
     if (!fs.existsSync(path.join(dest, 'src', entry)) || !fs.statSync(path.join(dest, 'src', entry)).isFile()) throw new Error(`Entrypoint ${entry} wurde nach dem Entpacken nicht gefunden`);
 
@@ -212,8 +217,8 @@ export function prepareCustomBot({ id = crypto.randomUUID(), buffer, runtime, en
     const dockerfile = runtime === 'node22'
       ? `FROM node:22-alpine\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; elif [ -f package.json ]; then npm install --omit=dev --no-audit --no-fund; fi\nRUN chown -R node:node /bot\nUSER node\nCMD ${JSON.stringify(command)}\n`
       : `FROM python:3.13-slim\nENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt; fi\nRUN useradd -m -u 10001 bot && chown -R bot:bot /bot\nUSER bot\nCMD ${JSON.stringify(command)}\n`;
-    fs.writeFileSync(path.join(dest, 'Dockerfile.generated'), dockerfile, { mode: 0o640 });
-    fs.writeFileSync(path.join(dest, '.dockerignore'), '.git\n.env\nnode_modules\n__pycache__\nsource.zip\n', { mode: 0o640 });
+    fs.writeFileSync(path.join(dest, 'Dockerfile.generated'), dockerfile, { mode: 0o600 });
+    fs.writeFileSync(path.join(dest, '.dockerignore'), '.git\n.env\nnode_modules\n__pycache__\nsource.zip\n', { mode: 0o600 });
     return { id, runtime, entrypoint: entry, fileCount: files.length, unpackedBytes: total, strippedWrapper: wrapper ? wrapper.slice(0, -1) : '' };
   } catch (error) {
     fs.rmSync(dest, { recursive: true, force: true });

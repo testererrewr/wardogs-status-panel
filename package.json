@@ -1,6 +1,6 @@
 {
   "name": "server-status-hub",
-  "version": "3.12.17",
+  "version": "3.12.20",
   "private": true,
   "description": "Multi-user Discord status bot hosting platform with PayPal and Stripe one-time/monthly Premium billing, account subscription management, free branding boosts, managed bot services, multi-VPS status nodes, GameDig, WARDOGS, FiveM, approved custom bots and text-only status bots.",
   "type": "module",
@@ -16,15 +16,15 @@
     "node": ">=22"
   },
   "dependencies": {
-    "adm-zip": "^0.5.16",
-    "discord.js": "^14.22.1",
-    "dotenv": "^17.2.2",
-    "express": "^5.1.0",
-    "express-rate-limit": "^8.1.0",
-    "express-session": "^1.18.2",
-    "gamedig": "^5.3.3",
-    "helmet": "^8.1.0",
-    "multer": "^2.0.2",
-    "stripe": "^22.6.2"
+    "adm-zip": "0.5.16",
+    "discord.js": "14.22.1",
+    "dotenv": "17.2.2",
+    "express": "5.1.0",
+    "express-rate-limit": "8.1.0",
+    "express-session": "1.18.2",
+    "gamedig": "5.3.3",
+    "helmet": "8.1.0",
+    "multer": "2.0.2",
+    "stripe": "22.6.2"
   }
 }

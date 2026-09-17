@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
-import { assertSafeUrl } from './target-safety.js';
+import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './managed-bots.js';
 
 export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
@@ -43,23 +43,36 @@ async function withLock(id, fn) {
   return tracked;
 }
 
-async function wardogsRequest(bot, pathname) {
-  const root = baseUrl(bot?.wardogsBaseUrl);
-  if (!root) throw new Error('WARDOGS base URL is missing');
-  const url = await assertSafeUrl(`${root}${pathname}`, { allowPrivate: Boolean(bot?.allowPrivateTarget) });
+export function playtimeTrackerServers(bot) {
+  const rows = Array.isArray(bot?.playtimeServers) ? bot.playtimeServers : [];
+  const normalized = rows.map((row, index) => ({
+    id: String(row?.id || `server-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64) || `server-${index + 1}`,
+    label: String(row?.label || `Server ${index + 1}`).trim().slice(0, 80) || `Server ${index + 1}`,
+    baseUrl: baseUrl(row?.baseUrl || row?.wardogsBaseUrl || ''),
+    secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || '')
+  })).filter((row) => row.baseUrl);
+  if (normalized.length) return normalized.slice(0, 12);
+  const legacyUrl = baseUrl(bot?.wardogsBaseUrl);
+  if (!legacyUrl) return [];
+  return [{ id: 'primary', label: String(bot?.serverLabel || bot?.name || 'Server 1').trim().slice(0, 80) || 'Server 1', baseUrl: legacyUrl, secretEnc: String(bot?.wardogsSecretEnc || '') }];
+}
+
+async function wardogsRequest(bot, server, pathname) {
+  const root = baseUrl(server?.baseUrl);
+  if (!root) throw new Error(`${server?.label || 'WARDOGS server'}: base URL is missing`);
   let secret = '';
-  try { secret = decryptSecret(bot?.wardogsSecretEnc); } catch { secret = ''; }
-  if (!secret) throw new Error('WARDOGS RCON/API password is missing');
-  const response = await fetch(url, {
-    redirect: 'manual',
+  try { secret = decryptSecret(server?.secretEnc); } catch { secret = ''; }
+  if (!secret) throw new Error(`${server?.label || 'WARDOGS server'}: RCON/API password is missing`);
+  const response = await safeHttpText(`${root}${pathname}`, {
+    allowPrivate: Boolean(bot?.allowPrivateTarget),
     headers: { Accept: 'application/json', Authorization: `Bearer ${secret}` },
-    signal: AbortSignal.timeout(8000)
+    timeoutMs: 8000, maxBytes: 1024 * 1024
   });
-  if (response.status >= 300 && response.status < 400) throw new Error('WARDOGS API redirects are not allowed');
-  const text = (await response.text()).slice(0, 1024 * 1024);
+  if (response.status >= 300 && response.status < 400) throw new Error(`${server?.label || 'WARDOGS server'}: API redirects are not allowed`);
+  const text = response.text;
   let data = {};
   if (text) { try { data = JSON.parse(text); } catch { data = { message: text.slice(0, 300) }; } }
-  if (!response.ok) throw new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message || data?.message || data?.error || 'Error').slice(0, 240)}`);
+  if (!response.ok) throw new Error(`${server?.label || 'WARDOGS server'}: WARDOGS API ${response.status}: ${String(data?.error?.message || data?.message || data?.error || 'Error').slice(0, 220)}`);
   return data;
 }
 
@@ -76,9 +89,18 @@ function extractClanTag(name) {
   return match ? match[1].toUpperCase() : '';
 }
 function emptyHours() { return Array.from({ length: 24 }, (_, hour) => ({ hour, samples: 0, playerSum: 0, maxPlayers: 0 })); }
-function normalizeStats(input) {
+function normalizeServerStats(input) {
   const stats = input && typeof input === 'object' ? structuredClone(input) : {};
   stats.players = stats.players && typeof stats.players === 'object' && !Array.isArray(stats.players) ? stats.players : {};
+  for (const [steamId, row] of Object.entries(stats.players)) {
+    stats.players[steamId] = {
+      ...row,
+      totalSeconds: Math.max(0, Number(row?.totalSeconds) || 0),
+      sessionCount: Math.max(0, Math.floor(Number(row?.sessionCount) || 0)),
+      firstSeenAt: row?.firstSeenAt || null,
+      lastSeenAt: row?.lastSeenAt || null
+    };
+  }
   const sourceHours = Array.isArray(stats.hours) ? stats.hours : [];
   stats.hours = emptyHours().map((base, hour) => {
     const row = sourceHours.find((x) => Number(x?.hour) === hour) || sourceHours[hour] || {};
@@ -87,6 +109,24 @@ function normalizeStats(input) {
   stats.startedAt = stats.startedAt || nowIso();
   stats.lastPollAt = stats.lastPollAt || null;
   return stats;
+}
+function normalizeStats(input, servers) {
+  const source = input && typeof input === 'object' ? structuredClone(input) : {};
+  const networkHoursSource = Array.isArray(source.hours) ? source.hours : [];
+  const networkHours = emptyHours().map((base, hour) => {
+    const row = networkHoursSource.find((x) => Number(x?.hour) === hour) || networkHoursSource[hour] || {};
+    return { hour, samples: Math.max(0, Number(row.samples) || 0), playerSum: Math.max(0, Number(row.playerSum) || 0), maxPlayers: Math.max(0, Number(row.maxPlayers) || 0) };
+  });
+  const out = { startedAt: source.startedAt || nowIso(), lastPollAt: source.lastPollAt || null, hours: networkHours, servers: {} };
+  const sourceServers = source.servers && typeof source.servers === 'object' && !Array.isArray(source.servers) ? source.servers : null;
+  if (sourceServers) {
+    for (const server of servers) out.servers[server.id] = normalizeServerStats(sourceServers[server.id]);
+  } else if (servers[0]) {
+    // Backward-compatible migration of the old single-server statistics shape.
+    out.servers[servers[0].id] = normalizeServerStats(source);
+  }
+  for (const server of servers) if (!out.servers[server.id]) out.servers[server.id] = normalizeServerStats(null);
+  return out;
 }
 function timeZone(bot) {
   const value = String(bot?.statsTimezone || 'Europe/Vienna').trim();
@@ -103,16 +143,46 @@ function formatDuration(seconds) {
   return `${hours.toLocaleString('en-US')}h ${minutes}m`;
 }
 
-function snapshotFromStats(stats, online = new Map()) {
+function serverSnapshot(server, stats, online = new Map()) {
   const rows = Object.entries(stats.players || {}).map(([steamId, p]) => ({
     steamId,
     name: String(p?.name || steamId),
     clanTag: String(p?.clanTag || ''),
     totalSeconds: Math.max(0, Number(p?.totalSeconds) || 0),
+    sessionCount: Math.max(0, Number(p?.sessionCount) || 0),
+    firstSeenAt: p?.firstSeenAt || null,
     lastSeenAt: p?.lastSeenAt || null,
     online: online.has(steamId)
   })).sort((a, b) => b.totalSeconds - a.totalSeconds || a.name.localeCompare(b.name));
   const totalSeconds = rows.reduce((sum, p) => sum + p.totalSeconds, 0);
+  const hours = (stats.hours || []).map((row) => ({
+    hour: Number(row.hour) || 0,
+    samples: Number(row.samples) || 0,
+    averagePlayers: Number(row.samples) ? Number(row.playerSum || 0) / Number(row.samples) : 0,
+    maxPlayers: Number(row.maxPlayers) || 0
+  })).sort((a, b) => a.hour - b.hour);
+  return { id: server.id, label: server.label, rows, totalSeconds, uniquePlayers: rows.length, onlinePlayers: online.size, hours, lastPollAt: stats.lastPollAt || null };
+}
+
+function snapshotFromStats(stats, servers, onlineByServer = new Map()) {
+  const serverSnaps = servers.map((server) => serverSnapshot(server, stats.servers?.[server.id] || normalizeServerStats(null), onlineByServer.get(server.id) || new Map()));
+  const players = new Map();
+  for (const server of serverSnaps) {
+    for (const row of server.rows) {
+      const current = players.get(row.steamId) || { steamId: row.steamId, name: row.name, clanTag: row.clanTag, totalSeconds: 0, sessionCount: 0, firstSeenAt: row.firstSeenAt, lastSeenAt: row.lastSeenAt, online: false, servers: [] };
+      current.name = row.name || current.name;
+      current.clanTag = row.clanTag || current.clanTag;
+      current.totalSeconds += row.totalSeconds;
+      current.sessionCount += row.sessionCount;
+      current.online ||= row.online;
+      if (!current.firstSeenAt || (row.firstSeenAt && String(row.firstSeenAt) < String(current.firstSeenAt))) current.firstSeenAt = row.firstSeenAt;
+      if (!current.lastSeenAt || (row.lastSeenAt && String(row.lastSeenAt) > String(current.lastSeenAt))) current.lastSeenAt = row.lastSeenAt;
+      current.servers.push({ id: server.id, label: server.label, totalSeconds: row.totalSeconds, sessionCount: row.sessionCount, online: row.online, lastSeenAt: row.lastSeenAt });
+      players.set(row.steamId, current);
+    }
+  }
+  const rows = [...players.values()].sort((a, b) => b.totalSeconds - a.totalSeconds || a.name.localeCompare(b.name));
+  const totalSeconds = serverSnaps.reduce((sum, s) => sum + s.totalSeconds, 0);
   const clanMap = new Map();
   for (const row of rows) {
     if (!row.clanTag) continue;
@@ -122,20 +192,32 @@ function snapshotFromStats(stats, online = new Map()) {
     clanMap.set(row.clanTag, current);
   }
   const clans = [...clanMap.values()].sort((a, b) => b.totalSeconds - a.totalSeconds || b.players - a.players || a.tag.localeCompare(b.tag));
-  const hours = (stats.hours || []).map((row) => ({
-    hour: Number(row.hour) || 0,
-    samples: Number(row.samples) || 0,
-    averagePlayers: Number(row.samples) ? Number(row.playerSum || 0) / Number(row.samples) : 0,
-    maxPlayers: Number(row.maxPlayers) || 0
-  })).sort((a, b) => a.hour - b.hour);
-  return { rows, top25: rows.slice(0, 25), totalSeconds, uniquePlayers: rows.length, onlinePlayers: online.size, clans, hours, startedAt: stats.startedAt, lastPollAt: stats.lastPollAt };
+  const hours = (Array.isArray(stats.hours) ? stats.hours : emptyHours()).map((row, hour) => ({
+    hour,
+    samples: Number(row?.samples) || 0,
+    averagePlayers: Number(row?.samples) ? Number(row?.playerSum || 0) / Number(row.samples) : 0,
+    maxPlayers: Number(row?.maxPlayers) || 0
+  }));
+  return {
+    rows,
+    top25: rows.slice(0, 25),
+    totalSeconds,
+    uniquePlayers: rows.length,
+    onlinePlayers: serverSnaps.reduce((sum, s) => sum + s.onlinePlayers, 0),
+    clans,
+    hours,
+    servers: serverSnaps,
+    startedAt: stats.startedAt,
+    lastPollAt: stats.lastPollAt
+  };
 }
 
 function signature(bot) {
   return JSON.stringify({
     enabled: Boolean(bot.enabled), botTokenEnc: bot.botTokenEnc || '', leaderboardChannelId: bot.leaderboardChannelId || '',
-    wardogsBaseUrl: bot.wardogsBaseUrl || '', wardogsSecretEnc: bot.wardogsSecretEnc || '', allowPrivateTarget: Boolean(bot.allowPrivateTarget),
-    pollSeconds: Number(bot.pollSeconds || 30), statsTimezone: timeZone(bot), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    playtimeServers: playtimeTrackerServers(bot).map((s) => ({ id: s.id, label: s.label, baseUrl: s.baseUrl, secretEnc: s.secretEnc })),
+    allowPrivateTarget: Boolean(bot.allowPrivateTarget), pollSeconds: Number(bot.pollSeconds || 30), statsTimezone: timeZone(bot),
+    accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -148,7 +230,8 @@ async function saveState(botId, state, force = false) {
 }
 
 async function buildLeaderboardPayload(bot, state) {
-  const snapshot = snapshotFromStats(state.stats, state.online || new Map());
+  const servers = playtimeTrackerServers(bot);
+  const snapshot = snapshotFromStats(state.stats, servers, state.onlineByServer || new Map());
   const lines = snapshot.top25.length ? snapshot.top25.map((p, index) => `**${index + 1}.** ${String(p.name).slice(0, 45)} — **${formatDuration(p.totalSeconds)}**`).join('\n') : 'No tracked players yet.';
   const embed = new EmbedBuilder()
     .setTitle('WARDOGS Playtime · Top 25')
@@ -156,7 +239,8 @@ async function buildLeaderboardPayload(bot, state) {
     .addFields(
       { name: 'Total tracked playtime', value: formatDuration(snapshot.totalSeconds), inline: true },
       { name: 'Tracked players', value: String(snapshot.uniquePlayers), inline: true },
-      { name: 'Online now', value: String(snapshot.onlinePlayers), inline: true }
+      { name: 'Online now', value: String(snapshot.onlinePlayers), inline: true },
+      { name: 'Tracked servers', value: String(servers.length), inline: true }
     )
     .setFooter({ text: 'status-hub.lol · updates every 6 hours' })
     .setTimestamp(new Date());
@@ -182,49 +266,88 @@ async function publishLeaderboard(bot, state) {
   return { ok: true, messageId: message.id, at };
 }
 
+function updateServerStats(bot, server, serverStats, previous, current, lastTick, now) {
+  const elapsed = lastTick ? Math.max(0, Math.min(300, (now - lastTick) / 1000)) : 0;
+  if (elapsed > 0) {
+    for (const [steamId] of previous) {
+      if (!current.has(steamId)) continue;
+      const record = serverStats.players[steamId] || { totalSeconds: 0 };
+      record.totalSeconds = Math.max(0, Number(record.totalSeconds) || 0) + elapsed;
+      serverStats.players[steamId] = record;
+    }
+  }
+  for (const [steamId, player] of current) {
+    const name = String(player?.name || player?.playerName || steamId).trim().slice(0, 100) || steamId;
+    const isNewSession = !previous.has(steamId);
+    const record = serverStats.players[steamId] || { totalSeconds: 0, firstSeenAt: nowIso(), sessionCount: 0 };
+    record.name = name;
+    record.clanTag = extractClanTag(name);
+    record.lastSeenAt = nowIso();
+    if (!record.firstSeenAt) record.firstSeenAt = nowIso();
+    if (isNewSession) record.sessionCount = Math.max(0, Number(record.sessionCount) || 0) + 1;
+    serverStats.players[steamId] = record;
+  }
+  const zone = timeZone(bot);
+  const hour = hourInZone(new Date(now), zone);
+  const bucket = serverStats.hours[hour] || { hour, samples: 0, playerSum: 0, maxPlayers: 0 };
+  bucket.samples += 1;
+  bucket.playerSum += current.size;
+  bucket.maxPlayers = Math.max(bucket.maxPlayers, current.size);
+  serverStats.hours[hour] = bucket;
+  serverStats.lastPollAt = nowIso();
+}
+
 async function pollOne(bot, state, { forceLeaderboard = false } = {}) {
   if (state.pollInFlight) return;
   state.pollInFlight = true;
   try {
-    const data = await wardogsRequest(bot, '/v1/players');
-    const rawPlayers = listPlayers(data);
+    const servers = playtimeTrackerServers(bot);
+    if (!servers.length) throw new Error('At least one WARDOGS server is required');
+    // Keep runtime stats aligned when a server is added/removed without losing the
+    // history of the remaining servers.
+    state.stats = normalizeStats(state.stats, servers);
+    const results = await Promise.allSettled(servers.map(async (server) => ({ server, data: await wardogsRequest(bot, server, '/v1/players') })));
     const now = Date.now();
-    const current = new Map();
-    for (const player of rawPlayers) {
-      const steamId = playerSteamId(player);
-      if (!steamId) continue;
-      current.set(steamId, player);
-    }
-    const previous = state.online || new Map();
-    const elapsed = state.lastTick ? Math.max(0, Math.min(300, (now - state.lastTick) / 1000)) : 0;
-    if (elapsed > 0) {
-      for (const [steamId] of previous) {
-        if (!current.has(steamId)) continue;
-        const record = state.stats.players[steamId] || { totalSeconds: 0 };
-        record.totalSeconds = Math.max(0, Number(record.totalSeconds) || 0) + elapsed;
-        state.stats.players[steamId] = record;
+    const serverErrors = [];
+    let successful = 0;
+    let onlineTotal = 0;
+    for (const result of results) {
+      if (result.status !== 'fulfilled') {
+        serverErrors.push(String(result.reason?.message || result.reason).slice(0, 240));
+        continue;
       }
+      successful += 1;
+      const { server, data } = result.value;
+      const rawPlayers = listPlayers(data);
+      const current = new Map();
+      for (const player of rawPlayers) {
+        const steamId = playerSteamId(player);
+        if (!steamId) continue;
+        current.set(steamId, player);
+      }
+      const previous = state.onlineByServer.get(server.id) || new Map();
+      const serverStats = state.stats.servers[server.id] || normalizeServerStats(null);
+      updateServerStats(bot, server, serverStats, previous, current, state.lastTickByServer.get(server.id) || 0, now);
+      state.stats.servers[server.id] = serverStats;
+      state.onlineByServer.set(server.id, current);
+      state.lastTickByServer.set(server.id, now);
+      onlineTotal += current.size;
     }
-    for (const [steamId, player] of current) {
-      const name = String(player?.name || player?.playerName || steamId).trim().slice(0, 100) || steamId;
-      const record = state.stats.players[steamId] || { totalSeconds: 0, firstSeenAt: nowIso() };
-      record.name = name;
-      record.clanTag = extractClanTag(name);
-      record.lastSeenAt = nowIso();
-      if (!record.firstSeenAt) record.firstSeenAt = nowIso();
-      state.stats.players[steamId] = record;
+    if (!successful) throw new Error(serverErrors[0] || 'All WARDOGS servers failed');
+    if (successful === servers.length) {
+      const zone = timeZone(bot), hour = hourInZone(new Date(now), zone);
+      const bucket = state.stats.hours[hour] || { hour, samples: 0, playerSum: 0, maxPlayers: 0 };
+      bucket.samples += 1; bucket.playerSum += onlineTotal; bucket.maxPlayers = Math.max(bucket.maxPlayers, onlineTotal); state.stats.hours[hour] = bucket;
     }
-    const zone = timeZone(bot);
-    const hour = hourInZone(new Date(now), zone);
-    const bucket = state.stats.hours[hour] || { hour, samples: 0, playerSum: 0, maxPlayers: 0 };
-    bucket.samples += 1;
-    bucket.playerSum += current.size;
-    bucket.maxPlayers = Math.max(bucket.maxPlayers, current.size);
-    state.stats.hours[hour] = bucket;
     state.stats.lastPollAt = nowIso();
-    state.online = current;
-    state.lastTick = now;
-    setRuntime(bot.id, { state: 'online', players: current.size, lastCheck: nowIso(), lastError: null });
+    setRuntime(bot.id, {
+      state: serverErrors.length ? 'online' : 'online',
+      players: onlineTotal,
+      trackedServers: servers.length,
+      reachableServers: successful,
+      lastCheck: nowIso(),
+      lastError: serverErrors.length ? `${serverErrors.length}/${servers.length} server(s) failed: ${serverErrors.join(' · ')}`.slice(0, 500) : null
+    });
     await saveState(bot.id, state);
 
     const fresh = getManagedBot(bot.id) || bot;
@@ -255,7 +378,9 @@ async function startOne(bot) {
   await stopOne(bot.id, false);
   if (bot.serviceId !== PLAYTIME_SERVICE_ID) return;
   if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: accessActive(bot) ? 'stopped' : 'access-expired' }); return; }
-  if (!bot.wardogsBaseUrl || !bot.wardogsSecretEnc) throw new Error('WARDOGS URL and RCON password are required');
+  const servers = playtimeTrackerServers(bot);
+  if (!servers.length) throw new Error('At least one WARDOGS server is required');
+  if (servers.some((server) => !server.secretEnc)) throw new Error('Every tracked WARDOGS server needs an RCON/API password');
   const wantsDiscord = validSnowflake(bot.leaderboardChannelId);
   let token = '';
   if (bot.botTokenEnc) { try { token = decryptSecret(bot.botTokenEnc); } catch {} }
@@ -267,7 +392,15 @@ async function startOne(bot) {
     client.on('invalidated', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now() }));
     client.on('shardResume', () => clearRecovery(bot.id));
   }
-  const state = { stats: normalizeStats(bot.playtimeStats), online: new Map(), lastTick: 0, pollInFlight: false, client, lastSavedAt: 0, leaderboardMessageId: String(bot.leaderboardMessageId || '') };
+  const state = {
+    stats: normalizeStats(bot.playtimeStats, servers),
+    onlineByServer: new Map(),
+    lastTickByServer: new Map(),
+    pollInFlight: false,
+    client,
+    lastSavedAt: 0,
+    leaderboardMessageId: String(bot.leaderboardMessageId || '')
+  };
   try {
     if (client) {
       await new Promise((resolve, reject) => {
@@ -278,7 +411,7 @@ async function startOne(bot) {
     }
     const fresh = getManagedBot(bot.id) || bot;
     if (!fresh.enabled || !accessActive(fresh)) { if (client) await client.destroy(); setRuntime(bot.id, { state: accessActive(fresh) ? 'stopped' : 'access-expired' }); return; }
-    setRuntime(bot.id, { state: client ? 'connected' : 'online', botTag: client?.user?.tag || null, botId: client?.user?.id || null, lastError: null });
+    setRuntime(bot.id, { state: client ? 'connected' : 'online', botTag: client?.user?.tag || null, botId: client?.user?.id || null, lastError: null, trackedServers: servers.length });
     await pollOne(fresh, state);
     const timer = setInterval(() => {
       const latest = getManagedBot(bot.id);
@@ -289,7 +422,7 @@ async function startOne(bot) {
     instances.set(bot.id, { client, timer, signature: signature(fresh), state });
     clearRecovery(bot.id);
   } catch (error) {
-    try { await client.destroy(); } catch {}
+    try { await client?.destroy?.(); } catch {}
     throw error;
   }
 }
@@ -345,7 +478,16 @@ export async function restartPlaytimeBot(bot) {
 }
 export async function stopPlaytimeBot(id) { return withLock(id, () => stopOne(id)); }
 export async function shutdownPlaytimeBots() { for (const id of [...instances.keys()]) await withLock(id, () => stopOne(id, false)); }
-export async function testPlaytimeWardogs(bot) { const data = await wardogsRequest(bot, '/v1/players'); return { playerCount: listPlayers(data).length }; }
+export async function testPlaytimeWardogs(bot) {
+  const servers = playtimeTrackerServers(bot);
+  if (!servers.length) throw new Error('At least one WARDOGS server is required');
+  const results = [];
+  for (const server of servers) {
+    const data = await wardogsRequest(bot, server, '/v1/players');
+    results.push({ id: server.id, label: server.label, playerCount: listPlayers(data).length });
+  }
+  return { serverCount: results.length, playerCount: results.reduce((sum, row) => sum + row.playerCount, 0), servers: results };
+}
 export async function refreshPlaytimeTracker(bot, { publish = false } = {}) {
   const active = instances.get(bot.id);
   if (!active) throw new Error('Playtime tracker is not running');
@@ -354,7 +496,8 @@ export async function refreshPlaytimeTracker(bot, { publish = false } = {}) {
   return playtimeTrackerSnapshot(getManagedBot(bot.id) || bot);
 }
 export function playtimeTrackerSnapshot(bot) {
+  const servers = playtimeTrackerServers(bot);
   const active = instances.get(bot?.id);
-  const stats = active?.state?.stats || normalizeStats(bot?.playtimeStats);
-  return { ...snapshotFromStats(stats, active?.state?.online || new Map()), runtime: playtimeBotRuntime(bot?.id), timezone: timeZone(bot) };
+  const stats = active?.state?.stats || normalizeStats(bot?.playtimeStats, servers);
+  return { ...snapshotFromStats(stats, servers, active?.state?.onlineByServer || new Map()), runtime: playtimeBotRuntime(bot?.id), timezone: timeZone(bot) };
 }

@@ -23,4 +23,4 @@ export function restartCustomBot(bot) { return call('/restart', { id: bot.id, en
 export function stopCustomBot(bot) { return call('/stop', { id: bot.id }, 30000); }
 export function deleteCustomBotRuntime(bot) { return call('/delete', { id: bot.id }, 45000); }
 export function customBotStatus(bot) { return call('/status', { id: bot.id }, 7000); }
-export function customBotLogs(bot) { return call('/logs', { id: bot.id }, 15000); }
+export function customBotLogs(bot) { const env = envFor(bot); return call('/logs', { id: bot.id, redact: Object.values(env).map(String).filter((x) => x.length >= 6).slice(0, 50) }, 15000); }

@@ -13,6 +13,7 @@ if [[ -d .git ]]; then
 fi
 if [[ -f compose.override.yaml ]] && grep -q "wardogs-panel" compose.override.yaml; then mv compose.override.yaml "compose.override.yaml.v2-backup-$(date +%Y%m%d-%H%M%S)"; fi
 [[ -f .env ]] || { cp .env.example .env; echo "Missing .env. Template created; fill it before starting."; exit 1; }
+chmod 600 .env
 if ! grep -q '^RUNNER_SHARED_SECRET=' .env; then echo "RUNNER_SHARED_SECRET=$(openssl rand -hex 48)" >> .env; fi
 if ! grep -q '^RUNNER_URL=' .env; then echo 'RUNNER_URL=http://runner:4000' >> .env; fi
 if ! grep -q '^ALLOW_PUBLIC_REGISTRATION=' .env; then echo 'ALLOW_PUBLIC_REGISTRATION=true' >> .env; fi
@@ -31,11 +32,18 @@ if ! grep -q '^DONATE_KOFI_URL=' .env; then echo 'DONATE_KOFI_URL=' >> .env; fi
 if ! grep -q '^DONATE_STRIPE_URL=' .env; then echo 'DONATE_STRIPE_URL=' >> .env; fi
 if ! grep -q '^NODE_INSTALL_SCRIPT_URL=' .env; then echo 'NODE_INSTALL_SCRIPT_URL=https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh' >> .env; fi
 if ! grep -q '^STEAM_WEB_API_KEY=' .env; then echo 'STEAM_WEB_API_KEY=' >> .env; fi
+if ! grep -q '^SECURITY_GLOBAL_LIMIT=' .env; then echo 'SECURITY_GLOBAL_LIMIT=1200' >> .env; fi
+if ! grep -q '^SECURITY_WRITE_LIMIT=' .env; then echo 'SECURITY_WRITE_LIMIT=180' >> .env; fi
+if ! grep -q '^ADMIN_IP_ALLOWLIST=' .env; then echo 'ADMIN_IP_ALLOWLIST=' >> .env; fi
 mkdir -p data custom-bots
 chown -R 1000:1000 data custom-bots
 chmod 750 data custom-bots
+find data -type f -exec chmod 600 {} + 2>/dev/null || true
+find custom-bots -type f -exec chmod 600 {} + 2>/dev/null || true
 if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
 "${COMPOSE[@]}" up -d --build --remove-orphans
 "${COMPOSE[@]}" ps
 echo "==> Update complete"
 echo "==> Enabled status bots restore automatically when the status node reconnects"
+echo "==> Security check"
+bash ./security-check.sh || true
