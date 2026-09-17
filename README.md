@@ -1,4 +1,4 @@
-# status-hub.lol v3.11.3
+# status-hub.lol v3.11.5
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
@@ -167,3 +167,17 @@ WARDOGS supports live faction scores from `/v1/status`. Available status tags: `
 - Premium uses a dedicated checkout page: **Buy → Checkout → one-time/subscription → PayPal/Stripe**.
 - PayPal subscription setup now distinguishes saved prices from PayPal billing plans and persists created plans before webhook setup.
 - Custom-bot ZIP uploads accept the common outer-folder layout, can auto-detect common entrypoints, default to a 25 MB upload limit and keep a successful upload even when the subsequent Docker build fails.
+
+
+## v3.11.4
+
+- Custom-bot ZIP uploads ignore dependency/cache folders such as `node_modules`, `.git`, `venv`, `.venv` and `__pycache__`.
+- Up to 5,000 relevant source files and 20,000 raw ZIP entries are accepted, with a 100 MB unpacked-size limit.
+
+## v3.11.5
+
+- Custom-bot ZIP validation now rejects unsafe/duplicate paths and checks the 100 MB expanded-size limit before extraction.
+- Outer project folders work with both automatic and manually entered entrypoints.
+- Node entrypoints can be detected from `package.json`; additional common Node/Python entry filenames are recognized.
+- Multipart upload errors return cleanly to the upload form and upload fields/parts have explicit limits.
+- Failed build/start attempts no longer leave custom bots marked as enabled.

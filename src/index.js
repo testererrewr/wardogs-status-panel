@@ -41,7 +41,18 @@ const secureCookie = process.env.COOKIE_SECURE === 'true' || baseUrl.startsWith(
 const bootstrapAdmins = new Set((process.env.ADMIN_DISCORD_IDS || '').split(',').map((x) => x.trim()).filter(Boolean));
 const firstAdmin = [...bootstrapAdmins][0] || '';
 const uploadMaxMb = Math.min(25, Math.max(1, Number(process.env.CUSTOM_UPLOAD_MAX_MB || 25)));
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: uploadMaxMb * 1024 * 1024, files: 1 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: uploadMaxMb * 1024 * 1024, files: 1, fields: 8, parts: 10, fieldSize: 256 * 1024 } });
+function customBotUpload(req, res, next) {
+  upload.single('archive')(req, res, (err) => {
+    if (!err) return next();
+    const code = err instanceof multer.MulterError ? err.code : '';
+    const message = code === 'LIMIT_FILE_SIZE'
+      ? l(req, `Upload zu groß. Maximal ${uploadMaxMb} MB ZIP erlaubt.`, `Upload too large. Maximum ZIP size is ${uploadMaxMb} MB.`)
+      : l(req, `ZIP-Upload fehlgeschlagen: ${String(err.message || err).slice(0, 180)}`, `ZIP upload failed: ${String(err.message || err).slice(0, 180)}`);
+    flash(req, 'err', message);
+    return res.redirect('/custom-bots/new');
+  });
+}
 
 assignLegacyOwnership(firstAdmin);
 
@@ -1006,13 +1017,13 @@ app.get('/custom-bots/new', requireLogin, (req,res)=>{
   render(req,res,l(req,'Custom Bot hochladen','Upload custom bot'),`<div class="pagehead"><div><h1>${l(req,'Custom Bot hochladen','Upload custom bot')}</h1><p>${l(req,'ZIP mit Sourcecode; jeder Upload benötigt Admin-Freigabe.','ZIP with source code; every upload requires admin approval.')}</p></div></div>${customBotForm({csrf:csrf(req),lang:langOf(req)})}`);
 });
 
-app.post('/custom-bots/new', requireLogin, upload.single('archive'), checkCsrf, async (req,res)=>{
+app.post('/custom-bots/new', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), customBotUpload, checkCsrf, async (req,res)=>{
   let preparedId='';
   try{
     const u=currentUser(req); const count=readDb().customBots.filter((b)=>b.ownerDiscordId===u.discordId).length;
     if(count>=customLimit(u))throw new Error(l(req,'Keine freien Custom-Bot-Slots','No free custom bot slots'));
     if(!req.file)throw new Error(l(req,'ZIP-Datei fehlt','ZIP file is missing'));
-    const name=String(req.body.name||'').trim(); if(!name)throw new Error(l(req,'Name fehlt','Name is required'));
+    const name=String(req.body.name||'').trim(); if(!name)throw new Error(l(req,'Name fehlt','Name is required')); if(name.length>80)throw new Error(l(req,'Name ist zu lang (maximal 80 Zeichen)','Name is too long (maximum 80 characters)'));
     const env=parseEnvText(req.body.envText);
     const runtime=String(req.body.runtime||'node22');
     const prep=prepareCustomBot({buffer:req.file.buffer,runtime,entrypoint:req.body.entrypoint}); preparedId=prep.id;
@@ -1032,9 +1043,9 @@ app.post('/custom-bots/new', requireLogin, upload.single('archive'), checkCsrf, 
   }catch(error){if(preparedId)deleteCustomBotFiles(preparedId);flash(req,/slots|limit/i.test(String(error.message))?'limit':'err',error.message);res.redirect('/custom-bots/new');}
 });
 
-app.post('/custom-bots/:id/approve', requireAdmin, checkCsrf, async (req,res)=>{try{const b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');const bot=upsertCustomBot({id:b.id,approvalState:'approved',enabled:true,reviewNote:l(req,'Von Admin freigegeben','Approved by admin')});await ensureCustomBot(bot);flash(req,'ok',l(req,'Custom Bot freigegeben und gestartet.','Custom bot approved and started.'));}catch(e){flash(req,'err',e.message);}res.redirect('/admin?tab=bots#bots');});
+app.post('/custom-bots/:id/approve', requireAdmin, checkCsrf, async (req,res)=>{let b=null;try{b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');const bot=upsertCustomBot({id:b.id,approvalState:'approved',enabled:true,reviewNote:l(req,'Von Admin freigegeben','Approved by admin')});await ensureCustomBot(bot);flash(req,'ok',l(req,'Custom Bot freigegeben und gestartet.','Custom bot approved and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,approvalState:'approved',enabled:false,reviewNote:l(req,`Freigegeben, Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Approved, start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect('/admin?tab=bots#bots');});
 app.post('/custom-bots/:id/revoke', requireAdmin, checkCsrf, async (req,res)=>{const b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,approvalState:'rejected',enabled:false,reviewNote:l(req,'Freigabe entzogen','Approval revoked')});flash(req,'ok',l(req,'Freigabe entzogen.','Approval revoked.'));res.redirect('/admin?tab=bots#bots');});
-app.post('/custom-bots/:id/start', requireLogin, checkCsrf, async (req,res)=>{try{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});await restartCustomBot(bot);flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){flash(req,'err',e.message);}res.redirect('/custom-bots');});
+app.post('/custom-bots/:id/start', requireLogin, checkCsrf, async (req,res)=>{let b=null;try{b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});await restartCustomBot(bot);upsertCustomBot({id:b.id,reviewNote:''});flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,enabled:false,reviewNote:l(req,`Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect('/custom-bots');});
 app.post('/custom-bots/:id/stop', requireLogin, checkCsrf, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,enabled:false});flash(req,'ok',l(req,'Custom Bot gestoppt.','Custom bot stopped.'));res.redirect('/custom-bots');});
 app.get('/custom-bots/:id/source', requireLogin, (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');const file=`custom-bots/${b.id}/source.zip`;res.download(file,`${String(b.name||'custom-bot').replace(/[^A-Za-z0-9._-]+/g,'_')}.zip`);});
 app.get('/custom-bots/:id/logs', requireLogin, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');let logs='';try{logs=(await customBotLogs(b)).logs||'';}catch(e){logs=`Logs unavailable: ${e.message}`;}render(req,res,'Custom Bot Logs',`<div class="pagehead"><div><h1>${esc(b.name)} · Logs</h1></div><a class="button ghost" href="/custom-bots">${l(req,'Zurück','Back')}</a></div><pre class="panel logbox">${esc(logs)}</pre>`);});
