@@ -17,10 +17,9 @@
     hours: lang === 'en' ? 'hours' : 'Stunden',
     days: lang === 'en' ? 'days' : 'Tage',
     active: lang === 'en' ? 'active' : 'aktiv',
-    duration: lang === 'en' ? 'minutes' : 'Minuten',
     templateName: lang === 'en' ? 'Template name' : 'Template-Name',
     banReason: lang === 'en' ? 'Ban reason' : 'Ban-Grund',
-    permanent: lang === 'en' ? '0 = permanent' : '0 = permanent'
+    permanent: lang === 'en' ? 'Permanent' : 'Permanent'
   };
   const ruleLabels = {
     vac_bans: 'VAC-Bans',
@@ -41,6 +40,23 @@
     map: lang === 'en' ? 'Change map' : 'Map wechseln', lighting: 'Lighting',
     ignore: lang === 'en' ? 'Ignore detection alerts' : 'Warnungen ignorieren'
   };
+
+  function durationControls(baseName, { temporaryOnly = false, unit = '', value = 1 } = {}) {
+    const selectedUnit = unit || (temporaryOnly ? 'days' : 'permanent');
+    const permanent = temporaryOnly ? '' : `<option value="permanent" ${selectedUnit === 'permanent' ? 'selected' : ''}>${t.permanent}</option>`;
+    const hidden = selectedUnit === 'permanent' && !temporaryOnly;
+    return `<span class="managed-duration" data-ban-duration><select name="${baseName}Unit" data-duration-unit>${permanent}<option value="hours" ${selectedUnit === 'hours' ? 'selected' : ''}>${t.hours}</option><option value="days" ${selectedUnit === 'days' ? 'selected' : ''}>${t.days}</option></select><input name="${baseName}Value" data-duration-value type="number" min="0.1" max="8760" step="0.1" value="${value}" ${hidden ? 'hidden disabled' : ''}></span>`;
+  }
+
+  function syncDuration(container) {
+    const unit = container?.querySelector?.('[data-duration-unit]');
+    const value = container?.querySelector?.('[data-duration-value]');
+    if (!unit || !value) return;
+    const permanent = unit.value === 'permanent';
+    value.hidden = permanent;
+    value.disabled = permanent;
+    if (!permanent && (!Number(value.value) || Number(value.value) <= 0)) value.value = '1';
+  }
 
   function ruleOptions(selected = 'vac_bans') {
     return Object.entries(ruleLabels).map(([value, label]) => `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`).join('');
@@ -64,7 +80,7 @@
       <span class="managed-rule-unit" data-rule-unit>${t.count}</span>
       <input name="ruleReason_${i}" maxlength="180" placeholder="${t.reason}">
       <select name="ruleAction_${i}" data-rule-action>${actionOptions()}</select>
-      <input name="ruleDuration_${i}" data-rule-duration type="number" min="1" max="525600" step="1" value="1440" placeholder="1440" hidden>
+      <span data-rule-duration hidden>${durationControls(`ruleDuration_${i}`, { temporaryOnly: true, unit: 'days', value: 1 })}</span>
       <button class="button danger smallbtn" type="button" data-remove-rule>×</button>
     </div>`;
   }
@@ -78,7 +94,7 @@
     return `<div class="managed-ban-template-row" data-ban-template-row>
       <input name="banTemplateLabel_${i}" maxlength="60" required placeholder="${t.templateName}">
       <input name="banTemplateReason_${i}" maxlength="180" required placeholder="${t.banReason}">
-      <input name="banTemplateDuration_${i}" type="number" min="0" max="525600" step="1" value="0" placeholder="${t.permanent}">
+      ${durationControls(`banTemplateDuration_${i}`, { unit: 'permanent', value: 1 })}
       <button class="button danger smallbtn" type="button" data-remove-ban-template>×</button>
     </div>`;
   }
@@ -89,8 +105,8 @@
     if (!action || !duration) return;
     const temporary = action.value === 'tempban';
     duration.hidden = !temporary;
-    duration.disabled = !temporary;
-    if (temporary && (!Number(duration.value) || Number(duration.value) < 1)) duration.value = '1440';
+    for (const field of duration.querySelectorAll('input,select')) field.disabled = !temporary;
+    if (temporary) syncDuration(duration.querySelector('[data-ban-duration]'));
   }
 
   function syncRule(row) {
@@ -126,6 +142,7 @@
   document.getElementById('add-ban-template')?.addEventListener('click', () => {
     if (!banTemplates || banTemplateIndex >= 12) return;
     banTemplates.insertAdjacentHTML('beforeend', banTemplate(banTemplateIndex++));
+    syncDuration(banTemplates.lastElementChild?.querySelector('[data-ban-duration]'));
   });
 
   document.addEventListener('click', (event) => {
@@ -141,9 +158,11 @@
     if (!(target instanceof Element)) return;
     if (target.matches('[data-rule-type]')) syncRule(target.closest('[data-rule-row]'));
     if (target.matches('[data-rule-action]')) syncRuleAction(target.closest('[data-rule-row]'));
+    if (target.matches('[data-duration-unit]')) syncDuration(target.closest('[data-ban-duration]'));
   });
 
   rules.querySelectorAll('[data-rule-row]').forEach(syncRule);
+  document.querySelectorAll('[data-ban-duration]').forEach(syncDuration);
 })();
 
 (() => {

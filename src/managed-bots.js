@@ -287,16 +287,19 @@ export async function testManagedWardogs(bot) {
   return { status, playerCount: Array.isArray(players?.players) ? players.players.length : Number(players?.count || 0) };
 }
 
-export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation') {
-  const normalized = normalizeSteamId64(steamId);
-  if (!normalized) throw new Error('Invalid SteamID64');
-  const result = await wardogsRequest(bot, '/v1/bans', { method: 'POST', body: { steamId: normalized, reason: String(reason || '').slice(0, 180) } });
-  const fresh = getManagedBot(bot?.id);
-  if (fresh) {
-    const next = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
-    if (next.length !== temporaryBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: next });
-  }
-  return result;
+export function normalizeManagedBanDiscordLink(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw.replace(/^\/+/, '')}`;
+  let url;
+  try { url = new URL(raw); } catch { return ''; }
+  const host = String(url.hostname || '').toLowerCase().replace(/^www\./, '');
+  const parts = String(url.pathname || '').split('/').filter(Boolean);
+  let code = '';
+  if (host === 'discord.gg') code = parts[0] || '';
+  else if ((host === 'discord.com' || host === 'discordapp.com') && String(parts[0] || '').toLowerCase() === 'invite') code = parts[1] || '';
+  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(code)) return '';
+  return `https://discord.gg/${code}`;
 }
 
 export function formatManagedBanDuration(durationMinutes) {
@@ -317,11 +320,28 @@ export function formatManagedBanDuration(durationMinutes) {
   return `${minutes} minute${minutes === 1 ? '' : 's'}`;
 }
 
-function temporaryBanMessage(reason, durationMinutes) {
-  const duration = formatManagedBanDuration(durationMinutes);
-  const prefix = `Ban duration: ${duration} | `;
-  const cleanReason = String(reason || 'Temporary WARDOGS ban').trim() || 'Temporary WARDOGS ban';
-  return `${prefix}${cleanReason}`.slice(0, 180);
+export function formatManagedBanReason(bot, reason, durationMinutes = 0) {
+  const minutes = Math.max(0, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
+  const prefix = minutes > 0 ? `Ban duration: ${formatManagedBanDuration(minutes)} | ` : '';
+  const invite = normalizeManagedBanDiscordLink(bot?.banDiscordLink);
+  const suffix = invite ? ` | Discord: ${invite}` : '';
+  let cleanReason = String(reason || (minutes > 0 ? 'Temporary WARDOGS ban' : 'WARDOGS rule violation')).trim();
+  cleanReason = cleanReason.replace(/^Ban duration:\s*[^|]{1,80}\|\s*/i, '').replace(/\s*\|\s*Discord:\s*https?:\/\/[^\s|]+\s*$/i, '').trim();
+  if (!cleanReason) cleanReason = minutes > 0 ? 'Temporary WARDOGS ban' : 'WARDOGS rule violation';
+  const available = Math.max(1, 180 - prefix.length - suffix.length);
+  return `${prefix}${cleanReason.slice(0, available)}${suffix}`.slice(0, 180);
+}
+
+export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation', options = {}) {
+  const normalized = normalizeSteamId64(steamId);
+  if (!normalized) throw new Error('Invalid SteamID64');
+  const result = await wardogsRequest(bot, '/v1/bans', { method: 'POST', body: { steamId: normalized, reason: formatManagedBanReason(bot, reason, options?.durationMinutes) } });
+  const fresh = getManagedBot(bot?.id);
+  if (fresh) {
+    const next = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
+    if (next.length !== temporaryBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: next });
+  }
+  return result;
 }
 
 export async function temporaryBanManagedPlayer(bot, steamId, reason = 'Temporary WARDOGS ban', durationMinutes = 1440, meta = {}) {
@@ -333,7 +353,7 @@ export async function temporaryBanManagedPlayer(bot, steamId, reason = 'Temporar
   // normal ban and persists the expiry locally, then removes it when the time is due.
   // Put the temporary duration into the actual WARDOGS ban reason so the player-facing
   // ban message also states how long the ban lasts.
-  await banManagedPlayer(bot, normalized, temporaryBanMessage(reason, minutes));
+  await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes });
   const fresh = getManagedBot(bot?.id) || bot;
   const existing = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
   const entry = {
@@ -604,7 +624,7 @@ function signature(bot) {
     steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
     announcementMessages: bot.announcementMessages || '', welcomeWhisperEnabled: bot.welcomeWhisperEnabled === true,
-    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -1045,6 +1065,29 @@ async function lightingPicker(bot) {
   };
 }
 
+function banDurationPicker(bot, target = 'manual') {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`wd:banduration:${bot.id}:${target}`)
+    .setPlaceholder('Choose ban duration')
+    .addOptions([
+      { label: 'Permanent', value: 'permanent', description: 'Permanent ban' },
+      { label: 'Hours', value: 'hours', description: 'Temporary ban in hours' },
+      { label: 'Days', value: 'days', description: 'Temporary ban in days' }
+    ]);
+  return { content: '**Ban duration**', components: [new ActionRowBuilder().addComponents(select)], ephemeral: true };
+}
+
+function discordBanDurationMinutes(interaction, mode) {
+  const normalized = String(mode || 'permanent').toLowerCase();
+  if (normalized === 'permanent') return 0;
+  if (!['hours', 'days'].includes(normalized)) throw new Error('Invalid ban duration mode');
+  const value = Number(String(interaction.fields.getTextInputValue('durationValue') || '').replace(',', '.'));
+  if (!Number.isFinite(value) || value <= 0) throw new Error('Ban duration must be greater than 0');
+  const minutes = Math.round(value * (normalized === 'days' ? 1440 : 60));
+  if (minutes < 1 || minutes > 525600) throw new Error('Ban duration is invalid or too long');
+  return minutes;
+}
+
 async function teamPicker(bot, steamId) {
   const status = await wardogsRequest(bot, '/v1/status');
   const factions = Array.isArray(status?.factionScores) ? [...new Set(status.factionScores.map((x) => String(x?.name || '').trim()).filter(Boolean))] : [];
@@ -1128,10 +1171,7 @@ async function handleButton(interaction, client, state) {
       const permission = ({ pkick: 'kick', pban: 'ban', pwhisper: 'whisper', pkill: 'kill', pteam: 'setteam' })[action];
       const bot = interactionBot(interaction, botId, permission); if (!bot) return true;
       if (action === 'pkick') await interaction.showModal(modal(`wd:mkick:${bot.id}:${steamId}`, 'Kick player', [{ id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' }]));
-      else if (action === 'pban') await interaction.showModal(modal(`wd:mbanplayer:${bot.id}:${steamId}`, 'Ban player', [
-        { id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' },
-        { id: 'duration', label: 'Duration in minutes (0 = permanent)', maxLength: 6, required: false, placeholder: '0' }
-      ]));
+      else if (action === 'pban') await interaction.reply(banDurationPicker(bot, steamId));
       else if (action === 'pwhisper') await interaction.showModal(modal(`wd:mwhisper:${bot.id}:${steamId}`, 'Whisper', [{ id: 'message', label: 'Message', style: TextInputStyle.Paragraph, maxLength: 200 }]));
       else if (action === 'pkill') { await killManagedPlayer(bot, steamId); await interaction.reply({ content: `Kill/respawn sent for ${steamId}.`, ephemeral: true }); }
       else await interaction.reply(await teamPicker(bot, steamId));
@@ -1139,11 +1179,7 @@ async function handleButton(interaction, client, state) {
     }
     if (action === 'manualban') {
       const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
-      await interaction.showModal(modal(`wd:mmanualban:${bot.id}`, 'Ban SteamID', [
-        { id: 'steamId', label: 'SteamID64', maxLength: 17, placeholder: '7656119…' },
-        { id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' },
-        { id: 'duration', label: 'Duration in minutes (0 = permanent)', maxLength: 6, required: false, placeholder: '0' }
-      ])); return true;
+      await interaction.reply(banDurationPicker(bot, 'manual')); return true;
     }
     if (action === 'restartmatch' || action === 'endmatch') {
       const bot = interactionBot(interaction, botId, 'match'); if (!bot) return true;
@@ -1189,6 +1225,27 @@ async function handleSelect(interaction) {
       const steamId = String(interaction.values?.[0] || ''); if (!validSteamId(steamId)) throw new Error('Invalid SteamID64');
       await interaction.reply(await playerControl(bot, steamId)); return true;
     }
+    if (action === 'banduration') {
+      const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
+      const target = String(parts[3] || 'manual');
+      const mode = String(interaction.values?.[0] || 'permanent');
+      if (!['permanent','hours','days'].includes(mode)) throw new Error('Invalid ban duration mode');
+      const durationField = mode === 'permanent' ? [] : [{ id: 'durationValue', label: mode === 'days' ? 'Duration in days' : 'Duration in hours', maxLength: 7, placeholder: mode === 'days' ? '7' : '24' }];
+      if (target === 'manual') {
+        await interaction.showModal(modal(`wd:mmanualban:${bot.id}:manual:${mode}`, 'Ban SteamID', [
+          { id: 'steamId', label: 'SteamID64', maxLength: 17, placeholder: '7656119…' },
+          { id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' },
+          ...durationField
+        ]));
+      } else {
+        if (!validSteamId(target)) throw new Error('Invalid SteamID64');
+        await interaction.showModal(modal(`wd:mbanplayer:${bot.id}:${target}:${mode}`, 'Ban player', [
+          { id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' },
+          ...durationField
+        ]));
+      }
+      return true;
+    }
     if (action === 'unban') {
       const bot = interactionBot(interaction, botId, 'unban'); if (!bot) return true;
       const steamId = String(interaction.values?.[0] || ''); await unbanManagedPlayer(bot, steamId);
@@ -1229,7 +1286,7 @@ async function handleModal(interaction) {
   if (!interaction.isModalSubmit?.()) return false;
   const parts = String(interaction.customId || '').split(':');
   if (parts[0] !== 'wd') return false;
-  const action = parts[1], botId = parts[2], steamId = parts[3];
+  const action = parts[1], botId = parts[2], steamId = parts[3], durationMode = parts[4] || 'permanent';
   try {
     if (action === 'mannounce') {
       const bot = interactionBot(interaction, botId, 'announce'); if (!bot) return true;
@@ -1244,7 +1301,7 @@ async function handleModal(interaction) {
     if (action === 'mbanplayer') {
       const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
       const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel ban';
-      const duration = Math.max(0, Math.min(525600, Math.floor(Number(interaction.fields.getTextInputValue('duration') || 0) || 0)));
+      const duration = discordBanDurationMinutes(interaction, durationMode);
       if (duration > 0) {
         const entry = await temporaryBanManagedPlayer(bot, steamId, reason, duration, { createdBy: `discord:${interaction.user?.id || ''}` });
         await interaction.reply({ content: `${steamId} was temporarily banned for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });
@@ -1263,7 +1320,7 @@ async function handleModal(interaction) {
       const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
       const id = interaction.fields.getTextInputValue('steamId').trim(); if (!validSteamId(id)) throw new Error('Invalid SteamID64');
       const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel ban';
-      const duration = Math.max(0, Math.min(525600, Math.floor(Number(interaction.fields.getTextInputValue('duration') || 0) || 0)));
+      const duration = discordBanDurationMinutes(interaction, durationMode);
       if (duration > 0) {
         const entry = await temporaryBanManagedPlayer(bot, id, reason, duration, { createdBy: `discord:${interaction.user?.id || ''}` });
         await interaction.reply({ content: `${id} was temporarily banned for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });

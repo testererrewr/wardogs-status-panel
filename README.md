@@ -1,4 +1,14 @@
-# status-hub.lol v3.12.14
+# status-hub.lol v3.12.15
+
+
+## v3.12.15 – Ban message settings and duration controls
+
+- WARDOGS Management Bot has a dedicated **Ban messages** settings block with an optional Discord server/invite link.
+- The invite is appended automatically to permanent and temporary bans, including manual bans, ban templates and detection-rule bans.
+- Temporary bans keep the duration at the front, for example: `Ban duration: 1 day | Teamkilling | Discord: https://discord.gg/example`.
+- Ban durations are selected as **Permanent**, **Hours** or **Days** instead of entering raw minutes. This applies to the web panel, ban templates, detection-rule temporary bans and the Discord management panel ban flow.
+- Config export/import includes the non-secret invite setting.
+- Database schema version 26.
 
 ## v3.12.14 – Temporary-ban duration in ban message
 
