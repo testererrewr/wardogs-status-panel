@@ -54,13 +54,101 @@ export async function kickManagedPlayer(bot, steamId, reason = 'WARDOGS rule vio
   if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
   return wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}/kick`, { method: 'POST', body: { reason: String(reason || '').slice(0, 180) } });
 }
+export async function killManagedPlayer(bot, steamId) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  return wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}/kill`, { method: 'POST' });
+}
+export async function whisperManagedPlayer(bot, steamId, message) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  const clean = String(message || '').trim();
+  if (!clean || clean.length > 200) throw new Error('Spielernachricht muss 1–200 Zeichen lang sein');
+  return wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}/message`, { method: 'POST', body: { message: clean } });
+}
+export async function moveManagedPlayer(bot, steamId, faction) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  const clean = String(faction || '').trim();
+  if (!clean || clean.length > 80) throw new Error('Fraktion ist ungültig');
+  const moved = await wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}`, { method: 'PATCH', body: { faction: clean } });
+  let respawn = null;
+  try { respawn = await killManagedPlayer(bot, steamId); } catch {}
+  return { moved, respawn };
+}
+export async function unbanManagedPlayer(bot, steamId) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  return wardogsRequest(bot, `/v1/bans/${encodeURIComponent(steamId)}`, { method: 'DELETE' });
+}
+export async function addManagedReservedSlot(bot, steamId) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  return wardogsRequest(bot, '/v1/reserved-slots', { method: 'POST', body: { steamId: String(steamId) } });
+}
+export async function removeManagedReservedSlot(bot, steamId) {
+  if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+  return wardogsRequest(bot, `/v1/reserved-slots/${encodeURIComponent(steamId)}`, { method: 'DELETE' });
+}
+export async function broadcastManaged(bot, message) {
+  const clean = String(message || '').trim();
+  if (!clean || clean.length > 200) throw new Error('Announcement muss 1–200 Zeichen lang sein');
+  return wardogsRequest(bot, '/v1/broadcast', { method: 'POST', body: { message: clean } });
+}
+export async function restartManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/restart', { method: 'POST' }); }
+export async function endManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/end', { method: 'POST' }); }
+export async function setManagedLighting(bot, lighting) {
+  const clean = String(lighting || '').trim();
+  if (!clean || clean.length > 100) throw new Error('Lighting ist ungültig');
+  return wardogsRequest(bot, '/v1/world/lighting', { method: 'PUT', body: { lighting: clean } });
+}
+export async function changeManagedMap(bot, { map, experiences = [], lighting = '', zoneAlternator = '' } = {}) {
+  const cleanMap = String(map || '').trim();
+  if (!cleanMap || cleanMap.length > 100) throw new Error('Map ist ungültig');
+  const body = { map: cleanMap };
+  const cleanExperiences = (Array.isArray(experiences) ? experiences : String(experiences || '').split(','))
+    .map((x) => String(x || '').trim()).filter(Boolean).slice(0, 20);
+  if (cleanExperiences.some((x) => x.length > 100)) throw new Error('Experience ist ungültig');
+  if (cleanExperiences.length) body.experiences = cleanExperiences;
+  const cleanLighting = String(lighting || '').trim();
+  const cleanAlternator = String(zoneAlternator || '').trim();
+  if (cleanLighting) body.lighting = cleanLighting.slice(0, 100);
+  if (cleanAlternator) body.zoneAlternator = cleanAlternator.slice(0, 160);
+  return wardogsRequest(bot, '/v1/match/map', { method: 'POST', body });
+}
+
+export async function managedDashboard(bot) {
+  const requests = {
+    status: ['/v1/status'],
+    health: ['/v1/health'],
+    players: ['/v1/players'],
+    bans: ['/v1/bans'],
+    capabilities: ['/v1/capabilities'],
+    serverId: ['/v1/server-id'],
+    reserved: ['/v1/reserved-slots'],
+    rotation: ['/v1/rotation'],
+    maps: ['/v1/catalog/maps'],
+    lightings: ['/v1/catalog/lightings'],
+    experiences: ['/v1/catalog/experiences'],
+    audit: ['/v1/audit?limit=40']
+  };
+  const keys = Object.keys(requests);
+  const settled = await Promise.allSettled(keys.map((key) => wardogsRequest(bot, requests[key][0])));
+  const out = { errors: {} };
+  settled.forEach((result, index) => {
+    const key = keys[index];
+    if (result.status === 'fulfilled') out[key] = result.value;
+    else { out[key] = null; out.errors[key] = String(result.reason?.message || result.reason || 'Fehler'); }
+  });
+  return out;
+}
+
+function announcementMessages(bot) {
+  return String(bot?.announcementMessages || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 50);
+}
 
 function signature(bot) {
   return JSON.stringify({
     enabled: Boolean(bot.enabled), botTokenEnc: bot.botTokenEnc || '', alertChannelId: bot.alertChannelId || '', mentionRoleId: bot.mentionRoleId || '',
     wardogsBaseUrl: bot.wardogsBaseUrl || '', wardogsSecretEnc: bot.wardogsSecretEnc || '', allowPrivateTarget: Boolean(bot.allowPrivateTarget),
     pollSeconds: Number(bot.pollSeconds || 20), rulesText: bot.rulesText || '', autoBanEnabled: bot.autoBanEnabled === true,
-    accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
+    announcementMessages: bot.announcementMessages || '', accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -102,7 +190,9 @@ async function pollPlayers(bot, state, client) {
     if (!state.initialized) {
       state.seen = current;
       state.initialized = true;
-      setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null });
+      state.lastAnnouncementAt = Date.now();
+      state.announcementIndex = 0;
+      setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null, lastAnnouncementAt: null });
       return;
     }
     const rules = parseManagedRules(bot.rulesText || '');
@@ -119,6 +209,22 @@ async function pollPlayers(bot, state, client) {
       }
       try { await postAlert(bot, client, player, reasons, autoResult); }
       catch (error) { setRuntime(bot.id, { lastError: `Discord Alert: ${error.message}` }); }
+    }
+    if (bot.announcementEnabled === true) {
+      const messages = announcementMessages(bot);
+      const intervalMs = Math.max(1, Math.min(1440, Number(bot.announcementIntervalMinutes) || 15)) * 60_000;
+      if (messages.length && Date.now() - Number(state.lastAnnouncementAt || 0) >= intervalMs) {
+        const message = messages[state.announcementIndex % messages.length];
+        try {
+          await broadcastManaged(bot, message);
+          state.announcementIndex = (state.announcementIndex + 1) % messages.length;
+          state.lastAnnouncementAt = Date.now();
+          setRuntime(bot.id, { lastAnnouncementAt: nowIso(), lastAnnouncement: message });
+        } catch (error) {
+          state.lastAnnouncementAt = Date.now();
+          setRuntime(bot.id, { lastAnnouncementError: error.message });
+        }
+      }
     }
     setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null });
   } catch (error) {

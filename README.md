@@ -1,9 +1,9 @@
-# status-hub.lol v3.11.8
+# status-hub.lol v3.11.9
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
 
-## v3.11.8
+## v3.11.9
 
 - Admin panel now exposes start/rebuild, stop, approve/revoke, logs, source and delete controls for Custom Bots.
 - WARDOGS Warning & Management Bot is now a hosted managed service with its own configuration page.
@@ -12,6 +12,13 @@ Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic
 - Rule-based join alerts support optional automatic bans. Auto-ban is OFF by default and must be explicitly enabled.
 - Discord warning messages include Ban, Kick and Steam Profile buttons.
 - Managed bot access and runtime are synchronized automatically when a subscription expires or configuration changes.
+
+- Live WARDOGS management dashboard with current server status, health, build, players and ban list.
+- Player controls from the panel: Whisper, Kick, Ban, Kill/Respawn, faction change and Steam profile.
+- Manual in-game server announcements plus optional rotating scheduled announcements (OFF by default).
+- Match restart/end, map change and lighting controls.
+- Read-only rotation, reserved-slot and WARDOGS audit-log views, plus join code when available.
+- Capability-aware controls hide optional actions unsupported by the connected WARDOGS build.
 
 ## v3.10.0 Lifecycle
 

@@ -104,8 +104,8 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Spieler- & Server-Management', 'Regelbasierte Warnungen', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick & Steam-Profil', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Warnungsgrund im Alert'],
-    featuresEn: ['Join monitoring', 'Player & server management', 'Rule-based alerts', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick & Steam profile', 'Discord alert channel', 'Configurable role mentions', 'Alert reason included'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Regelbasierte Warnungen', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick & Steam-Profil', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Rule-based alerts', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick & Steam profile', 'Discord alert channel', 'Configurable role mentions'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -121,7 +121,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 17, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 18, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -138,7 +138,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 17;
+  parsed.version = 18;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -190,12 +190,21 @@ function migrate(parsed) {
     if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...managedService, ...parsed.botServices[serviceIndex], monthlyAmount: '3.99', currency: 'EUR', priceLabel: '€3.99 / month', status: 'available', updatedAt: migrationNow };
     else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
   }
+  if (previousVersion < 18) {
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    const managedService = defaultBotServices()[0];
+    if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], descriptionDe: managedService.descriptionDe, descriptionEn: managedService.descriptionEn, featuresDe: managedService.featuresDe, featuresEn: managedService.featuresEn, updatedAt: migrationNow };
+    else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
     serviceId: String(b.serviceId || 'wardogs-warning-bot'),
     enabled: Boolean(b.enabled),
     autoBanEnabled: b.autoBanEnabled === true,
+    announcementEnabled: b.announcementEnabled === true,
+    announcementIntervalMinutes: Math.max(1, Math.min(1440, Number(b.announcementIntervalMinutes) || 15)),
+    announcementMessages: String(b.announcementMessages || ''),
     pollSeconds: Math.max(10, Math.min(300, Number(b.pollSeconds) || 20)),
     rulesText: String(b.rulesText || ''),
     accessSource: String(b.accessSource || ''),
@@ -286,7 +295,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, pollSeconds: 20, rulesText: '', createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }
