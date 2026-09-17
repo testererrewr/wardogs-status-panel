@@ -1,4 +1,32 @@
-# status-hub.lol v3.12.11
+# status-hub.lol v3.12.14
+
+## v3.12.14 – Temporary-ban duration in ban message
+
+- Temporary WARDOGS bans now include their duration directly in the actual ban reason sent to the game server.
+- Applies to manual temporary bans, ban templates and detection-rule temporary bans.
+- Discord confirmations and detection-action labels use human-readable durations.
+
+
+## v3.12.13 – Moderation toolkit & auto recovery
+
+- WARDOGS Management Bot: temporary bans with automatic unban after the configured duration.
+- Reusable ban templates with reason and optional duration.
+- Detection rules can independently choose Alert, Kick, Permanent Ban or Temporary Ban.
+- Safe managed-bot config export/import; secrets, ownership, billing data and runtime statistics are never exported.
+- Auto-Recovery for WARDOGS Management Bot and Playtime Tracker with guarded reconnect/restart attempts and exponential backoff.
+- Temporary-ban expiry is processed even while the Discord bot itself is stopped, as long as the service instance still exists and WARDOGS is configured.
+- Database schema version 25.
+- Multi-Server Dashboard is recorded as a future roadmap idea only; it is not implemented in this release.
+
+
+## v3.12.12 – Reliable WARDOGS join welcome whisper
+
+- Fixed the join welcome whisper being marked as completed before WARDOGS actually accepted the whisper.
+- A welcome is now considered delivered only after a successful `POST /v1/players/{steamId}/message` response.
+- Spawn/player-readiness HTTP errors are retried up to four times on later polls for the same join session; successful delivery is still exactly once per join.
+- Authentication, unsupported-route and ambiguous transport failures are not blindly retried, preventing duplicate whispers.
+- Faction detection now also tolerates object-shaped faction data while keeping unassigned/no-team states pending.
+- No database migration is required.
 ## v3.12.8 – Full-day activity stats & service-bot deletion
 
 - WARDOGS Playtime Tracker now shows **all 24 hours (00:00–23:00)** in chronological order instead of only the top 12 activity buckets.

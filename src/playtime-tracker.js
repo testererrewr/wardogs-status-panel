@@ -8,6 +8,7 @@ export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
 const instances = new Map();
 const runtime = new Map();
 const locks = new Map();
+const recoveryState = new Map();
 const LEADERBOARD_MS = 6 * 60 * 60 * 1000;
 const SAVE_MS = 60 * 1000;
 
@@ -22,6 +23,16 @@ function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, '');
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
 function setRuntime(id, patch) { runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: nowIso() }); }
 export function playtimeBotRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
+function recoveryDelayMs(attempts) { return Math.min(5 * 60_000, 15_000 * (2 ** Math.max(0, Math.min(5, Number(attempts || 1) - 1)))); }
+function clearRecovery(id) { recoveryState.delete(id); setRuntime(id, { needsRecovery: false, recoveryAttempts: 0, nextRecoveryAt: null, disconnectedAt: null }); }
+function markRecoveryFailure(id, error) {
+  const previous = recoveryState.get(id) || { attempts: 0 };
+  const attempts = Number(previous.attempts || 0) + 1;
+  const nextAttemptAt = Date.now() + recoveryDelayMs(attempts);
+  const lastError = String(error?.message || error || 'Runtime error').slice(0, 300);
+  recoveryState.set(id, { attempts, nextAttemptAt, lastError });
+  setRuntime(id, { state: 'recovering', lastError, needsRecovery: true, recoveryAttempts: attempts, nextRecoveryAt: new Date(nextAttemptAt).toISOString(), lastCheck: nowIso() });
+}
 
 async function withLock(id, fn) {
   const previous = locks.get(id) || Promise.resolve();
@@ -250,6 +261,12 @@ async function startOne(bot) {
   if (bot.botTokenEnc) { try { token = decryptSecret(bot.botTokenEnc); } catch {} }
   if (wantsDiscord && !token) throw new Error('Discord bot token is required when a leaderboard channel is configured');
   const client = wantsDiscord ? new Client({ intents: [GatewayIntentBits.Guilds] }) : null;
+  if (client) {
+    client.on('shardDisconnect', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now() }));
+    client.on('shardError', (error) => setRuntime(bot.id, { state: 'error', lastError: String(error?.message || error).slice(0, 300), needsRecovery: true, disconnectedAt: Date.now() }));
+    client.on('invalidated', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now() }));
+    client.on('shardResume', () => clearRecovery(bot.id));
+  }
   const state = { stats: normalizeStats(bot.playtimeStats), online: new Map(), lastTick: 0, pollInFlight: false, client, lastSavedAt: 0, leaderboardMessageId: String(bot.leaderboardMessageId || '') };
   try {
     if (client) {
@@ -270,6 +287,7 @@ async function startOne(bot) {
     }, Math.max(10, Math.min(300, Number(fresh.pollSeconds) || 30)) * 1000);
     timer.unref?.();
     instances.set(bot.id, { client, timer, signature: signature(fresh), state });
+    clearRecovery(bot.id);
   } catch (error) {
     try { await client.destroy(); } catch {}
     throw error;
@@ -285,18 +303,46 @@ export async function syncPlaytimeBots(bots) {
       const fresh = getManagedBot(id) || snapshots.get(id);
       if (!fresh || fresh.serviceId !== PLAYTIME_SERVICE_ID || !fresh.enabled || !accessActive(fresh)) {
         if (instances.has(id)) await stopOne(id);
-        setRuntime(id, { state: fresh?.enabled && !accessActive(fresh) ? 'access-expired' : 'stopped', botTag: null, players: null });
+        recoveryState.delete(id);
+        setRuntime(id, { state: fresh?.enabled && !accessActive(fresh) ? 'access-expired' : 'stopped', botTag: null, players: null, needsRecovery: false, nextRecoveryAt: null });
         return;
       }
       const existing = instances.get(id);
       const sig = signature(fresh);
-      if (existing?.signature === sig) return;
+      const rt = playtimeBotRuntime(id);
+      if (existing?.signature === sig) {
+        if (!existing.client) return;
+        const ready = typeof existing.client.isReady === 'function' ? existing.client.isReady() : true;
+        const needsRecovery = !ready || rt.needsRecovery === true;
+        const disconnectedAt = Number(rt.disconnectedAt || 0);
+        if (!needsRecovery || fresh.autoRecoveryEnabled === false || (disconnectedAt && Date.now() - disconnectedAt < 10_000)) return;
+        try { await startOne(fresh); }
+        catch (error) { await stopOne(id, false); markRecoveryFailure(id, error); }
+        return;
+      }
+      const recovery = recoveryState.get(id);
+      if (!existing && recovery) {
+        if (fresh.autoRecoveryEnabled === false) {
+          setRuntime(id, { state: 'error', lastError: recovery.lastError, recoveryAttempts: recovery.attempts, nextRecoveryAt: null, needsRecovery: false });
+          return;
+        }
+        if (Number(recovery.nextAttemptAt || 0) > Date.now()) {
+          setRuntime(id, { state: 'recovering', recoveryAttempts: recovery.attempts, nextRecoveryAt: new Date(recovery.nextAttemptAt).toISOString(), needsRecovery: true });
+          return;
+        }
+      }
       try { await startOne(fresh); }
-      catch (error) { await stopOne(id, false); setRuntime(id, { state: 'error', lastError: String(error.message || error).slice(0, 300), lastCheck: nowIso() }); }
+      catch (error) { await stopOne(id, false); markRecoveryFailure(id, error); }
     });
   }
 }
-export async function restartPlaytimeBot(bot) { return withLock(bot.id, async () => { try { await startOne(getManagedBot(bot.id) || bot); return playtimeBotRuntime(bot.id); } catch (error) { await stopOne(bot.id, false); setRuntime(bot.id, { state: 'error', lastError: error.message, lastCheck: nowIso() }); throw error; } }); }
+export async function restartPlaytimeBot(bot) {
+  return withLock(bot.id, async () => {
+    clearRecovery(bot.id);
+    try { await startOne(getManagedBot(bot.id) || bot); return playtimeBotRuntime(bot.id); }
+    catch (error) { await stopOne(bot.id, false); markRecoveryFailure(bot.id, error); throw error; }
+  });
+}
 export async function stopPlaytimeBot(id) { return withLock(id, () => stopOne(id)); }
 export async function shutdownPlaytimeBots() { for (const id of [...instances.keys()]) await withLock(id, () => stopOne(id, false)); }
 export async function testPlaytimeWardogs(bot) { const data = await wardogsRequest(bot, '/v1/players'); return { playerCount: listPlayers(data).length }; }

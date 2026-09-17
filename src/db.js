@@ -104,9 +104,9 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick, Ignore & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick, Ignore & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Detection Rules mit eigener Aktion', 'Config Export / Import', 'Auto-Recovery'],
     category: 'wardogs',
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick, Ignore & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick, Ignore & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Per-rule detection actions', 'Config export / import', 'Auto recovery'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -127,8 +127,8 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Playtime Tracker',
     descriptionDe: 'Gehosteter WARDOGS Playtime Tracker. Er erfasst automatisch die Server-Spielzeit jedes Spielers per Steam64ID und zeigt Leaderboards sowie Langzeit-Statistiken im Webpanel und optional in Discord.',
     descriptionEn: "Hosted WARDOGS playtime tracker. It automatically tracks every player's server playtime by Steam64ID and provides leaderboards plus long-term statistics in the web panel and optionally in Discord.",
-    featuresDe: ['Spielzeit pro Spieler & Steam64ID', 'Top-25 Leaderboard', 'Gesamtspielzeit aller Spieler', 'Discord Top-25 Channel mit 6h Auto-Update', 'Manuelles Leaderboard-Update im Webpanel', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Eigene Instanz & eigenes PayPal-Abo'],
-    featuresEn: ['Playtime per player & Steam64ID', 'Top 25 leaderboard', 'Total tracked player-hours', 'Discord Top 25 channel with 6h auto update', 'Manual leaderboard refresh from the web panel', 'Peak activity by hour of day', 'Most used clan tags', 'Dedicated instance & separate PayPal subscription'],
+    featuresDe: ['Spielzeit pro Spieler & Steam64ID', 'Top-25 Leaderboard', 'Gesamtspielzeit aller Spieler', 'Discord Top-25 Channel mit 6h Auto-Update', 'Manuelles Leaderboard-Update im Webpanel', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Eigene Instanz & eigenes PayPal-Abo', 'Config Export / Import', 'Auto-Recovery'],
+    featuresEn: ['Playtime per player & Steam64ID', 'Top 25 leaderboard', 'Total tracked player-hours', 'Discord Top 25 channel with 6h auto update', 'Manual leaderboard refresh from the web panel', 'Peak activity by hour of day', 'Most used clan tags', 'Dedicated instance & separate PayPal subscription', 'Config export / import', 'Auto recovery'],
     priceLabel: '€1.99 / month',
     monthlyAmount: '1.99',
     currency: 'EUR',
@@ -144,7 +144,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 24, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 25, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -161,7 +161,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 24;
+  parsed.version = 25;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -291,6 +291,20 @@ function migrate(parsed) {
       if (!String(bot.welcomeWhisperMessage || '').trim()) bot.welcomeWhisperMessage = 'Hello {player}, welcome to the server! Join our Discord.';
     }
   }
+  if (previousVersion < 25) {
+    // v3.12.13 adds temporary bans, ban templates, per-rule actions,
+    // safe config import/export and service-bot auto recovery.
+    const defaults = defaultBotServices();
+    for (const service of defaults) {
+      const serviceIndex = parsed.botServices.findIndex((x) => x.id === service.id || x.slug === service.slug);
+      if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: service.featuresDe, featuresEn: service.featuresEn, updatedAt: migrationNow };
+    }
+    for (const bot of parsed.managedBots) {
+      if (typeof bot.autoRecoveryEnabled !== 'boolean') bot.autoRecoveryEnabled = true;
+      if (!Array.isArray(bot.banTemplates)) bot.banTemplates = [];
+      if (!Array.isArray(bot.temporaryBans)) bot.temporaryBans = [];
+    }
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -312,6 +326,21 @@ function migrate(parsed) {
       permissions: Array.isArray(g?.permissions) ? [...new Set(g.permissions.map(String).filter((x) => ['view','announce','whisper','kick','ban','unban','kill','setteam','match','map','lighting','ignore'].includes(x)))] : []
     })).filter((g) => /^\d{17,20}$/.test(g.id) && g.permissions.length).slice(0, 20),
     pollSeconds: Math.max(10, Math.min(300, Number(b.pollSeconds) || 20)),
+    autoRecoveryEnabled: b.autoRecoveryEnabled !== false,
+    banTemplates: (Array.isArray(b.banTemplates) ? b.banTemplates : []).map((entry, index) => ({
+      id: String(entry?.id || `template-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64) || `template-${index + 1}`,
+      label: String(entry?.label || '').trim().slice(0, 60),
+      reason: String(entry?.reason || '').trim().slice(0, 180),
+      durationMinutes: Math.max(0, Math.min(525600, Math.floor(Number(entry?.durationMinutes) || 0)))
+    })).filter((entry) => entry.label && entry.reason).slice(0, 12),
+    temporaryBans: (Array.isArray(b.temporaryBans) ? b.temporaryBans : []).map((entry) => ({
+      steamId: String(entry?.steamId || ''),
+      reason: String(entry?.reason || '').slice(0, 180),
+      expiresAt: entry?.expiresAt || null,
+      createdAt: entry?.createdAt || null,
+      createdBy: String(entry?.createdBy || '').slice(0, 100),
+      templateId: String(entry?.templateId || '').slice(0, 64)
+    })).filter((entry) => /^\d{17}$/.test(entry.steamId) && Number.isFinite(Date.parse(entry.expiresAt || ''))).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 1000),
     rulesText: String(b.rulesText || ''),
     steamWebApiKeyEnc: String(b.steamWebApiKeyEnc || ''),
     steamAppId: /^\d{1,10}$/.test(String(b.steamAppId || '')) ? String(b.steamAppId) : '1867240',
@@ -412,7 +441,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banTemplates: [], temporaryBans: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

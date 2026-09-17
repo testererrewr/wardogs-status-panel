@@ -23,7 +23,7 @@ import { tr, normalizeLang, localeCode } from './i18n.js';
 import { FileSessionStore } from './file-session-store.js';
 import { prepareCustomBot, parseEnvText, deleteCustomBotFiles } from './custom-bots.js';
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
-import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64 } from './managed-bots.js';
+import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, temporaryBanManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64 } from './managed-bots.js';
 import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
@@ -55,6 +55,15 @@ function customBotUpload(req, res, next) {
       : l(req, `ZIP-Upload fehlgeschlagen: ${String(err.message || err).slice(0, 180)}`, `ZIP upload failed: ${String(err.message || err).slice(0, 180)}`);
     flash(req, 'err', message);
     return res.redirect('/custom-bots/new');
+  });
+}
+
+const managedConfigUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 256 * 1024, files: 1, fields: 4, parts: 6, fieldSize: 16 * 1024 } });
+function managedConfigFile(req, res, next) {
+  managedConfigUpload.single('config')(req, res, (err) => {
+    if (!err) return next();
+    flash(req, 'err', l(req, `Config-Import fehlgeschlagen: ${String(err.message || err).slice(0, 180)}`, `Config import failed: ${String(err.message || err).slice(0, 180)}`));
+    return res.redirect(String(req.get('referer') || '/bot-services'));
   });
 }
 
@@ -722,9 +731,8 @@ function managedRuleRows(text) {
   const rows=[];
   for(const rawLine of String(text||'').split(/\r?\n/).map((x)=>x.trim()).filter((x)=>x&&!x.startsWith('#'))){
     try {
-      const [exprRaw,...reasonParts]=rawLine.split('|'),reason=reasonParts.join('|').trim();
       const parsed=parseManagedRules(rawLine)[0]; if(!parsed||parsed.legacy)continue;
-      rows.push({type:parsed.type,op:parsed.op||'',value:parsed.value===true?'':String(parsed.value??''),reason});
+      rows.push({type:parsed.type,op:parsed.op||'',value:parsed.value===true?'':String(parsed.value??''),reason:parsed.reason||'',action:parsed.action||'alert',durationMinutes:Number(parsed.durationMinutes||0)});
     } catch {}
   }
   return rows;
@@ -734,11 +742,18 @@ function managedRulesFromBody(req){
   const lines=[];
   const numericTypes=new Set(['vac_bans','game_bans','playtime','account_age','recent_ban']);
   const booleanTypes=new Set(['community_ban','economy_ban','private_profile']);
+  const actions=new Set(['alert','kick','ban','tempban']);
   for(let i=0;i<100;i+=1){
     const type=String(req.body[`ruleType_${i}`]||'').trim().toLowerCase();
     if(!type)continue;
     if(!numericTypes.has(type)&&!booleanTypes.has(type))throw new Error(l(req,`Regel ${i+1}: ungültiger Typ.`,`Rule ${i+1}: invalid type.`));
-    const reason=String(req.body[`ruleReason_${i}`]||'').trim().slice(0,180);
+    const reason=String(req.body[`ruleReason_${i}`]||'').trim().replace(/\|/g,'/').slice(0,180);
+    const actionRaw=String(req.body[`ruleAction_${i}`]||'alert').trim().toLowerCase();
+    const action=actions.has(actionRaw)?actionRaw:'alert';
+    let durationMinutes=0;
+    if(action==='tempban'){
+      durationMinutes=Math.max(1,Math.min(525600,Math.floor(Number(req.body[`ruleDuration_${i}`])||1440)));
+    }
     let expr='';
     if(booleanTypes.has(type)){
       if(type==='community_ban')expr='communityban=true';
@@ -755,7 +770,9 @@ function managedRulesFromBody(req){
       else if(type==='account_age')expr=`accountage<${Math.max(1,Math.min(36500,Math.floor(value)))}`;
       else expr=`recentban<=${Math.max(0,Math.min(36500,Math.floor(value)))}`;
     }
-    lines.push(`${expr}${reason?` | ${reason}`:''}`);
+    const meta=[`@action=${action}`];
+    if(action==='tempban')meta.push(`@duration=${durationMinutes}`);
+    lines.push(`${expr}${reason?` | ${reason}`:''} | ${meta.join(' | ')}`);
   }
   const text=lines.join('\n');parseManagedRules(text);return text;
 }
@@ -793,13 +810,40 @@ function managedGrantsFromBody(req){
   }
   return out;
 }
+
+function managedBanTemplates(bot){
+  return (Array.isArray(bot?.banTemplates)?bot.banTemplates:[]).map((entry,index)=>({
+    id:String(entry?.id||`template-${index+1}`).replace(/[^a-zA-Z0-9_-]+/g,'-').slice(0,64)||`template-${index+1}`,
+    label:String(entry?.label||'').trim().slice(0,60),
+    reason:String(entry?.reason||'').trim().slice(0,180),
+    durationMinutes:Math.max(0,Math.min(525600,Math.floor(Number(entry?.durationMinutes)||0)))
+  })).filter((entry)=>entry.label&&entry.reason).slice(0,12);
+}
+function managedBanTemplatesFromBody(req){
+  const rows=[];
+  for(let i=0;i<12;i+=1){
+    const label=String(req.body[`banTemplateLabel_${i}`]||'').trim().slice(0,60);
+    const reason=String(req.body[`banTemplateReason_${i}`]||'').trim().slice(0,180);
+    if(!label&&!reason)continue;
+    if(!label||!reason)throw new Error(l(req,`Ban Template ${i+1}: Name und Grund sind erforderlich.`,`Ban template ${i+1}: label and reason are required.`));
+    rows.push({id:`template-${i+1}`,label,reason,durationMinutes:Math.max(0,Math.min(525600,Math.floor(Number(req.body[`banTemplateDuration_${i}`])||0)))});
+  }
+  return rows;
+}
+function managedBanTemplateRowsHtml(req,bot){
+  const rows=managedBanTemplates(bot);
+  if(!rows.length)rows.push({id:'template-1',label:'',reason:'',durationMinutes:0});
+  return rows.map((row,i)=>`<div class="managed-ban-template-row" data-ban-template-row><input name="banTemplateLabel_${i}" maxlength="60" value="${esc(row.label||'')}" placeholder="${l(req,'Name, z. B. Teamkilling','Label, e.g. Teamkilling')}"><input name="banTemplateReason_${i}" maxlength="180" value="${esc(row.reason||'')}" placeholder="${l(req,'Ban-Grund','Ban reason')}"><input name="banTemplateDuration_${i}" type="number" min="0" max="525600" value="${esc(row.durationMinutes||0)}" title="${l(req,'Minuten · 0 = permanent','minutes · 0 = permanent')}" placeholder="0"><button class="button danger smallbtn" type="button" data-remove-ban-template>×</button></div>`).join('');
+}
 function managedRuleRowHtml(req,row,index){
   const type=row?.type||'vac_bans';
   const options=['vac_bans','game_bans','playtime','account_age','recent_ban','community_ban','economy_ban','private_profile'].map((key)=>`<option value="${key}" ${type===key?'selected':''}>${esc(managedRuleTypeLabel(req,key))}</option>`).join('');
   const booleanType=['community_ban','economy_ban','private_profile'].includes(type);
   const op=type==='playtime'||type==='account_age'?'&lt;':type==='recent_ban'?'≤':'≥';
   const unit=type==='playtime'?l(req,'Stunden','hours'):['account_age','recent_ban'].includes(type)?l(req,'Tage','days'):l(req,'Anzahl','count');
-  return `<div class="managed-rule-row" data-rule-row><select name="ruleType_${index}" data-rule-type>${options}</select><span class="managed-rule-op" data-rule-op-label>${op}</span><input name="ruleValue_${index}" data-rule-value type="number" min="0" step="${type==='playtime'?'0.1':'1'}" value="${esc(row?.value||'')}" placeholder="${type==='playtime'?'10':type==='account_age'?'30':type==='recent_ban'?'365':'1'}" ${booleanType?'disabled':''}><span class="managed-rule-unit" data-rule-unit>${esc(booleanType?l(req,'aktiv','active'):unit)}</span><input name="ruleReason_${index}" maxlength="180" value="${esc(row?.reason||'')}" placeholder="${l(req,'Warn-/Banngrund (optional)','Alert/ban reason (optional)')}"><button class="button danger smallbtn" type="button" data-remove-rule>×</button></div>`;
+  const action=String(row?.action||'alert');
+  const actionOptions=[['alert',l(req,'Nur Alert','Alert only')],['kick','Kick'],['ban',l(req,'Permanent Ban','Permanent ban')],['tempban',l(req,'Temporary Ban','Temporary ban')]].map(([value,label])=>`<option value="${value}" ${action===value?'selected':''}>${esc(label)}</option>`).join('');
+  return `<div class="managed-rule-row" data-rule-row><select name="ruleType_${index}" data-rule-type>${options}</select><span class="managed-rule-op" data-rule-op-label>${op}</span><input name="ruleValue_${index}" data-rule-value type="number" min="0" step="${type==='playtime'?'0.1':'1'}" value="${esc(row?.value||'')}" placeholder="${type==='playtime'?'10':type==='account_age'?'30':type==='recent_ban'?'365':'1'}" ${booleanType?'disabled':''}><span class="managed-rule-unit" data-rule-unit>${esc(booleanType?l(req,'aktiv','active'):unit)}</span><select name="ruleAction_${index}" data-rule-action>${actionOptions}</select><input name="ruleDuration_${index}" data-rule-duration type="number" min="1" max="525600" value="${esc(row?.durationMinutes||1440)}" placeholder="1440" ${action==='tempban'?'':'hidden'}><input name="ruleReason_${index}" maxlength="180" value="${esc(row?.reason||'')}" placeholder="${l(req,'Warn-/Banngrund (optional)','Alert/ban reason (optional)')}"><button class="button danger smallbtn" type="button" data-remove-rule>×</button></div>`;
 }
 
 function managedGrantRowHtml(req,row,index){
@@ -814,6 +858,7 @@ function managedBotForm(req, service, bot) {
   const ruleRows=rules.map((row,i)=>managedRuleRowHtml(req,row,i)).join('');
   const hasGlobalSteamKey=Boolean(String(process.env.STEAM_WEB_API_KEY||'').trim());
   const grantRows=grants.map((row,i)=>managedGrantRowHtml(req,row,i)).join('');
+  const banTemplateRows=managedBanTemplateRowsHtml(req,bot);
    return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid" id="managed-bot-config">
     <input type="hidden" name="_csrf" value="${esc(csrf(req))}">
     <input type="hidden" name="botId" value="${esc(bot.id)}">
@@ -828,6 +873,7 @@ function managedBotForm(req, service, bot) {
     <label class="span2">WARDOGS RCON / Bearer Password<input name="wardogsSecret" type="password" autocomplete="new-password" placeholder="${bot.wardogsSecretEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
     <label>${tr(lang,'Prüfintervall','Poll interval')}<input name="pollSeconds" type="number" min="10" max="300" value="${esc(bot.pollSeconds||20)}"><span class="muted small">10–300 s</span></label>
     <label class="check"><input type="checkbox" name="enabled" value="1" ${bot.enabled?'checked':''}> ${tr(lang,'Bot aktiv / gehostet','Bot enabled / hosted')}</label>
+    <label class="check"><input type="checkbox" name="autoRecoveryEnabled" value="1" ${bot.autoRecoveryEnabled!==false?'checked':''}> ${tr(lang,'Auto-Recovery','Auto recovery')}</label>
     <label class="check span2 auto-ban-toggle"><input type="checkbox" name="autoBanEnabled" value="1" ${auto?'checked':''}> <strong>${tr(lang,'Auto-Ban AKTIVIEREN','ENABLE auto-ban')}</strong> · ${tr(lang,'Standard ist AUS. Nur bei Regel-Treffern wird automatisch gebannt.','Default is OFF. Automatic bans happen only on matching rules.')}</label>
     <label class="check span2"><input type="checkbox" name="announcementEnabled" value="1" ${bot.announcementEnabled===true?'checked':''}> <strong>${tr(lang,'Automatische Server-Announcements aktivieren','Enable scheduled server announcements')}</strong></label>
     <label>${tr(lang,'Announcement-Intervall','Announcement interval')}<input name="announcementIntervalMinutes" type="number" min="1" max="1440" value="${esc(bot.announcementIntervalMinutes||15)}"><span class="muted small">1–1440 min</span></label>
@@ -835,10 +881,12 @@ function managedBotForm(req, service, bot) {
     <label class="check span2"><input type="checkbox" name="welcomeWhisperEnabled" value="1" ${bot.welcomeWhisperEnabled===true?'checked':''}> <strong>${tr(lang,'Join-Welcome-Whisper aktivieren','Enable join welcome whisper')}</strong></label>
     <label class="span2">${tr(lang,'Welcome-Whisper','Welcome whisper')}<textarea name="welcomeWhisperMessage" rows="3" maxlength="200" placeholder="Hello {player}, welcome to the server! Join our Discord: discord.gg/example">${esc(bot.welcomeWhisperMessage||'Hello {player}, welcome to the server! Join our Discord.')}</textarea><span class="muted small">${tr(lang,'Variablen: {player}, {steamid}, {faction}','Variables: {player}, {steamid}, {faction}')}</span></label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
+    <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Ban Templates','Ban templates')}</strong><button class="button ghost smallbtn" type="button" id="add-ban-template">+ Template</button></div><div id="managed-ban-templates" data-next-index="${managedBanTemplates(bot).length||1}">${banTemplateRows}</div></div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Steam Detection Rules','Steam detection rules')}</strong><button class="button ghost smallbtn" type="button" id="add-managed-rule">+ ${tr(lang,'Regel','Rule')}</button></div><div class="managed-steam-settings"><label>${tr(lang,'Steam Web API Key','Steam Web API key')}<input name="steamWebApiKey" type="password" autocomplete="new-password" placeholder="${bot.steamWebApiKeyEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):hasGlobalSteamKey?tr(lang,'Globaler Key ist konfiguriert','Global key is configured'):tr(lang,'Für Steam-Regeln erforderlich','Required for Steam rules')}"></label></div><div id="managed-rules" class="managed-rules" data-lang="${esc(lang)}" data-next-index="${rules.length}">${ruleRows||`<div class="muted small managed-rule-empty">${tr(lang,'Noch keine Detection Rule aktiv.','No detection rule active yet.')}</div>`}</div></div>
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
     ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
   </form>
+  <section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
   <script src="/managed.js" defer></script>`;
 }
 
@@ -858,11 +906,12 @@ function playtimeTrackerForm(req,service,bot) {
     <label>${tr(lang,'Prüfintervall','Poll interval')}<input name="pollSeconds" type="number" min="10" max="300" value="${esc(bot.pollSeconds||30)}"><span class="muted small">10–300 s</span></label>
     <label>${tr(lang,'Statistik-Zeitzone','Statistics timezone')}<input name="statsTimezone" maxlength="80" value="${esc(bot.statsTimezone||'Europe/Vienna')}" placeholder="Europe/Vienna"></label>
     <label class="span2">Discord Top-25 Channel ID (${tr(lang,'optional','optional')})<input name="leaderboardChannelId" inputmode="numeric" value="${esc(bot.leaderboardChannelId||'')}" placeholder="123456789012345678"></label>
-    <label class="check span2"><input type="checkbox" name="enabled" value="1" ${bot.enabled?'checked':''}> ${tr(lang,'Tracker aktiv / gehostet','Tracker enabled / hosted')}</label>
+    <label class="check"><input type="checkbox" name="enabled" value="1" ${bot.enabled?'checked':''}> ${tr(lang,'Tracker aktiv / gehostet','Tracker enabled / hosted')}</label>
+    <label class="check"><input type="checkbox" name="autoRecoveryEnabled" value="1" ${bot.autoRecoveryEnabled!==false?'checked':''}> ${tr(lang,'Auto-Recovery','Auto recovery')}</label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
     ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastLeaderboardError?`<div class="span2 warning"><strong>Discord Leaderboard:</strong> ${esc(rt.lastLeaderboardError)}</div>`:''}
-  </form>`;
+  </form><section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>`;
 }
 function playtimeStatsPanel(req,bot) {
   const snap=playtimeTrackerSnapshot(bot),token=esc(csrf(req));
@@ -901,19 +950,22 @@ function managedOperationsPanel(req, bot, live) {
   const rotationRows=Array.isArray(live.rotation?.entries)?live.rotation.entries:[];
   const factions=[...new Set((Array.isArray(status.factionScores)?status.factionScores:[]).map((x)=>String(x?.name||'').trim()).filter(Boolean))];
   const fmtUptime=(seconds)=>{const n=Number(seconds);if(!Number.isFinite(n)||n<0)return '—';const d=Math.floor(n/86400),h=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60);return `${d?`${d}d `:''}${h}h ${m}m`;};
+  const templates=managedBanTemplates(bot);
+  const temporaryBanMap=new Map((Array.isArray(bot.temporaryBans)?bot.temporaryBans:[]).map((entry)=>[String(entry?.steamId||''),entry]));
+  const templateOptions=`<option value="">${l(req,'Benutzerdefiniert','Custom')}</option>${templates.map((tpl)=>`<option value="${esc(tpl.id)}">${esc(tpl.label)} · ${tpl.durationMinutes?`${esc(tpl.durationMinutes)} min`:l(req,'permanent','permanent')}</option>`).join('')}`;
   const playerRows=players.map((p)=>{
     const steam=normalizeSteamId64(p.steamId64||p.steamId||p.steamID64||p.steamID||p.playerSteamId||p.playerId),valid=Boolean(steam),name=String(p.name||'Unknown'),faction=String(p.faction||'—');
     const actionBase=valid?`<div class="managed-player-actions">
       <form method="post" action="/managed-bots/${esc(bot.id)}/player/message"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><input name="message" maxlength="200" required placeholder="${l(req,'Whisper…','Whisper…')}"><button class="button ghost smallbtn">${l(req,'Senden','Send')}</button></form>
       <form method="post" action="/managed-bots/${esc(bot.id)}/player/kick"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><input name="reason" maxlength="180" placeholder="${l(req,'Kick-Grund','Kick reason')}"><button class="button ghost smallbtn">Kick</button></form>
-      <form method="post" action="/managed-bots/${esc(bot.id)}/player/ban" onsubmit="return confirm('${l(req,'Spieler wirklich bannen?','Really ban this player?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><input name="reason" maxlength="180" placeholder="${l(req,'Ban-Grund','Ban reason')}"><button class="button danger smallbtn">Ban</button></form>
+      <form method="post" action="/managed-bots/${esc(bot.id)}/player/ban" onsubmit="return confirm('${l(req,'Ban wirklich ausführen?','Really apply this ban?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}">${templates.length?`<select name="templateId">${templateOptions}</select>`:''}<input name="reason" maxlength="180" placeholder="${l(req,'Ban-Grund','Ban reason')}"><input name="durationMinutes" type="number" min="0" max="525600" value="0" title="${l(req,'Minuten, 0 = permanent','Minutes, 0 = permanent')}" placeholder="0"><button class="button danger smallbtn">Ban</button></form>
       ${supports('POST','/v1/players/{steamId}/kill')?`<form method="post" action="/managed-bots/${esc(bot.id)}/player/kill" onsubmit="return confirm('${l(req,'Spieler töten/respawnen?','Kill/respawn this player?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><button class="button ghost smallbtn">Kill</button></form>`:''}
       ${supports('PATCH','/v1/players/{steamId}')&&factions.length?`<form method="post" action="/managed-bots/${esc(bot.id)}/player/faction"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><select name="faction" required><option value="">${l(req,'Team wählen…','Choose team…')}</option>${factions.map((team)=>`<option value="${esc(team)}" ${team===faction?'selected':''}>${esc(team)}</option>`).join('')}</select><button class="button ghost smallbtn">${l(req,'Team setzen','Set team')}</button></form>`:''}
       <a class="button ghost smallbtn" target="_blank" rel="noopener" href="https://steamcommunity.com/profiles/${esc(steam)}">Steam</a>
     </div>`:'';
     return `<tr><td><strong>${esc(name)}</strong><div class="muted small">${esc(steam||'—')}</div></td><td>${esc(faction)}</td><td>${esc(p.kills??'—')} / ${esc(p.deaths??'—')}</td><td>${esc(p.cash??'—')}</td><td>${esc(p.pingMs??p.ping??'—')} ms</td><td>${actionBase||'—'}</td></tr>`;
   }).join('');
-  const banRows=bans.map((b)=>{const steam=String(b.steamId||'');return `<tr><td><a target="_blank" rel="noopener" href="https://steamcommunity.com/profiles/${esc(steam)}">${esc(steam)}</a></td><td>${esc(b.reason||'—')}</td><td>${esc(b.bannedBy||'—')}</td><td>${b.bannedAtUtc&&String(b.bannedAtUtc).startsWith('0001-')?'—':esc(b.bannedAtUtc||'—')}</td><td><form method="post" action="/managed-bots/${esc(bot.id)}/ban/remove" onsubmit="return confirm('${l(req,'Ban wirklich entfernen?','Really remove this ban?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><button class="button ghost smallbtn">Unban</button></form></td></tr>`;}).join('');
+  const banRows=bans.map((b)=>{const steam=String(b.steamId||''),temporary=temporaryBanMap.get(steam);const expiry=temporary?.expiresAt?new Date(temporary.expiresAt):null;return `<tr><td><a target="_blank" rel="noopener" href="https://steamcommunity.com/profiles/${esc(steam)}">${esc(steam)}</a></td><td>${esc(b.reason||temporary?.reason||'—')}</td><td>${esc(b.bannedBy||temporary?.createdBy||'—')}</td><td>${b.bannedAtUtc&&String(b.bannedAtUtc).startsWith('0001-')?'—':esc(b.bannedAtUtc||temporary?.createdAt||'—')}</td><td>${expiry&&!Number.isNaN(expiry.getTime())?`<span class="badge neutral">${esc(expiry.toLocaleString(localeCode(langOf(req))))}</span>`:`<span class="badge error">${l(req,'Permanent','Permanent')}</span>`}</td><td><form method="post" action="/managed-bots/${esc(bot.id)}/ban/remove" onsubmit="return confirm('${l(req,'Ban wirklich entfernen?','Really remove this ban?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><button class="button ghost smallbtn">Unban</button></form></td></tr>`;}).join('');
   const canWriteReserved=supports('POST','/v1/reserved-slots')&&supports('DELETE','/v1/reserved-slots/{steamId}');
   const reservedRows=reservedIds.map((steam)=>`<tr><td><a target="_blank" rel="noopener" href="https://steamcommunity.com/profiles/${esc(steam)}">${esc(steam)}</a></td><td>${canWriteReserved?`<form method="post" action="/managed-bots/${esc(bot.id)}/reserved/remove" onsubmit="return confirm('${l(req,'Reserved Slot entfernen?','Remove reserved slot?')}')"><input type="hidden" name="_csrf" value="${token}"><input type="hidden" name="steamId" value="${esc(steam)}"><button class="button ghost smallbtn">${l(req,'Entfernen','Remove')}</button></form>`:`<span class="muted small">${l(req,'Dieser Server-Build erlaubt Änderungen nur über die Server-Konfiguration.','This server build only allows changes through the server config.')}</span>`}</td></tr>`).join('');
   const mapOptions=mapRows.map((m)=>{const id=String(m.id||m.name||'');return `<option value="${esc(id)}" ${id===String(status.map||'')?'selected':''}>${esc(m.displayName||id)}</option>`;}).join('');
@@ -937,11 +989,11 @@ function managedOperationsPanel(req, bot, live) {
     </section>
     <div class="panel tablewrap managed-section"><div class="managed-heading padded"><div><span class="eyebrow">Players</span><h2>${l(req,'Live-Spielerliste','Live player list')}</h2><p>${players.length} ${l(req,'Spieler verbunden','players connected')}</p></div></div><table><thead><tr><th>Player</th><th>Faction</th><th>K/D</th><th>Cash</th><th>Ping</th><th>${l(req,'Aktionen','Actions')}</th></tr></thead><tbody>${playerRows||`<tr><td colspan="6">${l(req,'Keine Spieler online.','No players online.')}</td></tr>`}</tbody></table></div>
     <section class="managed-grid">
-      <form method="post" action="/managed-bots/${esc(bot.id)}/ban/add" class="panel formgrid managed-section"><div class="span2 managed-heading"><div><span class="eyebrow">Ban</span><h2>${l(req,'Spieler manuell bannen','Ban player manually')}</h2></div></div><input type="hidden" name="_csrf" value="${token}"><label>SteamID64<input name="steamId" pattern="[0-9]{17}" maxlength="17" required></label><label>${l(req,'Grund','Reason')}<input name="reason" maxlength="180" placeholder="${l(req,'Regelverstoß','Rule violation')}"></label><div class="span2 actions"><button class="button danger">Ban</button></div></form>
+      <form method="post" action="/managed-bots/${esc(bot.id)}/ban/add" class="panel formgrid managed-section"><div class="span2 managed-heading"><div><span class="eyebrow">Ban</span><h2>${l(req,'Spieler manuell bannen','Ban player manually')}</h2></div></div><input type="hidden" name="_csrf" value="${token}"><label>SteamID64<input name="steamId" pattern="[0-9]{17}" maxlength="17" required></label>${templates.length?`<label>${l(req,'Ban Template','Ban template')}<select name="templateId">${templateOptions}</select></label>`:''}<label>${l(req,'Grund','Reason')}<input name="reason" maxlength="180" placeholder="${l(req,'Regelverstoß','Rule violation')}"></label><label>${l(req,'Dauer in Minuten','Duration in minutes')}<input name="durationMinutes" type="number" min="0" max="525600" value="0"><span class="muted small">0 = ${l(req,'permanent','permanent')}</span></label><div class="span2 actions"><button class="button danger">Ban</button></div></form>
       ${mapOptions?`<form method="post" action="/managed-bots/${esc(bot.id)}/match/map" class="panel formgrid managed-section" data-managed-map-form data-lang="${esc(lang)}" data-options-url="/managed-bots/${esc(bot.id)}/map-options"><div class="span2 managed-heading"><div><span class="eyebrow">Map</span><h2>${l(req,'Map wechseln','Change map')}</h2></div></div><input type="hidden" name="_csrf" value="${token}"><label>Map<select name="map" required data-map-select>${mapOptions}</select></label><label>Lighting<select name="lighting"><option value="">${l(req,'Server-Standard','Server default')}</option>${lightingOptions}</select></label><div class="span2"><label>Experiences</label><details class="managed-multi-dropdown"><summary data-experience-summary>${l(req,'Experiences auswählen…','Choose experiences…')}</summary><div class="managed-multi-options" data-experience-options>${expRows.slice(0,100).map((x)=>{const id=String(x.id||x.name||'');return id?`<label class="check"><input type="checkbox" name="experiences" value="${esc(id)}"> ${esc(x.displayName||id)}</label>`:'';}).join('')}</div></details><span class="muted small">${l(req,'Mehrere Einträge können angehakt werden. Die Liste wird beim Mapwechsel automatisch auf die Map gefiltert.','Multiple entries can be checked. The list is automatically filtered for the selected map.')}</span></div><label class="span2">Zone Alternator<select name="zoneAlternator" data-alternator-select><option value="">${l(req,'Server-Standard','Server default')}</option></select></label><div class="span2 actions"><button class="button primary">${l(req,'Mapwechsel senden','Send map change')}</button></div></form>`:''}
       ${lightingOptions?`<form method="post" action="/managed-bots/${esc(bot.id)}/lighting" class="panel formgrid managed-section"><div class="span2 managed-heading"><div><span class="eyebrow">World</span><h2>${l(req,'Lighting ändern','Change lighting')}</h2></div></div><input type="hidden" name="_csrf" value="${token}"><label class="span2">Lighting<select name="lighting" required>${lightingOptions}</select></label><div class="span2 actions"><button class="button ghost">${l(req,'Lighting anwenden','Apply lighting')}</button></div></form>`:''}
     </section>
-    <div class="panel tablewrap managed-section"><div class="managed-heading padded"><div><span class="eyebrow">Bans</span><h2>${l(req,'Server-Banliste','Server ban list')}</h2><p>${bans.length} ${l(req,'Einträge','entries')}</p></div></div><table><thead><tr><th>SteamID64</th><th>${l(req,'Grund','Reason')}</th><th>${l(req,'Von','By')}</th><th>${l(req,'Zeit','Time')}</th><th></th></tr></thead><tbody>${banRows||`<tr><td colspan="5">${l(req,'Keine Bans.','No bans.')}</td></tr>`}</tbody></table></div>
+    <div class="panel tablewrap managed-section"><div class="managed-heading padded"><div><span class="eyebrow">Bans</span><h2>${l(req,'Server-Banliste','Server ban list')}</h2><p>${bans.length} ${l(req,'Einträge','entries')}</p></div></div><table><thead><tr><th>SteamID64</th><th>${l(req,'Grund','Reason')}</th><th>${l(req,'Von','By')}</th><th>${l(req,'Zeit','Time')}</th><th>${l(req,'Läuft ab','Expires')}</th><th></th></tr></thead><tbody>${banRows||`<tr><td colspan="6">${l(req,'Keine Bans.','No bans.')}</td></tr>`}</tbody></table></div>
     ${live.reserved?`<div class="panel tablewrap managed-section"><div class="managed-heading padded"><div><span class="eyebrow">Reserved Slots</span><h2>${l(req,'Reservierte Spieler','Reserved players')}</h2><p>${reservedIds.length} ${l(req,'Einträge','entries')}</p></div></div>${canWriteReserved?`<form method="post" action="/managed-bots/${esc(bot.id)}/reserved/add" class="managed-add-row"><input type="hidden" name="_csrf" value="${token}"><input name="steamId" pattern="[0-9]{17}" maxlength="17" required placeholder="SteamID64"><button class="button primary smallbtn">${l(req,'Hinzufügen','Add')}</button></form>`:`<div class="help managed-cap-note">${l(req,'Reserved Slots werden angezeigt. Dieser WARDOGS-Build bietet aber keine direkten POST/DELETE-Routen; deshalb schreibt das Panel nicht automatisch in die komplette ServerSettings.ini.','Reserved slots are shown. This WARDOGS build does not expose direct POST/DELETE routes, so the panel does not rewrite the full ServerSettings.ini automatically.')}</div>`}<table><thead><tr><th>SteamID64</th><th></th></tr></thead><tbody>${reservedRows||`<tr><td colspan="2">${l(req,'Keine reservierten Spieler.','No reserved players.')}</td></tr>`}</tbody></table></div>`:''}
     ${rotationHtml}${auditHtml}
   </div>`;
@@ -1034,6 +1086,9 @@ app.post('/bot-services/:id/instances/:botId/delete', requireLogin, checkCsrf, r
     }else if(sub){
       updatePaypalServiceSubscriptionRecord(sub.id,{deletedAt:now,deletedBotId:bot.id,cancelledAt:sub.cancelledAt||now,status:sub.cancelledAt?sub.status:'CANCELLED',nextBillingAt:null,lastSyncAt:now});
     }
+    if(service.id==='wardogs-warning-bot'&&Array.isArray(bot.temporaryBans)&&bot.temporaryBans.length){
+      for(const entry of bot.temporaryBans){try{if(/^\d{17}$/.test(String(entry?.steamId||'')))await unbanManagedPlayer(bot,String(entry.steamId));}catch{}}
+    }
     try{upsertManagedBot({id:bot.id,enabled:false});await stopServiceBot({...bot,enabled:false});}catch{}
     deleteManagedBot(bot.id);
     rebalanceAssignments();
@@ -1054,7 +1109,7 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
       const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
       const leaderboardChannelId=String(req.body.leaderboardChannelId||'').trim(); if(leaderboardChannelId&&!validSnowflake(leaderboardChannelId))throw new Error(l(req,'Discord Top-25 Channel ID ist ungültig.','Discord Top 25 channel ID is invalid.'));
       const statsTimezone=String(req.body.statsTimezone||'Europe/Vienna').trim().slice(0,80)||'Europe/Vienna'; try{new Intl.DateTimeFormat('en-US',{timeZone:statsTimezone}).format(new Date());}catch{throw new Error(l(req,'Ungültige IANA-Zeitzone, z. B. Europe/Vienna.','Invalid IANA timezone, e.g. Europe/Vienna.'));}
-      const patch={id:bot.id,name,wardogsBaseUrl,leaderboardChannelId,statsTimezone,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||30)),enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+      const patch={id:bot.id,name,wardogsBaseUrl,leaderboardChannelId,statsTimezone,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||30)),autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
       const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(leaderboardChannelId&&!bot.botTokenEnc)throw new Error(l(req,'Für den Discord Top-25 Channel ist ein Discord Bot Token erforderlich.','A Discord bot token is required for the Discord Top 25 channel.'));
       const secret=String(req.body.wardogsSecret||'').trim(); if(secret)patch.wardogsSecretEnc=encryptSecret(secret); else if(!bot.wardogsSecretEnc)throw new Error(l(req,'WARDOGS RCON/API Passwort fehlt.','WARDOGS RCON/API password is required.'));
       bot=upsertManagedBot(patch); rebalanceAssignments(); await syncAllServiceBots();
@@ -1068,6 +1123,7 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     const mentionRoleId=String(req.body.mentionRoleId||'').trim(); if(mentionRoleId&&!validSnowflake(mentionRoleId))throw new Error(l(req,'Discord Rollen-ID ist ungültig.','Discord role ID is invalid.'));
     const controlPanelEnabled=req.body.controlPanelEnabled==='1',controlPanelChannelId=String(req.body.controlPanelChannelId||'').trim(); if(controlPanelChannelId&&!validSnowflake(controlPanelChannelId))throw new Error(l(req,'Discord Management Panel Channel ID ist ungültig.','Discord management panel channel ID is invalid.')); if(controlPanelEnabled&&!controlPanelChannelId)throw new Error(l(req,'Für das Discord Management Panel muss eine Channel ID eingetragen sein.','A channel ID is required when the Discord management panel is enabled.'));
     const discordGrants=managedGrantsFromBody(req);
+    const banTemplates=managedBanTemplatesFromBody(req);
     const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
     const rulesText=managedRulesFromBody(req); parseManagedRules(rulesText);
     const steamAppId='1867240';
@@ -1078,7 +1134,7 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     const welcomeWhisperMessage=String(req.body.welcomeWhisperMessage||'').trim();
     if(welcomeWhisperMessage.length>200)throw new Error(l(req,'Der Welcome-Whisper darf maximal 200 Zeichen lang sein.','The welcome whisper may contain at most 200 characters.'));
     if(welcomeWhisperEnabled&&!welcomeWhisperMessage)throw new Error(l(req,'Für den Join-Welcome-Whisper muss eine Nachricht eingetragen sein.','A message is required when the join welcome whisper is enabled.'));
-    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,banTemplates,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
     if(patch.announcementEnabled&&!announcementMessages.length)throw new Error(l(req,'Für automatische Announcements muss mindestens eine Nachricht eingetragen sein.','At least one message is required when scheduled announcements are enabled.'));
     const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(!bot.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
     const steamKey=String(req.body.steamWebApiKey||'').trim(); if(steamKey)patch.steamWebApiKeyEnc=encryptSecret(steamKey);
@@ -1119,9 +1175,53 @@ app.post('/managed-bots/:id/ignore/:steamId/remove', requireLogin, checkCsrf, as
   await syncAllServiceBots();flash(req,'ok',l(req,'Ignore entfernt. Der Spieler wird wieder geprüft.','Ignore removed. The player will be screened again.'));res.redirect(managedManageUrl(bot.serviceId,bot.id));
 });
 
-app.post('/managed-bots/:id/restart', requireLogin, checkCsrf, async(req,res)=>{const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin'),wasEnabled=bot.enabled===true;if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');try{const fresh=upsertManagedBot({id:bot.id,enabled:true,restartNonce:Date.now()});rebalanceAssignments();await restartServiceBot(fresh);flash(req,'ok',wasEnabled?l(req,'Managed Bot neu gestartet.','Managed bot restarted.'):l(req,'Managed Bot gestartet.','Managed bot started.'));}catch(error){upsertManagedBot({id:bot.id,enabled:false});flash(req,'err',error.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':managedManageUrl(bot.serviceId,bot.id));});
+app.post('/managed-bots/:id/restart', requireLogin, checkCsrf, async(req,res)=>{const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin'),wasEnabled=bot.enabled===true;if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');try{const fresh=upsertManagedBot({id:bot.id,enabled:true,restartNonce:Date.now()});rebalanceAssignments();await restartServiceBot(fresh);flash(req,'ok',wasEnabled?l(req,'Managed Bot neu gestartet.','Managed bot restarted.'):l(req,'Managed Bot gestartet.','Managed bot started.'));}catch(error){const latest=getManagedBot(bot.id)||bot;if(latest.autoRecoveryEnabled===false)upsertManagedBot({id:bot.id,enabled:false});flash(req,'err',latest.autoRecoveryEnabled===false?error.message:l(req,`${error.message} · Auto-Recovery versucht den Start automatisch erneut.`,`${error.message} · Auto recovery will retry automatically.`));}res.redirect(fromAdmin?'/admin?tab=bots#bots':managedManageUrl(bot.serviceId,bot.id));});
 app.post('/managed-bots/:id/stop', requireLogin, checkCsrf, async(req,res)=>{const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');try{upsertManagedBot({id:bot.id,enabled:false});rebalanceAssignments();await stopServiceBot(bot);flash(req,'ok',l(req,'Managed Bot gestoppt.','Managed bot stopped.'));}catch(error){flash(req,'err',error.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':managedManageUrl(bot.serviceId,bot.id));});
 
+function managedConfigPayload(bot){
+  const base={format:'status-hub-managed-bot-config',version:1,serviceId:String(bot.serviceId||''),name:String(bot.name||''),pollSeconds:Number(bot.pollSeconds||20),autoRecoveryEnabled:bot.autoRecoveryEnabled!==false,wardogsBaseUrl:String(bot.wardogsBaseUrl||'')};
+  if(bot.serviceId===PLAYTIME_SERVICE_ID)return {...base,leaderboardChannelId:String(bot.leaderboardChannelId||''),statsTimezone:String(bot.statsTimezone||'Europe/Vienna')};
+  return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||'')};
+}
+app.get('/managed-bots/:id/config/export',requireLogin,(req,res)=>{
+  const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');
+  const payload=managedConfigPayload(bot);
+  const safeName=String(bot.name||'managed-bot').replace(/[^a-zA-Z0-9_-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60)||'managed-bot';
+  res.setHeader('Content-Type','application/json; charset=utf-8');
+  res.setHeader('Content-Disposition',`attachment; filename="${safeName}-config.json"`);
+  res.send(JSON.stringify(payload,null,2));
+});
+app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkCsrf,async(req,res)=>{
+  const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');
+  try{
+    if(!req.file?.buffer?.length)throw new Error(l(req,'Keine JSON-Config ausgewählt.','No JSON config selected.'));
+    const data=JSON.parse(req.file.buffer.toString('utf8'));
+    if(data?.format!=='status-hub-managed-bot-config'||Number(data?.version)!==1)throw new Error(l(req,'Ungültiges Config-Format.','Invalid config format.'));
+    if(String(data.serviceId||'')!==String(bot.serviceId||''))throw new Error(l(req,'Die Config gehört zu einem anderen Service Bot.','This config belongs to a different service bot.'));
+    const patch={id:bot.id,restartNonce:Date.now()};
+    if(String(data.name||'').trim())patch.name=String(data.name).trim().slice(0,80);
+    patch.pollSeconds=Math.max(10,Math.min(300,Number(data.pollSeconds)||Number(bot.pollSeconds)||20));
+    patch.autoRecoveryEnabled=data.autoRecoveryEnabled!==false;
+    const url=String(data.wardogsBaseUrl||'').trim().replace(/\/+$/,'');if(url&&/^https?:\/\//i.test(url))patch.wardogsBaseUrl=url;
+    if(bot.serviceId===PLAYTIME_SERVICE_ID){
+      const channel=String(data.leaderboardChannelId||'').trim();if(channel&&!validSnowflake(channel))throw new Error(l(req,'Discord Top-25 Channel ID in der Config ist ungültig.','Discord Top 25 channel ID in config is invalid.'));
+      patch.leaderboardChannelId=channel;
+      const tz=String(data.statsTimezone||'Europe/Vienna').trim().slice(0,80)||'Europe/Vienna';new Intl.DateTimeFormat('en-US',{timeZone:tz}).format(new Date());patch.statsTimezone=tz;
+    }else{
+      const alert=String(data.alertChannelId||'').trim();if(alert&&!validSnowflake(alert))throw new Error(l(req,'Alert Channel ID in der Config ist ungültig.','Alert channel ID in config is invalid.'));if(alert)patch.alertChannelId=alert;
+      const mention=String(data.mentionRoleId||'').trim();if(mention&&!validSnowflake(mention))throw new Error(l(req,'Rollen-ID in der Config ist ungültig.','Role ID in config is invalid.'));patch.mentionRoleId=mention;
+      const panel=String(data.controlPanelChannelId||'').trim();if(panel&&!validSnowflake(panel))throw new Error(l(req,'Management Panel Channel ID in der Config ist ungültig.','Management panel channel ID in config is invalid.'));patch.controlPanelChannelId=panel;patch.controlPanelEnabled=data.controlPanelEnabled===true&&Boolean(panel);
+      patch.discordGrants=(Array.isArray(data.discordGrants)?data.discordGrants:[]).map((g)=>({type:g?.type==='user'?'user':'role',id:String(g?.id||''),permissions:Array.isArray(g?.permissions)?g.permissions.map(String).filter((x)=>MANAGED_DISCORD_PERMISSION_KEYS.includes(x)):[]})).filter((g)=>validSnowflake(g.id)&&g.permissions.length).slice(0,20);
+      patch.banTemplates=(Array.isArray(data.banTemplates)?data.banTemplates:[]).map((t,i)=>({id:`template-${i+1}`,label:String(t?.label||'').trim().slice(0,60),reason:String(t?.reason||'').trim().slice(0,180),durationMinutes:Math.max(0,Math.min(525600,Math.floor(Number(t?.durationMinutes)||0)))})).filter((t)=>t.label&&t.reason).slice(0,12);
+      patch.rulesText=String(data.rulesText||'').slice(0,50000);parseManagedRules(patch.rulesText);
+      patch.autoBanEnabled=data.autoBanEnabled===true;
+      patch.announcementEnabled=data.announcementEnabled===true;patch.announcementIntervalMinutes=Math.max(1,Math.min(1440,Number(data.announcementIntervalMinutes)||15));patch.announcementMessages=String(data.announcementMessages||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean).slice(0,50).map((x)=>x.slice(0,200)).join('\n');
+      patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);
+    }
+    upsertManagedBot(patch);await syncAllServiceBots();flash(req,'ok',l(req,'Config importiert. Tokens, Passwörter, Abo-/Besitzdaten und Laufzeitstatistiken wurden nicht überschrieben.','Config imported. Tokens, passwords, subscription/ownership data and runtime statistics were not overwritten.'));
+  }catch(error){flash(req,'err',`${l(req,'Config-Import fehlgeschlagen','Config import failed')}: ${error.message}`);}
+  res.redirect(managedManageUrl(bot.serviceId,bot.id));
+});
 
 function managedActionContext(req,res){
   const bot=ownedManaged(req,req.params.id);
@@ -1132,6 +1232,16 @@ function managedActionContext(req,res){
 }
 function managedBack(res,bot){return res.redirect(managedManageUrl(bot.serviceId,bot.id));}
 function managedSteamId(req){const id=String(req.body.steamId||'').trim();if(!/^\d{17}$/.test(id))throw new Error(l(req,'Ungültige SteamID64.','Invalid SteamID64.'));return id;}
+function managedBanSpec(req,bot,defaultReason='Manual panel ban'){
+  const templateId=String(req.body.templateId||'').trim();
+  const template=managedBanTemplates(bot).find((x)=>x.id===templateId)||null;
+  if(template)return {reason:template.reason,durationMinutes:template.durationMinutes,templateId:template.id};
+  return {reason:String(req.body.reason||defaultReason).trim().slice(0,180)||defaultReason,durationMinutes:Math.max(0,Math.min(525600,Math.floor(Number(req.body.durationMinutes)||0))),templateId:''};
+}
+async function applyManagedBanSpec(bot,steamId,spec,createdBy='web'){
+  if(Number(spec?.durationMinutes)>0)return temporaryBanManagedPlayer(bot,steamId,spec.reason,Number(spec.durationMinutes),{createdBy,templateId:spec.templateId||''});
+  await banManagedPlayer(bot,steamId,spec.reason);return null;
+}
 const managedActionRate=rateLimit({windowMs:60_000,limit:80,standardHeaders:'draft-8',legacyHeaders:false});
 
 app.get('/managed-bots/:id/map-options',requireLogin,managedActionRate,async(req,res)=>{
@@ -1144,10 +1254,10 @@ app.get('/managed-bots/:id/map-options',requireLogin,managedActionRate,async(req
 app.post('/managed-bots/:id/broadcast',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await broadcastManaged(bot,String(req.body.message||''));flash(req,'ok',l(req,'Server-Announcement gesendet.','Server announcement sent.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/player/message',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await whisperManagedPlayer(bot,managedSteamId(req),String(req.body.message||''));flash(req,'ok',l(req,'Whisper gesendet.','Whisper sent.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/player/kick',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await kickManagedPlayer(bot,managedSteamId(req),String(req.body.reason||'Manual panel kick').trim().slice(0,180)||'Manual panel kick');flash(req,'ok',l(req,'Kick wurde gesendet.','Kick sent.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
-app.post('/managed-bots/:id/player/ban',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await banManagedPlayer(bot,managedSteamId(req),String(req.body.reason||'Manual panel ban').trim().slice(0,180)||'Manual panel ban');flash(req,'ok',l(req,'Spieler gebannt.','Player banned.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
+app.post('/managed-bots/:id/player/ban',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{const steamId=managedSteamId(req),spec=managedBanSpec(req,bot,'Manual panel ban');const temp=await applyManagedBanSpec(bot,steamId,spec,String(currentUser(req)?.discordId||'web'));flash(req,'ok',temp?l(req,`Spieler temporär bis ${new Date(temp.expiresAt).toLocaleString(localeCode(langOf(req)))} gebannt.`,`Player temporarily banned until ${new Date(temp.expiresAt).toLocaleString(localeCode(langOf(req)))}.`):l(req,'Spieler permanent gebannt.','Player permanently banned.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/player/kill',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await killManagedPlayer(bot,managedSteamId(req));flash(req,'ok',l(req,'Kill/Respawn wurde gesendet.','Kill/respawn sent.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/player/faction',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await moveManagedPlayer(bot,managedSteamId(req),String(req.body.faction||''));flash(req,'ok',l(req,'Teamwechsel wurde gesendet.','Team change sent.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
-app.post('/managed-bots/:id/ban/add',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await banManagedPlayer(bot,managedSteamId(req),String(req.body.reason||'Manual panel ban').trim().slice(0,180)||'Manual panel ban');flash(req,'ok',l(req,'SteamID wurde gebannt.','SteamID banned.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
+app.post('/managed-bots/:id/ban/add',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{const steamId=managedSteamId(req),spec=managedBanSpec(req,bot,'Manual panel ban');const temp=await applyManagedBanSpec(bot,steamId,spec,String(currentUser(req)?.discordId||'web'));flash(req,'ok',temp?l(req,`SteamID temporär bis ${new Date(temp.expiresAt).toLocaleString(localeCode(langOf(req)))} gebannt.`,`SteamID temporarily banned until ${new Date(temp.expiresAt).toLocaleString(localeCode(langOf(req)))}.`):l(req,'SteamID permanent gebannt.','SteamID permanently banned.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/ban/remove',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await unbanManagedPlayer(bot,managedSteamId(req));flash(req,'ok',l(req,'Ban entfernt.','Ban removed.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/reserved/add',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await addManagedReservedSlot(bot,managedSteamId(req));flash(req,'ok',l(req,'Reserved Slot hinzugefügt. Je nach WARDOGS-Build kann ein Server-Neustart nötig sein.','Reserved slot added. Depending on the WARDOGS build, a server restart may be required.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
 app.post('/managed-bots/:id/reserved/remove',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{const bot=managedActionContext(req,res);if(!bot)return;try{await removeManagedReservedSlot(bot,managedSteamId(req));flash(req,'ok',l(req,'Reserved Slot entfernt. Je nach WARDOGS-Build kann ein Server-Neustart nötig sein.','Reserved slot removed. Depending on the WARDOGS build, a server restart may be required.'));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);});
