@@ -23,6 +23,7 @@ function safeEqual(a, b) {
 }
 function validId(id) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(id || '')); }
 function names(id) { return { container: `statushub-custom-${id}`, image: `statushub-custom-${id}:latest`, network: `statushub-net-${id}` }; }
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function auth(req, res, next) { if (!shared || !safeEqual(req.get('X-Runner-Secret'), shared)) return res.status(403).json({ error: 'forbidden' }); next(); }
 app.use(auth);
 
@@ -74,9 +75,18 @@ async function ensureNetwork(name, id) {
   }
 }
 async function containerUsesNetwork(container, network) {
-  const r = await run('docker', ['inspect', '-f', `{{if index .NetworkSettings.Networks "${network}"}}yes{{else}}no{{end}}`, container], { allowFailure: true, timeout: 15000 });
+  const r = await run('docker', ['inspect', '-f', `{{if index .NetworkSettings.Networks \"${network}\"}}yes{{else}}no{{end}}`, container], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'yes';
 }
+async function containerIsReadOnly(container) {
+  const r = await run('docker', ['inspect', '-f', '{{.HostConfig.ReadonlyRootfs}}', container], { allowFailure: true, timeout: 15000 });
+  return r.code === 0 && r.out.trim() === 'true';
+}
+async function recentLogs(container) {
+  const r = await run('docker', ['logs', '--tail', '40', container], { allowFailure: true, timeout: 15000 });
+  return `${r.out}${r.err}`.trim().slice(-2500);
+}
+
 async function build(id, image) {
   const dir = path.join(root, id);
   if (!fs.existsSync(path.join(dir, 'Dockerfile.generated'))) throw new Error('upload files missing');
@@ -88,13 +98,21 @@ async function startFresh(id, envObj) {
   await ensureNetwork(network, id);
   await build(id, image);
   const args = ['run', '-d', '--name', container, '--restart', 'unless-stopped',
-    '--memory', '256m', '--cpus', '0.50', '--pids-limit', '100', '--read-only',
-    '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m', '--tmpfs', '/home/bot:rw,noexec,nosuid,size=16m', '--tmpfs', '/home/node:rw,noexec,nosuid,size=16m', '--tmpfs', '/bot/data:rw,nosuid,size=64m',
+    '--memory', '256m', '--cpus', '0.50', '--pids-limit', '100',
+    '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--network', network,
     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2', '--label', `server-status-hub.custom=${id}`];
   for (const [k, v] of Object.entries(validateEnv(envObj))) args.push('-e', `${k}=${v}`);
   args.push(image);
   const r = await run('docker', args, { timeout: 30000 });
+  // A custom bot is expected to be a long-running process. Give it a brief
+  // startup window so an immediate crash is surfaced instead of being reported
+  // as a successful start. Docker still keeps the normal unless-stopped policy.
+  await sleep(1200);
+  if (!(await isRunning(container))) {
+    const logs = await recentLogs(container);
+    throw new Error(`custom bot exited directly after start${logs ? `: ${logs}` : ''}`);
+  }
   return r.out.trim();
 }
 
@@ -103,9 +121,11 @@ app.post('/ensure', async (req, res) => {
     const id = req.body.id; if (!validId(id)) throw new Error('invalid id');
     const { container, network } = names(id);
     if (await existsContainer(container)) {
-      if (!(await containerUsesNetwork(container, network))) {
+      const wrongNetwork = !(await containerUsesNetwork(container, network));
+      const legacyReadOnly = await containerIsReadOnly(container);
+      if (wrongNetwork || legacyReadOnly) {
         await startFresh(id, req.body.env || {});
-        return res.json({ ok: true, running: true, reused: false, migratedNetwork: true });
+        return res.json({ ok: true, running: true, reused: false, migratedNetwork: wrongNetwork, migratedRuntime: legacyReadOnly });
       }
       if (!(await isRunning(container))) await run('docker', ['start', container], { timeout: 20000 });
       return res.json({ ok: true, running: true, reused: true });

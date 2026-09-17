@@ -105,9 +105,9 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion', 'JOIN Seeding am Servernamen (1–20 Spieler)'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion'],
     category: 'wardogs',
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Config export / import', 'Auto recovery', 'Whisper entire faction', 'JOIN Seeding on the server name (1–20 players)'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Config export / import', 'Auto recovery', 'Whisper entire faction'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -145,7 +145,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 30, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 31, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -162,7 +162,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 30;
+  parsed.version = 31;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -355,6 +355,20 @@ function migrate(parsed) {
     const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
     if (service && serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: service.featuresDe, featuresEn: service.featuresEn, updatedAt: migrationNow };
   }
+  if (previousVersion < 31) {
+    // v3.12.21 removes the JOIN Seeding server-name feature completely. Existing
+    // instances keep a one-time cleanup marker so a suffix left by v3.12.20 can
+    // be removed safely the next time that management bot starts.
+    const defaults = defaultBotServices();
+    const service = defaults.find((x) => x.id === 'wardogs-warning-bot');
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    if (service && serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: service.featuresDe, featuresEn: service.featuresEn, updatedAt: migrationNow };
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || '') !== 'wardogs-warning-bot') continue;
+      delete bot.seedingNameEnabled;
+      if (typeof bot.legacyJoinSeedingCleanupDone !== 'boolean') bot.legacyJoinSeedingCleanupDone = false;
+    }
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -366,7 +380,7 @@ function migrate(parsed) {
     announcementMessages: String(b.announcementMessages || ''),
     welcomeWhisperEnabled: b.welcomeWhisperEnabled === true,
     welcomeWhisperMessage: String(b.welcomeWhisperMessage || 'Hello {player}, welcome to the server! Join our Discord.').trim().slice(0, 200),
-    seedingNameEnabled: b.seedingNameEnabled === true,
+    legacyJoinSeedingCleanupDone: b.legacyJoinSeedingCleanupDone === true,
     banDiscordLink: String(b.banDiscordLink || '').trim().slice(0, 120),
     controlPanelEnabled: b.controlPanelEnabled === true,
     controlPanelChannelId: /^\d{17,20}$/.test(String(b.controlPanelChannelId || '')) ? String(b.controlPanelChannelId) : '',
@@ -505,7 +519,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', seedingNameEnabled: false, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

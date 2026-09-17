@@ -138,9 +138,37 @@ app.use(session({
 }));
 
 function csrf(req) { if (!req.session.csrf) req.session.csrf = crypto.randomBytes(24).toString('base64url'); return req.session.csrf; }
+function allowedRequestOrigin(req, rawOrigin) {
+  const value = String(rawOrigin || '').trim();
+  // Origin is a defence-in-depth check on top of the mandatory per-session CSRF
+  // token. Some browsers/privacy modes can legitimately send Origin: null.
+  if (!value || value === 'null') return true;
+  try {
+    const candidate = new URL(value);
+    if (!['http:', 'https:'].includes(candidate.protocol)) return false;
+
+    // Compare only against the configured PUBLIC_URL. Do not compare the browser
+    // Origin with req.get('host'): behind Caddy/another reverse proxy that Host can
+    // legitimately be an internal container host even though the public browser
+    // origin is correct. CSRF remains mandatory below.
+    if (candidate.hostname.toLowerCase() !== canonical.hostname.toLowerCase()) return false;
+
+    const canonicalPort = canonical.port || (canonical.protocol === 'https:' ? '443' : '80');
+    const candidatePort = candidate.port || (candidate.protocol === 'https:' ? '443' : '80');
+    // If PUBLIC_URL explicitly includes a non-standard port, require it. With the
+    // normal 80/443 public setup, allow an HTTPS browser origin in front of an
+    // older http:// PUBLIC_URL configuration used behind TLS termination.
+    if (canonical.port && candidatePort !== canonicalPort) return false;
+    if (!canonical.port && candidate.port && !['80', '443'].includes(candidatePort)) return false;
+    if (canonical.protocol === 'https:' && candidate.protocol !== 'https:') return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 function checkCsrf(req, res, next) {
   const origin = String(req.get('origin') || '').trim();
-  if (origin && origin !== canonical.origin) return res.status(403).send('Ungültige Request-Origin.');
+  if (!allowedRequestOrigin(req, origin)) return res.status(403).send('Ungültige Request-Origin.');
   const a = Buffer.from(String(req.body?._csrf || '')); const b = Buffer.from(String(req.session.csrf || ''));
   if (!a.length || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).send('Ungültiges CSRF-Token. Seite neu laden.');
   next();
@@ -308,7 +336,6 @@ function applyPaypalServiceSubscription(record, details, reason = 'service_subsc
       name: `${service.nameDe || service.nameEn || 'Managed Bot'} #${instanceNumber}`,
       enabled: false,
       autoBanEnabled: false,
-      seedingNameEnabled: service.id === 'wardogs-warning-bot',
       welcomeWhisperEnabled: false,
       welcomeWhisperMessage: 'Hello {player}, welcome to the server! Join our Discord.',
       pollSeconds: service.id === PLAYTIME_SERVICE_ID ? 30 : 20,
@@ -957,13 +984,12 @@ function managedBotForm(req, service, bot) {
     <label class="span2">${tr(lang,'Automatische Announcements','Scheduled announcements')}<textarea name="announcementMessages" rows="5" maxlength="10050" placeholder="Welcome to our server!&#10;Read the rules in Discord.&#10;Have fun!">${esc(bot.announcementMessages||'')}</textarea><span class="muted small">${tr(lang,'Eine Nachricht pro Zeile, maximal 200 Zeichen. Die Nachrichten rotieren automatisch.','One message per line, maximum 200 characters. Messages rotate automatically.')}</span></label>
     <label class="check span2"><input type="checkbox" name="welcomeWhisperEnabled" value="1" ${bot.welcomeWhisperEnabled===true?'checked':''}> <strong>${tr(lang,'Join-Welcome-Whisper aktivieren','Enable join welcome whisper')}</strong></label>
     <label class="span2">${tr(lang,'Welcome-Whisper','Welcome whisper')}<textarea name="welcomeWhisperMessage" rows="3" maxlength="200" placeholder="Hello {player}, welcome to the server! Join our Discord: discord.gg/example">${esc(bot.welcomeWhisperMessage||'Hello {player}, welcome to the server! Join our Discord.')}</textarea><span class="muted small">${tr(lang,'Variablen: {player}, {steamid}, {faction}','Variables: {player}, {steamid}, {faction}')}</span></label>
-    <label class="check span2"><input type="checkbox" name="seedingNameEnabled" value="1" ${bot.seedingNameEnabled===true?'checked':''}> <strong>JOIN Seeding</strong> · ${tr(lang,'bei 1–20 Spielern automatisch hinter den WARDOGS-Servernamen setzen','automatically append behind the WARDOGS server name at 1–20 players')}</label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
     <div class="span2 managed-config-block"><strong>${tr(lang,'Ban-Nachrichten','Ban messages')}</strong><label>${tr(lang,'Discord Server / Invite-Link','Discord server / invite link')}<input name="banDiscordLink" maxlength="120" value="${esc(bot.banDiscordLink||'')}" placeholder="https://discord.gg/example"></label></div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Ban Templates','Ban templates')}</strong><button class="button ghost smallbtn" type="button" id="add-ban-template">+ Template</button></div><div id="managed-ban-templates" data-next-index="${managedBanTemplates(bot).length||1}">${banTemplateRows}</div></div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'Steam Detection Rules','Steam detection rules')}</strong><button class="button ghost smallbtn" type="button" id="add-managed-rule">+ ${tr(lang,'Regel','Rule')}</button></div><div class="managed-steam-settings"><label>${tr(lang,'Steam Web API Key','Steam Web API key')}<input name="steamWebApiKey" type="password" autocomplete="new-password" placeholder="${bot.steamWebApiKeyEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):hasGlobalSteamKey?tr(lang,'Globaler Key ist konfiguriert','Global key is configured'):tr(lang,'Für Steam-Regeln erforderlich','Required for Steam rules')}"></label></div><div id="managed-rules" class="managed-rules" data-lang="${esc(lang)}" data-next-index="${rules.length}">${ruleRows||`<div class="muted small managed-rule-empty">${tr(lang,'Noch keine Detection Rule aktiv.','No detection rule active yet.')}</div>`}</div></div>
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
-    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSeedingNameError?`<div class="span2 warning"><strong>JOIN Seeding:</strong> ${esc(rt.lastSeedingNameError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
+    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
   </form>
   <section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
   <script src="/managed.js?v=3.12.20" defer></script>`;
@@ -1155,7 +1181,7 @@ function managedInstancesPanel(req,service,bots,selectedBot,subscriptions){
 app.post('/bot-services/:id/admin-activate', requireAdmin, checkCsrf, (req,res)=>{
   const service=getBotService(req.params.id),user=currentUser(req); if(!supportedManagedService(service))return res.status(404).send('Service not found');
   const existing=managedServicesForUser(user.discordId,service.id);
-  const bot=upsertManagedBot({ownerDiscordId:user.discordId,serviceId:service.id,name:`${service.nameDe||service.nameEn||'WARDOGS Bot'} #${existing.length+1}`,enabled:false,autoBanEnabled:false,seedingNameEnabled:service.id==='wardogs-warning-bot',welcomeWhisperEnabled:false,welcomeWhisperMessage:'Hello {player}, welcome to the server! Join our Discord.',pollSeconds:service.id===PLAYTIME_SERVICE_ID?30:20,rulesText:'',statsTimezone:'Europe/Vienna',adminGrant:true,accessSource:'admin',accessRecordId:'',accessUntil:null});
+  const bot=upsertManagedBot({ownerDiscordId:user.discordId,serviceId:service.id,name:`${service.nameDe||service.nameEn||'WARDOGS Bot'} #${existing.length+1}`,enabled:false,autoBanEnabled:false,welcomeWhisperEnabled:false,welcomeWhisperMessage:'Hello {player}, welcome to the server! Join our Discord.',pollSeconds:service.id===PLAYTIME_SERVICE_ID?30:20,rulesText:'',statsTimezone:'Europe/Vienna',adminGrant:true,accessSource:'admin',accessRecordId:'',accessUntil:null});
   rebalanceAssignments();
   flash(req,'ok',l(req,'Neue Managed-Bot-Instanz wurde für deinen Admin-Account kostenlos angelegt.','A new managed-bot instance was created free for your admin account.'));
   res.redirect(managedManageUrl(service.id,bot.id));
@@ -1271,7 +1297,7 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     const welcomeWhisperMessage=String(req.body.welcomeWhisperMessage||'').trim();
     if(welcomeWhisperMessage.length>200)throw new Error(l(req,'Der Welcome-Whisper darf maximal 200 Zeichen lang sein.','The welcome whisper may contain at most 200 characters.'));
     if(welcomeWhisperEnabled&&!welcomeWhisperMessage)throw new Error(l(req,'Für den Join-Welcome-Whisper muss eine Nachricht eingetragen sein.','A message is required when the join welcome whisper is enabled.'));
-    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,banTemplates,banDiscordLink,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,seedingNameEnabled:req.body.seedingNameEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,banTemplates,banDiscordLink,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),welcomeWhisperEnabled,welcomeWhisperMessage,enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
     if(patch.announcementEnabled&&!announcementMessages.length)throw new Error(l(req,'Für automatische Announcements muss mindestens eine Nachricht eingetragen sein.','At least one message is required when scheduled announcements are enabled.'));
     const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(!bot.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
     const steamKey=String(req.body.steamWebApiKey||'').trim(); if(steamKey)patch.steamWebApiKeyEnc=encryptSecret(steamKey);
@@ -1324,7 +1350,7 @@ app.post('/managed-bots/:id/stop', requireLogin, checkCsrf, async(req,res)=>{con
 function managedConfigPayload(bot){
   const base={format:'status-hub-managed-bot-config',version:1,serviceId:String(bot.serviceId||''),name:String(bot.name||''),pollSeconds:Number(bot.pollSeconds||20),autoRecoveryEnabled:bot.autoRecoveryEnabled!==false,wardogsBaseUrl:String(bot.wardogsBaseUrl||'')};
   if(bot.serviceId===PLAYTIME_SERVICE_ID)return {...base,playtimeServers:playtimeTrackerServers(bot).map((row)=>({id:row.id,label:row.label,baseUrl:row.baseUrl})),leaderboardChannelId:String(bot.leaderboardChannelId||''),statsTimezone:String(bot.statsTimezone||'Europe/Vienna')};
-  return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),banDiscordLink:String(bot.banDiscordLink||''),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||''),seedingNameEnabled:bot.seedingNameEnabled===true};
+  return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),banDiscordLink:String(bot.banDiscordLink||''),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||'')};
 }
 app.get('/managed-bots/:id/config/export',requireLogin,(req,res)=>{
   const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');
@@ -1366,7 +1392,7 @@ app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkC
       patch.rulesText=String(data.rulesText||'').slice(0,50000);parseManagedRules(patch.rulesText);
       patch.autoBanEnabled=data.autoBanEnabled===true;
       patch.announcementEnabled=data.announcementEnabled===true;patch.announcementIntervalMinutes=Math.max(1,Math.min(1440,Number(data.announcementIntervalMinutes)||15));patch.announcementMessages=String(data.announcementMessages||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean).slice(0,50).map((x)=>x.slice(0,200)).join('\n');
-      patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);patch.seedingNameEnabled=data.seedingNameEnabled===true;
+      patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);
     }
     upsertManagedBot(patch);await syncAllServiceBots();flash(req,'ok',l(req,'Config importiert. Tokens, Passwörter, Abo-/Besitzdaten und Laufzeitstatistiken wurden nicht überschrieben.','Config imported. Tokens, passwords, subscription/ownership data and runtime statistics were not overwritten.'));
   }catch(error){flash(req,'err',`${l(req,'Config-Import fehlgeschlagen','Config import failed')}: ${error.message}`);}

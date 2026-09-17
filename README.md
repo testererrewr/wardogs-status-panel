@@ -1,8 +1,12 @@
-# status-hub.lol v3.12.20
+# status-hub.lol v3.12.21
 
-## v3.12.20 – JOIN Seeding server-name fix & welcome whisper reliability
+## v3.12.21 – Save/Origin fix & management cleanup
 
-- WARDOGS Management Bot: **JOIN Seeding** is appended to the actual WARDOGS game-server name while 1–20 players are online and removed again at 0 or 21+ players. It never changes the Discord bot nickname. Existing management bots keep the setting enabled and it can be disabled in settings.
+- Fixed legitimate HTTPS form saves behind Caddy/reverse proxies being rejected as `Ungültige Request-Origin.` while keeping CSRF and same-host checks enabled.
+- Removed the WARDOGS Management Bot `JOIN Seeding` server-name feature from runtime, settings, config import/export and the public feature list.
+- Existing v3.12.20 bots perform a one-time cleanup of a leftover `JOIN Seeding` suffix on next start.
+- Fixed custom bots going offline after the security hardening when their runtime needs writable cache/state files; existing read-only custom-bot containers are migrated automatically.
+
 - Join welcome whispers now use a dedicated 5-second join/spawn watcher instead of relying on the slower detection poll. Existing online players remain baseline-only; a real leave/rejoin gets one fresh welcome.
 - Spawn-ready welcome delivery retries clear WARDOGS readiness errors for up to two minutes and only marks a welcome complete after a successful whisper response.
 - WARDOGS Playtime Tracker: one tracker instance can monitor up to 12 WARDOGS servers at once, each with its own encrypted RCON password.

@@ -29,7 +29,6 @@ const lifecycleLocks = new Map();
 const recoveryState = new Map();
 const WELCOME_MAX_ATTEMPTS = 24;
 const WELCOME_RETRY_MS = 5000;
-const SEEDING_SUFFIX = 'JOIN Seeding';
 
 function withLifecycleLock(id, task) {
   const key = String(id || '');
@@ -609,30 +608,17 @@ async function pollManagedWelcome(bot, state) {
   }
 }
 
-export function managedSeedingServerName(currentName, playerCount, enabled = true) {
-  const current = String(currentName || '').trim();
-  if (!current) return '';
-  const suffixPattern = /\s+JOIN Seeding$/i;
-  const base = current.replace(suffixPattern, '').trim();
-  const seeding = enabled === true && Number(playerCount) >= 1 && Number(playerCount) <= 20;
-  return seeding ? `${base} ${SEEDING_SUFFIX}` : base;
-}
-
-async function updateManagedSeedingServerName(bot, state, playerCount, { force = false } = {}) {
-  const active = bot?.seedingNameEnabled === true && Number(playerCount) >= 1 && Number(playerCount) <= 20;
-  const now = Date.now();
-  // Re-check periodically as well as on threshold changes. This restores the suffix
-  // after a game-server restart without hammering the config endpoint every poll.
-  if (!force && state.seedingServerActive === active && now - Number(state.lastSeedingServerCheckAt || 0) < 60_000) return;
-  state.lastSeedingServerCheckAt = now;
-  const status = await wardogsRequest(bot, '/v1/status');
-  const currentName = String(status?.serverName || '').trim();
-  if (!currentName) throw new Error('WARDOGS status did not return a server name');
-  const desired = managedSeedingServerName(currentName, playerCount, bot?.seedingNameEnabled === true);
-  if (desired && desired !== currentName) await writeManagedServerName(bot, desired);
-  state.seedingServerActive = active;
-  state.seedingServerName = desired || currentName;
-  setRuntime(bot.id, { seedingServerName: desired || currentName, lastSeedingNameError: null });
+async function cleanupLegacyJoinSeedingServerName(bot) {
+  if (bot?.legacyJoinSeedingCleanupDone === true) return;
+  try {
+    const status = await wardogsRequest(bot, '/v1/status');
+    const currentName = String(status?.serverName || '').trim();
+    const desired = currentName.replace(/\s+JOIN Seeding$/i, '').trim();
+    if (currentName && desired && desired !== currentName) await writeManagedServerName(bot, desired);
+    upsertManagedBot({ id: bot.id, legacyJoinSeedingCleanupDone: true });
+  } catch (error) {
+    console.warn(`Managed bot ${bot?.id || ''}: legacy JOIN Seeding cleanup failed: ${String(error?.message || error).slice(0, 240)}`);
+  }
 }
 
 export async function whisperManagedPlayer(bot, steamId, message) {
@@ -860,7 +846,7 @@ function signature(bot) {
     steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
     announcementMessages: bot.announcementMessages || '', welcomeWhisperEnabled: bot.welcomeWhisperEnabled === true,
-    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', seedingNameEnabled: bot.seedingNameEnabled === true, banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -1030,9 +1016,6 @@ async function pollPlayers(bot, state, client) {
       state.lastAnnouncementAt = Date.now();
       state.announcementIndex = 0;
     }
-
-    try { await updateManagedSeedingServerName(bot, state, players.length); }
-    catch (error) { setRuntime(bot.id, { lastSeedingNameError: String(error?.message || error).slice(0, 240) }); }
 
     if (bot.welcomeWhisperEnabled !== true) {
       state.welcomePending?.clear?.();
@@ -1590,7 +1573,6 @@ async function stopOne(id, keepRuntime = true) {
     clearTimeout(active.state?.panelRepostTimer);
     clearInterval(active.state?.welcomeTimer);
     const stored = getManagedBot(id) || { id };
-    try { await updateManagedSeedingServerName({ ...stored, seedingNameEnabled: false }, active.state, 0, { force: true }); } catch {}
     try { await deleteStoredControlPanel(stored, active.client, active.state); } catch {}
     try { await active.client.destroy(); } catch {}
   }
@@ -1607,7 +1589,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, seedingServerActive: null, seedingServerName: '', lastSeedingServerCheckAt: 0, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {
@@ -1638,6 +1620,7 @@ async function startOne(bot) {
     // v3.12.19 briefly used the Discord guild nickname for JOIN Seeding. Clean that
     // legacy suffix once; seeding now belongs exclusively to the WARDOGS server name.
     await cleanupLegacySeedingDiscordNickname(freshBeforeRun, client);
+    await cleanupLegacyJoinSeedingServerName(freshBeforeRun);
     setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
     await pollPlayers(freshBeforeRun, state, client);
     if (freshBeforeRun.welcomeWhisperEnabled === true) await pollManagedWelcome(freshBeforeRun, state);
