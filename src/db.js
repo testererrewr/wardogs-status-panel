@@ -104,9 +104,9 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick, Ignore & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick, Ignore & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn'],
     category: 'wardogs',
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick, Ignore & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick, Ignore & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -144,7 +144,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 23, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 24, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -161,7 +161,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 23;
+  parsed.version = 24;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -279,6 +279,18 @@ function migrate(parsed) {
       } else parsed.botServices.push({ ...defaults, createdAt: migrationNow, updatedAt: migrationNow });
     }
   }
+  if (previousVersion < 24) {
+    // v3.12.11 adds an opt-in welcome whisper sent once per confirmed join
+    // after WARDOGS reports that the player has spawned into a faction.
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    const managedService = defaultBotServices()[0];
+    if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: managedService.featuresDe, featuresEn: managedService.featuresEn, updatedAt: migrationNow };
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || 'wardogs-warning-bot') !== 'wardogs-warning-bot') continue;
+      if (typeof bot.welcomeWhisperEnabled !== 'boolean') bot.welcomeWhisperEnabled = false;
+      if (!String(bot.welcomeWhisperMessage || '').trim()) bot.welcomeWhisperMessage = 'Hello {player}, welcome to the server! Join our Discord.';
+    }
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -288,6 +300,8 @@ function migrate(parsed) {
     announcementEnabled: b.announcementEnabled === true,
     announcementIntervalMinutes: Math.max(1, Math.min(1440, Number(b.announcementIntervalMinutes) || 15)),
     announcementMessages: String(b.announcementMessages || ''),
+    welcomeWhisperEnabled: b.welcomeWhisperEnabled === true,
+    welcomeWhisperMessage: String(b.welcomeWhisperMessage || 'Hello {player}, welcome to the server! Join our Discord.').trim().slice(0, 200),
     controlPanelEnabled: b.controlPanelEnabled === true,
     controlPanelChannelId: /^\d{17,20}$/.test(String(b.controlPanelChannelId || '')) ? String(b.controlPanelChannelId) : '',
     controlPanelMessageId: /^\d{17,20}$/.test(String(b.controlPanelMessageId || '')) ? String(b.controlPanelMessageId) : '',

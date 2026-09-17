@@ -1,6 +1,6 @@
 {
   "name": "server-status-hub",
-  "version": "3.12.7",
+  "version": "3.12.11",
   "private": true,
   "description": "Multi-user Discord status bot hosting platform with PayPal and Stripe one-time/monthly Premium billing, account subscription management, free branding boosts, managed bot services, multi-VPS status nodes, GameDig, WARDOGS, FiveM, approved custom bots and text-only status bots.",
   "type": "module",

@@ -62,6 +62,52 @@ function playerSteamId(player) {
   return '';
 }
 
+function playerHasFaction(player) {
+  const faction = String(player?.faction ?? '').trim();
+  if (!faction) return false;
+  return !['none', 'null', 'undefined', 'unassigned'].includes(faction.toLowerCase());
+}
+
+export function renderManagedWelcomeMessage(template, player) {
+  const steamId = playerSteamId(player);
+  const values = {
+    player: String(player?.name || 'player').trim() || 'player',
+    name: String(player?.name || 'player').trim() || 'player',
+    steamid: steamId,
+    faction: String(player?.faction || '').trim()
+  };
+  return String(template || '')
+    .replace(/\{(player|name|steamid|faction)\}/gi, (_, key) => values[String(key).toLowerCase()] ?? '')
+    .trim()
+    .slice(0, 200);
+}
+
+export function managedWelcomeTargets(state, players, joinedPlayers) {
+  if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
+  if (!(state.welcomeAttempted instanceof Set)) state.welcomeAttempted = new Set();
+  const activeIds = state.joinTracker?.active instanceof Set ? state.joinTracker.active : new Set();
+  for (const id of [...state.welcomePending]) if (!activeIds.has(id)) state.welcomePending.delete(id);
+  for (const id of [...state.welcomeAttempted]) if (!activeIds.has(id)) state.welcomeAttempted.delete(id);
+
+  for (const player of Array.isArray(joinedPlayers) ? joinedPlayers : []) {
+    const steamId = playerSteamId(player);
+    if (steamId && !state.welcomeAttempted.has(steamId)) state.welcomePending.add(steamId);
+  }
+
+  const bySteamId = new Map((Array.isArray(players) ? players : []).map((player) => [playerSteamId(player), player]).filter(([id]) => id));
+  const targets = [];
+  for (const steamId of [...state.welcomePending]) {
+    const player = bySteamId.get(steamId);
+    if (!player || !playerHasFaction(player) || state.welcomeAttempted.has(steamId)) continue;
+    // Reserve the welcome before the network request. Even if the request times out,
+    // this join session cannot be spammed by retries on later poll cycles.
+    state.welcomePending.delete(steamId);
+    state.welcomeAttempted.add(steamId);
+    targets.push({ ...player, steamId });
+  }
+  return targets;
+}
+
 export function createManagedJoinTracker() {
   return { initialized: false, active: new Set(), missing: new Map() };
 }
@@ -324,7 +370,8 @@ function signature(bot) {
     pollSeconds: Number(bot.pollSeconds || 20), rulesText: bot.rulesText || '', autoBanEnabled: bot.autoBanEnabled === true,
     steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
-    announcementMessages: bot.announcementMessages || '', accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    announcementMessages: bot.announcementMessages || '', welcomeWhisperEnabled: bot.welcomeWhisperEnabled === true,
+    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -480,16 +527,33 @@ async function pollPlayers(bot, state, client) {
     // a SteamID is screened once when it transitions into a new confirmed session.
     // Three consecutive successful snapshots must miss a player before a later return
     // is treated as another join. This absorbs temporary empty/incomplete API results.
-    const candidates = managedJoinCandidates(state.joinTracker, players, 3)
-      .filter((player) => {
-        const id = playerSteamId(player);
-        return id && !ignored.has(id);
-      });
+    const joinedPlayers = managedJoinCandidates(state.joinTracker, players, 3);
+    const candidates = joinedPlayers.filter((player) => {
+      const id = playerSteamId(player);
+      return id && !ignored.has(id);
+    });
 
     if (!state.baselineReady && state.joinTracker?.initialized) {
       state.baselineReady = true;
       state.lastAnnouncementAt = Date.now();
       state.announcementIndex = 0;
+    }
+
+    if (bot.welcomeWhisperEnabled === true) {
+      for (const player of managedWelcomeTargets(state, players, joinedPlayers)) {
+        const steamId = playerSteamId(player);
+        const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
+        if (!message) continue;
+        try {
+          await whisperManagedPlayer(bot, steamId, message);
+          setRuntime(bot.id, { lastWelcomeWhisperAt: nowIso(), lastWelcomeWhisperPlayer: String(player?.name || steamId), lastWelcomeWhisperError: null });
+        } catch (error) {
+          setRuntime(bot.id, { lastWelcomeWhisperAt: nowIso(), lastWelcomeWhisperPlayer: String(player?.name || steamId), lastWelcomeWhisperError: error.message });
+        }
+      }
+    } else {
+      state.welcomePending?.clear?.();
+      state.welcomeAttempted?.clear?.();
     }
 
     let riskProfiles = new Map();
@@ -982,7 +1046,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeAttempted: new Set(), panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {

@@ -116,7 +116,7 @@ function snapshotFromStats(stats, online = new Map()) {
     samples: Number(row.samples) || 0,
     averagePlayers: Number(row.samples) ? Number(row.playerSum || 0) / Number(row.samples) : 0,
     maxPlayers: Number(row.maxPlayers) || 0
-  })).sort((a, b) => b.averagePlayers - a.averagePlayers || b.maxPlayers - a.maxPlayers || a.hour - b.hour);
+  })).sort((a, b) => a.hour - b.hour);
   return { rows, top25: rows.slice(0, 25), totalSeconds, uniquePlayers: rows.length, onlinePlayers: online.size, clans, hours, startedAt: stats.startedAt, lastPollAt: stats.lastPollAt };
 }
 
