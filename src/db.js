@@ -100,14 +100,14 @@ function defaultBotServices() {
   return [{
     id: 'wardogs-warning-bot',
     slug: 'wardogs-warning-bot',
-    nameDe: 'WARDOGS Warning Bot',
-    nameEn: 'WARDOGS Warning Bot',
-    descriptionDe: 'Überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
-    descriptionEn: 'Monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Regelbasierte Warnungen', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Warnungsgrund im Alert'],
-    featuresEn: ['Join monitoring', 'Rule-based alerts', 'Discord alert channel', 'Configurable role mentions', 'Alert reason included'],
-    priceLabel: '',
-    status: 'coming_soon',
+    nameDe: 'WARDOGS Warning & Management Bot',
+    nameEn: 'WARDOGS Warning & Management Bot',
+    descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
+    descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
+    featuresDe: ['Join-Überwachung', 'Spieler- & Server-Management', 'Regelbasierte Warnungen', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Warnungsgrund im Alert'],
+    featuresEn: ['Join monitoring', 'Player & server management', 'Rule-based alerts', 'Discord alert channel', 'Configurable role mentions', 'Alert reason included'],
+    priceLabel: '€3.99 / month',
+    status: 'available',
     purchaseUrl: '',
     supportUrl: '',
     visible: true,
@@ -116,7 +116,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 15, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 16, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -133,7 +133,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 15;
+  parsed.version = 16;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -171,6 +171,12 @@ function migrate(parsed) {
   parsed.statusNodes = parsed.statusNodes.map((n) => ({ ...n, disabled: Boolean(n.disabled), acceptNewBots: n.acceptNewBots !== false }));
   parsed.supporters = parsed.supporters.map((s) => ({ ...s, id: s.id || crypto.randomUUID(), visible: s.visible !== false, featured: Boolean(s.featured) }));
   parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [] }));
+  if (previousVersion < 16) {
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    const managedService = defaultBotServices()[0];
+    if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], ...managedService, updatedAt: migrationNow };
+    else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
+  }
   return parsed;
 }
 

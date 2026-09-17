@@ -1,4 +1,4 @@
-# status-hub.lol v3.11.5
+# status-hub.lol v3.11.7
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 

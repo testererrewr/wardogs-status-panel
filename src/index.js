@@ -194,6 +194,7 @@ function applyPaypalSubscription(record, details, reason = 'subscription') {
   const user = findUser(fresh.userDiscordId);
   if (!user) throw new Error('User for PayPal subscription not found');
   const status = String(details?.status || fresh.status || '').toUpperCase();
+  if (fresh.cancelledAt) return updatePaypalSubscriptionRecord(fresh.id, { remoteStatus: status, lastSyncAt: new Date().toISOString() });
   if (!['ACTIVE','APPROVED'].includes(status)) return updatePaypalSubscriptionRecord(fresh.id, { status, lastSyncAt: new Date().toISOString() });
   const hasConfirmedPayment = Boolean(details?.billing_info?.last_payment?.time) || reason === 'recurring_payment';
   if (!hasConfirmedPayment) return updatePaypalSubscriptionRecord(fresh.id, { status: 'ACTIVE_PENDING_PAYMENT', subscriptionId: fresh.subscriptionId || details?.id || '', nextBillingAt: details?.billing_info?.next_billing_time || null, lastSyncAt: new Date().toISOString() });
@@ -202,6 +203,24 @@ function applyPaypalSubscription(record, details, reason = 'subscription') {
   const updated = updatePaypalSubscriptionRecord(fresh.id, { status: 'ACTIVE', subscriptionId: fresh.subscriptionId || details?.id || '', nextBillingAt: details?.billing_info?.next_billing_time || null, entitlementExpiresAt: expiresAt, activatedAt: fresh.activatedAt || new Date().toISOString(), lastSyncAt: new Date().toISOString() });
   rebalanceAssignments();
   return updated;
+}
+async function stopCancelledPaypalSubscription(record, details, settings = getSiteSettings()) {
+  if (!record?.cancelledAt) return false;
+  const subscriptionId = String(record.subscriptionId || details?.id || '');
+  const remoteStatus = String(details?.status || '').toUpperCase();
+  const terminal = ['CANCELLED','EXPIRED'].includes(remoteStatus);
+  if (subscriptionId && !terminal) {
+    try {
+      await cancelSubscription(subscriptionId, 'Cancelled earlier by customer from status-hub.lol', settings);
+      updatePaypalSubscriptionRecord(record.id, { status: 'CANCELLED', remoteStatus: remoteStatus || null, remoteCancelError: null, lastSyncAt: new Date().toISOString() });
+    } catch (error) {
+      updatePaypalSubscriptionRecord(record.id, { remoteStatus: remoteStatus || null, remoteCancelError: String(error.message || error).slice(0,500), lastSyncAt: new Date().toISOString() });
+      console.error(`PayPal cancelled-subscription guard (${subscriptionId}):`, error.message);
+    }
+  } else {
+    updatePaypalSubscriptionRecord(record.id, { remoteStatus: remoteStatus || null, lastSyncAt: new Date().toISOString() });
+  }
+  return true;
 }
 function subscriptionFromPaypalEvent(event) {
   const resource = event?.resource || {};
@@ -643,7 +662,7 @@ app.post('/paypal/subscribe/:planId', requireLogin, rateLimit({ windowMs: 60_000
   const settings = getSiteSettings();
   const sub = paypalSubscriptionConfig(settings);
   if (!paypalSubscriptionReady(settings, planId)) { flash(req,'err',l(req,'PayPal-Abo ist für diesen Plan noch nicht eingerichtet.','PayPal subscription is not configured for this plan yet.')); return res.redirect(`/checkout/${planId}`); }
-  const existing = listPaypalSubscriptionsForUser(user.discordId).find((x) => ['ACTIVE','APPROVAL_PENDING','CREATING'].includes(String(x.status || '').toUpperCase())) || listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING','APPROVAL_PENDING','CREATING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
+  const existing = listPaypalSubscriptionsForUser(user.discordId).find((x) => ['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT','CREATING'].includes(String(x.status || '').toUpperCase()) && !x.cancelledAt) || listStripeSubscriptionsForUser(user.discordId).find((x)=>['ACTIVE','TRIALING','APPROVAL_PENDING','CREATING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
   if (existing) { flash(req,'err',l(req,'Du hast bereits ein aktives oder offenes PayPal-Abo. Verwalte es zuerst unter „Your Account“.','You already have an active or pending PayPal subscription. Manage it under “Your Account” first.')); return res.redirect('/account'); }
   const record = createPaypalSubscriptionRecord({ id: crypto.randomUUID(), provider: 'paypal_subscription', userDiscordId: user.discordId, planId, amount: sub.amounts[planId], currency: sub.currency, paypalPlanId: sub.planIds[planId], status: 'creating' });
   try {
@@ -664,6 +683,11 @@ app.get('/paypal/subscription/return', requireLogin, rateLimit({ windowMs: 60_00
     const subscriptionId = String(req.query.subscription_id || record.subscriptionId || '');
     if (!subscriptionId) throw new Error('PayPal subscription ID missing');
     const details = await getSubscription(subscriptionId);
+    if (record.cancelledAt) {
+      await stopCancelledPaypalSubscription({ ...record, subscriptionId }, details);
+      flash(req,'err',l(req,'Dieser PayPal-Aboabschluss wurde bereits abgebrochen. Ein später bestätigter PayPal-Vorgang wird automatisch wieder gekündigt.','This PayPal subscription checkout was already cancelled. If PayPal later approves it, it is automatically cancelled again.'));
+      return res.redirect('/account');
+    }
     updatePaypalSubscriptionRecord(record.id, { subscriptionId, status: String(details.status || record.status || '').toUpperCase(), nextBillingAt: details?.billing_info?.next_billing_time || null, lastSyncAt: new Date().toISOString() });
     if (String(details.status || '').toUpperCase() === 'ACTIVE' && details?.billing_info?.last_payment?.time) {
       applyPaypalSubscription({ ...record, subscriptionId }, details, 'approved');
@@ -684,13 +708,15 @@ app.get('/paypal/subscription/cancel', requireLogin, (req, res) => {
 app.get('/account', requireLogin, async (req, res) => {
   const lang = langOf(req); const user = currentUser(req); const plan = effectivePlan(user);
   const paypalSubscriptions = listPaypalSubscriptionsForUser(user.discordId);
-  const activePaypal = paypalSubscriptions.find((x) => ['ACTIVE','APPROVAL_PENDING'].includes(String(x.status || '').toUpperCase())) || paypalSubscriptions[0] || null;
+  const activePaypal = paypalSubscriptions.find((x) => ['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(String(x.status || '').toUpperCase()) && !x.cancelledAt) || paypalSubscriptions[0] || null;
   const stripeSubscriptions = listStripeSubscriptionsForUser(user.discordId);
   const activeStripe = stripeSubscriptions.find((x) => ['ACTIVE','TRIALING','APPROVAL_PENDING','CHECKOUT_COMPLETED'].includes(String(x.status || '').toUpperCase())) || stripeSubscriptions[0] || null;
   const billingCards = [];
   if (activePaypal) {
-    const state = String(activePaypal.status || '').toUpperCase(); const end = activePaypal.entitlementExpiresAt || user.planExpiresAt || ''; const canCancel = state === 'ACTIVE' && activePaypal.subscriptionId && !activePaypal.cancelledAt;
-    billingCards.push(`<div class="account-billing"><div><span class="eyebrow">PayPal</span><h3>${esc(PLANS[activePaypal.planId]?.label || activePaypal.planId)}</h3><p>${tr(lang,'Status','Status')}: <strong>${esc(state)}</strong></p>${activePaypal.nextBillingAt ? `<p>${tr(lang,'Nächste Zahlung','Next payment')}: ${esc(new Date(activePaypal.nextBillingAt).toLocaleString(localeCode(lang)))}</p>` : ''}${activePaypal.cancelledAt && end ? `<p>${tr(lang,'Gekündigt. Premium bleibt bis','Cancelled. Premium remains until')} ${esc(new Date(end).toLocaleString(localeCode(lang)))}</p>` : ''}</div>${canCancel ? `<form method="post" action="/account/subscription/cancel" onsubmit="return confirm('${tr(lang,'Monatliches PayPal-Abo wirklich kündigen? Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Cancel the monthly PayPal subscription? Premium remains active until the end of the already paid period.')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(activePaypal.id)}"><button class="button danger" type="submit">${tr(lang,'Abo kündigen','Cancel subscription')}</button></form>` : ''}</div>`);
+    const state = String(activePaypal.status || '').toUpperCase(); const end = activePaypal.entitlementExpiresAt || user.planExpiresAt || ''; const pendingCancel = ['APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(state); const canCancel = ['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(state) && activePaypal.subscriptionId && !activePaypal.cancelledAt;
+    const cancelConfirm = pendingCancel ? tr(lang,'Diesen offenen PayPal-Aboabschluss wirklich abbrechen? Solange keine Zahlung bestätigt wurde, wird kein Premium-Zeitraum angerechnet.','Cancel this pending PayPal subscription checkout? No Premium period is granted until a payment has been confirmed.') : tr(lang,'Monatliches PayPal-Abo wirklich kündigen? Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Cancel the monthly PayPal subscription? Premium remains active until the end of the already paid period.');
+    const cancelLabel = pendingCancel ? tr(lang,'Aboabschluss abbrechen','Cancel checkout') : tr(lang,'Abo kündigen','Cancel subscription');
+    billingCards.push(`<div class="account-billing"><div><span class="eyebrow">PayPal</span><h3>${esc(PLANS[activePaypal.planId]?.label || activePaypal.planId)}</h3><p>${tr(lang,'Status','Status')}: <strong>${esc(state)}</strong></p>${activePaypal.nextBillingAt ? `<p>${tr(lang,'Nächste Zahlung','Next payment')}: ${esc(new Date(activePaypal.nextBillingAt).toLocaleString(localeCode(lang)))}</p>` : ''}${activePaypal.cancelledAt && end ? `<p>${tr(lang,'Gekündigt. Premium bleibt bis','Cancelled. Premium remains until')} ${esc(new Date(end).toLocaleString(localeCode(lang)))}</p>` : ''}</div>${canCancel ? `<form method="post" action="/account/subscription/cancel" onsubmit="return confirm('${cancelConfirm}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(activePaypal.id)}"><button class="button danger" type="submit">${cancelLabel}</button></form>` : ''}</div>`);
   }
   if (activeStripe) {
     const state=String(activeStripe.status||'').toUpperCase(); const end=activeStripe.entitlementExpiresAt||user.planExpiresAt||''; const canCancel=['ACTIVE','TRIALING'].includes(state)&&activeStripe.subscriptionId&&!activeStripe.cancelAtPeriodEnd&&!activeStripe.cancelledAt;
@@ -716,13 +742,39 @@ app.post('/account/subscription/cancel', requireLogin, checkCsrf, rateLimit({ wi
     const user = currentUser(req);
     const record = getPaypalSubscriptionRecord(String(req.body.recordId || ''));
     if (!record || record.userDiscordId !== user.discordId || !record.subscriptionId) throw new Error(l(req,'Abo nicht gefunden.','Subscription not found.'));
-    let details = null;
-    try { details = await getSubscription(record.subscriptionId); } catch {}
-    const end = record.entitlementExpiresAt || user.planExpiresAt || (details ? subscriptionEntitlementExpiry(details) : new Date(Date.now() + 32*86400_000).toISOString());
+    if (record.cancelledAt) { flash(req,'ok',l(req,'Dieses PayPal-Abo wurde bereits beendet.','This PayPal subscription has already been ended.')); return res.redirect('/account'); }
+
+    let details = null; let lookupError = null;
+    try { details = await getSubscription(record.subscriptionId); } catch (error) { lookupError = error; }
+    const localState = String(record.status || '').toUpperCase();
+    const remoteState = String(details?.status || '').toUpperCase();
+    const effectiveState = remoteState || localState;
+    const now = new Date().toISOString();
+
+    if (['CANCELLED','EXPIRED'].includes(effectiveState)) {
+      updatePaypalSubscriptionRecord(record.id, { status: effectiveState, cancelledAt: record.cancelledAt || now, nextBillingAt: null, remoteStatus: remoteState || null, lastSyncAt: now });
+      flash(req,'ok',l(req,'Dieses PayPal-Abo ist bereits beendet.','This PayPal subscription is already ended.'));
+      return res.redirect('/account');
+    }
+
+    if (effectiveState === 'APPROVAL_PENDING') {
+      try {
+        await cancelSubscription(record.subscriptionId, 'Cancelled before approval by customer from status-hub.lol');
+        updatePaypalSubscriptionRecord(record.id, { status: 'CANCELLED', cancelledAt: now, nextBillingAt: null, remoteStatus: remoteState || 'APPROVAL_PENDING', remoteCancelError: null, lastSyncAt: now });
+      } catch (error) {
+        if (!details || remoteState !== 'APPROVAL_PENDING') throw lookupError || error;
+        updatePaypalSubscriptionRecord(record.id, { status: 'CANCELLED_BEFORE_APPROVAL', cancelledAt: now, nextBillingAt: null, remoteStatus: remoteState, remoteCancelError: String(error.message || error).slice(0,500), lastSyncAt: now });
+      }
+      flash(req,'ok',l(req,'Offener PayPal-Aboabschluss abgebrochen. Du kannst jetzt ein neues Abo starten.','Pending PayPal subscription checkout cancelled. You can now start a new subscription.'));
+      return res.redirect('/account');
+    }
+
     await cancelSubscription(record.subscriptionId, 'Cancelled by customer from status-hub.lol');
-    updatePaypalSubscriptionRecord(record.id, { status: 'CANCELLED', cancelledAt: new Date().toISOString(), entitlementExpiresAt: end, nextBillingAt: null });
-    if (user.premiumSource?.provider === 'paypal_subscription' && user.premiumSource?.recordId === record.id) upsertUser({ discordId: user.discordId, planExpiresAt: end });
-    flash(req,'ok',l(req,'Abo gekündigt. Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Subscription cancelled. Premium remains active until the end of the already paid period.'));
+    const ownsPremium = user.premiumSource?.provider === 'paypal_subscription' && user.premiumSource?.recordId === record.id;
+    const end = record.entitlementExpiresAt || (ownsPremium ? user.planExpiresAt : null) || null;
+    updatePaypalSubscriptionRecord(record.id, { status: 'CANCELLED', cancelledAt: now, entitlementExpiresAt: end, nextBillingAt: null, remoteStatus: remoteState || effectiveState, remoteCancelError: null, lastSyncAt: now });
+    if (ownsPremium && end) upsertUser({ discordId: user.discordId, planExpiresAt: end });
+    flash(req,'ok',end ? l(req,'Abo gekündigt. Premium bleibt bis zum Ende des bereits bezahlten Zeitraums aktiv.','Subscription cancelled. Premium remains active until the end of the already paid period.') : l(req,'PayPal-Abo gekündigt. Es wurde noch kein bezahlter Premium-Zeitraum erkannt.','PayPal subscription cancelled. No paid Premium period was detected yet.'));
   } catch (error) { flash(req,'err',`PayPal: ${error.message}`); }
   res.redirect('/account');
 });
@@ -798,14 +850,16 @@ app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async 
       const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || '')) || getPaypalSubscriptionRecord(String(event.resource?.custom_id || ''));
       if (record) {
         const details = event.resource?.billing_info ? event.resource : await getSubscription(record.subscriptionId || event.resource?.id, settings);
-        applyPaypalSubscription(record, details, 'webhook');
+        if (!await stopCancelledPaypalSubscription(record, details, settings)) applyPaypalSubscription(record, details, 'webhook');
       }
     } else if (type === 'PAYMENT.SALE.COMPLETED') {
       const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.billing_agreement_id || ''));
       if (record) {
         const details = await getSubscription(record.subscriptionId, settings);
-        applyPaypalSubscription(record, details, 'recurring_payment');
-        updatePaypalSubscriptionRecord(record.id, { lastPaymentId: String(event.resource?.id || ''), lastPaymentAt: event.resource?.create_time || new Date().toISOString(), lastPaymentAmount: event.resource?.amount?.total || event.resource?.amount?.value || '' });
+        if (!await stopCancelledPaypalSubscription(record, details, settings)) {
+          applyPaypalSubscription(record, details, 'recurring_payment');
+          updatePaypalSubscriptionRecord(record.id, { lastPaymentId: String(event.resource?.id || ''), lastPaymentAt: event.resource?.create_time || new Date().toISOString(), lastPaymentAmount: event.resource?.amount?.total || event.resource?.amount?.value || '' });
+        }
       }
     } else if (['BILLING.SUBSCRIPTION.CANCELLED','BILLING.SUBSCRIPTION.EXPIRED','BILLING.SUBSCRIPTION.SUSPENDED','BILLING.SUBSCRIPTION.PAYMENT.FAILED'].includes(type)) {
       const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || event.resource?.billing_agreement_id || ''));
