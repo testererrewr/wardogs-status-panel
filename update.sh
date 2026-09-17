@@ -30,6 +30,7 @@ if ! grep -q '^DONATE_PAYPAL_URL=' .env; then echo 'DONATE_PAYPAL_URL=' >> .env;
 if ! grep -q '^DONATE_KOFI_URL=' .env; then echo 'DONATE_KOFI_URL=' >> .env; fi
 if ! grep -q '^DONATE_STRIPE_URL=' .env; then echo 'DONATE_STRIPE_URL=' >> .env; fi
 if ! grep -q '^NODE_INSTALL_SCRIPT_URL=' .env; then echo 'NODE_INSTALL_SCRIPT_URL=https://raw.githubusercontent.com/testererrewr/wardogs-status-panel/main/install-node.sh' >> .env; fi
+if ! grep -q '^STEAM_WEB_API_KEY=' .env; then echo 'STEAM_WEB_API_KEY=' >> .env; fi
 mkdir -p data custom-bots
 chown -R 1000:1000 data custom-bots
 chmod 750 data custom-bots

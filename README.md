@@ -1,7 +1,16 @@
-# status-hub.lol v3.12.0
+# status-hub.lol v3.12.1
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
 
+
+
+## v3.12.1
+
+- WARDOGS Detection Rules redesigned around Steam risk signals: VAC bans, game bans, low playtime, new accounts, recent bans, Community/Economy bans and private profiles.
+- Empty default rule removed, so management-panel-only changes no longer fail rule validation.
+- Optional encrypted Steam Web API key per managed bot, with `STEAM_WEB_API_KEY` environment fallback.
+- Configurable Steam App ID for low-playtime checks.
+- Legacy v3.12.0 SteamID/name/faction/ping rules are cleared during migration and Auto-Ban is switched OFF for safety until new rules are configured.
 
 ## v3.12.0
 

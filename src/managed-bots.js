@@ -14,7 +14,8 @@ import {
 import { decryptSecret } from './crypto.js';
 import { assertSafeUrl } from './target-safety.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
-import { parseManagedRules, evaluateManagedRules } from './managed-rules.js';
+import { parseManagedRules, evaluateManagedRules, managedRulesNeedSteam } from './managed-rules.js';
+import { getSteamRiskProfile, steamApiKeyAvailable } from './steam-risk.js';
 export { parseManagedRules, evaluateManagedRules } from './managed-rules.js';
 
 export const MANAGED_DISCORD_PERMISSION_KEYS = Object.freeze([
@@ -48,6 +49,11 @@ function setUiState(botId, userId, patch) {
 }
 function getUiState(botId, userId) { return discordUiState.get(uiKey(botId, userId)) || {}; }
 export function managedBotRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
+
+export function managedSteamRuleStatus(bot) {
+  const rules = parseManagedRules(bot?.rulesText || '');
+  return { needsSteam: managedRulesNeedSteam(rules), apiKeyAvailable: steamApiKeyAvailable(bot) };
+}
 
 async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
@@ -234,6 +240,7 @@ function signature(bot) {
     controlPanelEnabled: bot.controlPanelEnabled === true, controlPanelChannelId: bot.controlPanelChannelId || '', discordGrants: normalizeDiscordGrants(bot),
     wardogsBaseUrl: bot.wardogsBaseUrl || '', wardogsSecretEnc: bot.wardogsSecretEnc || '', allowPrivateTarget: Boolean(bot.allowPrivateTarget),
     pollSeconds: Number(bot.pollSeconds || 20), rulesText: bot.rulesText || '', autoBanEnabled: bot.autoBanEnabled === true,
+    steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
     announcementMessages: bot.announcementMessages || '', accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
@@ -249,7 +256,7 @@ function alertComponents(bot, player) {
   )];
 }
 
-async function postAlert(bot, client, player, reasons, autoResult = null) {
+async function postAlert(bot, client, player, reasons, autoResult = null, risk = null) {
   const channel = await client.channels.fetch(String(bot.alertChannelId || ''));
   if (!channel?.isTextBased?.() || typeof channel.send !== 'function') throw new Error('Discord Alert-Channel wurde nicht gefunden oder ist nicht beschreibbar');
   const steamId = String(player?.steamId || player?.steamId64 || '—');
@@ -261,10 +268,19 @@ async function postAlert(bot, client, player, reasons, autoResult = null) {
       { name: 'Player', value: String(player?.name || 'Unknown').slice(0, 1024), inline: true },
       { name: 'SteamID64', value: steamId.slice(0, 1024), inline: true },
       { name: 'Faction', value: String(player?.faction || '—').slice(0, 1024), inline: true },
-      { name: 'Ping', value: Number.isFinite(ping) ? `${ping} ms` : '—', inline: true },
-      { name: 'Auto-Ban', value: bot.autoBanEnabled ? (autoResult?.ok ? 'Executed' : `Enabled${autoResult?.error ? ` · failed: ${String(autoResult.error).slice(0, 160)}` : ''}`) : 'OFF', inline: false }
-    )
-    .setTimestamp(new Date());
+      { name: 'Ping', value: Number.isFinite(ping) ? `${ping} ms` : '—', inline: true }
+    );
+  if (risk) {
+    const steamFacts = [
+      Number.isFinite(Number(risk.vacBans)) ? `VAC: ${risk.vacBans}` : null,
+      Number.isFinite(Number(risk.gameBans)) ? `Game bans: ${risk.gameBans}` : null,
+      Number.isFinite(Number(risk.playtimeHours)) ? `Playtime: ${risk.playtimeHours} h` : null,
+      Number.isFinite(Number(risk.accountAgeDays)) ? `Account: ${risk.accountAgeDays} d` : null,
+      risk.profilePrivate === true ? 'Profile: private' : risk.profilePrivate === false ? 'Profile: public' : null
+    ].filter(Boolean).join(' · ');
+    if (steamFacts) embed.addFields({ name: 'Steam Check', value: steamFacts.slice(0, 1024), inline: false });
+  }
+  embed.addFields({ name: 'Auto-Ban', value: bot.autoBanEnabled ? (autoResult?.ok ? 'Executed' : `Enabled${autoResult?.error ? ` · failed: ${String(autoResult.error).slice(0, 160)}` : ''}`) : 'OFF', inline: false }).setTimestamp(new Date());
   const content = validSnowflake(bot.mentionRoleId) ? `<@&${bot.mentionRoleId}>` : '';
   await channel.send({ content, embeds: [embed], components: alertComponents(bot, player), allowedMentions: content ? { roles: [String(bot.mentionRoleId)] } : { parse: [] } });
 }
@@ -384,15 +400,25 @@ async function pollPlayers(bot, state, client) {
     const joins = players.filter((p) => { const id = String(p?.steamId || p?.steamId64 || ''); return validSteamId(id) && !state.seen.has(id); });
     state.seen = current;
     for (const player of joins) {
-      const reasons = evaluateManagedRules(player, rules);
-      if (!reasons.length) continue;
       const steamId = String(player?.steamId || player?.steamId64 || '');
+      let risk = null;
+      if (managedRulesNeedSteam(rules)) {
+        try { risk = await getSteamRiskProfile(bot, steamId, rules); }
+        catch (error) {
+          // Keep the player retryable while they remain online; transient Steam failures should not skip the join forever.
+          state.seen.delete(steamId);
+          setRuntime(bot.id, { lastSteamError: error.message, lastSteamCheck: nowIso() });
+          continue;
+        }
+      }
+      const reasons = evaluateManagedRules(player, rules, risk);
+      if (!reasons.length) continue;
       let autoResult = null;
       if (bot.autoBanEnabled === true) {
         try { await banManagedPlayer(bot, steamId, reasons.join('; ').slice(0, 180)); autoResult = { ok: true }; }
         catch (error) { autoResult = { ok: false, error: error.message }; }
       }
-      try { await postAlert(bot, client, player, reasons, autoResult); }
+      try { await postAlert(bot, client, player, reasons, autoResult, risk); }
       catch (error) { setRuntime(bot.id, { lastError: `Discord Alert: ${error.message}` }); }
     }
     if (bot.announcementEnabled === true) {

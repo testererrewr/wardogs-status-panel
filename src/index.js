@@ -647,30 +647,57 @@ app.get('/bot-services', (req, res) => {
 function managedRuleRows(text) {
   const rows=[];
   for(const rawLine of String(text||'').split(/\r?\n/).map((x)=>x.trim()).filter((x)=>x&&!x.startsWith('#'))){
-    const [exprRaw,...reasonParts]=rawLine.split('|'),expr=String(exprRaw||'').trim(),reason=reasonParts.join('|').trim();
-    const parsed=parseManagedRules(rawLine)[0]; if(!parsed)continue;
-    rows.push({type:parsed.type,op:parsed.op||'',value:String(parsed.value??''),reason});
+    try {
+      const [exprRaw,...reasonParts]=rawLine.split('|'),reason=reasonParts.join('|').trim();
+      const parsed=parseManagedRules(rawLine)[0]; if(!parsed||parsed.legacy)continue;
+      rows.push({type:parsed.type,op:parsed.op||'',value:parsed.value===true?'':String(parsed.value??''),reason});
+    } catch {}
   }
   return rows;
 }
 
 function managedRulesFromBody(req){
   const lines=[];
+  const numericTypes=new Set(['vac_bans','game_bans','playtime','account_age','recent_ban']);
+  const booleanTypes=new Set(['community_ban','economy_ban','private_profile']);
   for(let i=0;i<100;i+=1){
     const type=String(req.body[`ruleType_${i}`]||'').trim().toLowerCase();
-    const value=String(req.body[`ruleValue_${i}`]||'').trim();
+    if(!type)continue;
+    if(!numericTypes.has(type)&&!booleanTypes.has(type))throw new Error(l(req,`Regel ${i+1}: ungültiger Typ.`,`Rule ${i+1}: invalid type.`));
     const reason=String(req.body[`ruleReason_${i}`]||'').trim().slice(0,180);
-    if(!type&&!value)continue;
-    if(!['steam','name','faction','ping'].includes(type))throw new Error(l(req,`Regel ${i+1}: ungültiger Typ.`,`Rule ${i+1}: invalid type.`));
-    if(!value)throw new Error(l(req,`Regel ${i+1}: Wert fehlt.`,`Rule ${i+1}: value is required.`));
     let expr='';
-    if(type==='steam')expr=`steam:${value}`;
-    else if(type==='name')expr=`name:${value}`;
-    else if(type==='faction')expr=`faction:${value}`;
-    else {const op=String(req.body[`ruleOp_${i}`]||'>').trim();if(!['>','>='].includes(op))throw new Error(l(req,`Regel ${i+1}: Ping-Operator ist ungültig.`,`Rule ${i+1}: invalid ping operator.`));expr=`ping${op}${value}`;}
+    if(booleanTypes.has(type)){
+      if(type==='community_ban')expr='communityban=true';
+      else if(type==='economy_ban')expr='economyban=true';
+      else expr='privateprofile=true';
+    } else {
+      const raw=String(req.body[`ruleValue_${i}`]||'').trim();
+      if(!raw)throw new Error(l(req,`Regel ${i+1}: Wert fehlt.`,`Rule ${i+1}: value is required.`));
+      const value=Number(raw.replace(',','.'));
+      if(!Number.isFinite(value)||value<0)throw new Error(l(req,`Regel ${i+1}: Wert ist ungültig.`,`Rule ${i+1}: value is invalid.`));
+      if(type==='vac_bans')expr=`vac>=${Math.max(1,Math.min(100,Math.floor(value)))}`;
+      else if(type==='game_bans')expr=`gameban>=${Math.max(1,Math.min(100,Math.floor(value)))}`;
+      else if(type==='playtime')expr=`playtime<${Math.max(0.1,Math.min(100000,value))}`;
+      else if(type==='account_age')expr=`accountage<${Math.max(1,Math.min(36500,Math.floor(value)))}`;
+      else expr=`recentban<=${Math.max(0,Math.min(36500,Math.floor(value)))}`;
+    }
     lines.push(`${expr}${reason?` | ${reason}`:''}`);
   }
   const text=lines.join('\n');parseManagedRules(text);return text;
+}
+
+function managedRuleTypeLabel(req,type){
+  const labels={
+    vac_bans:['VAC-Bans','VAC bans'],
+    game_bans:['Game-Bans','Game bans'],
+    playtime:['Wenig Spielzeit','Low playtime'],
+    account_age:['Neues Steam-Konto','New Steam account'],
+    recent_ban:['Kürzlicher Steam-Ban','Recent Steam ban'],
+    community_ban:['Community-Ban','Community ban'],
+    economy_ban:['Economy-Ban','Economy ban'],
+    private_profile:['Privates Steam-Profil','Private Steam profile']
+  };
+  return (labels[type]||[type,type])[langOf(req)==='en'?1:0];
 }
 
 const managedGrantLabels={view:['Panel / Spieler ansehen','View panel / players'],announce:['Announcements','Announcements'],whisper:['Whisper','Whisper'],kick:['Kick','Kick'],ban:['Ban','Ban'],unban:['Unban','Unban'],kill:['Kill / Respawn','Kill / respawn'],setteam:['Team setzen','Set team'],match:['Match steuern','Match control'],map:['Map wechseln','Change map'],lighting:['Lighting','Lighting']};
@@ -693,9 +720,14 @@ function managedGrantsFromBody(req){
   return out;
 }
 function managedRuleRowHtml(req,row,index){
-  const type=row?.type||'steam',op=row?.op||'>';
-  return `<div class="managed-rule-row" data-rule-row><select name="ruleType_${index}" data-rule-type><option value="steam" ${type==='steam'?'selected':''}>SteamID64</option><option value="name" ${type==='name'?'selected':''}>${l(req,'Spielername enthält','Player name contains')}</option><option value="faction" ${type==='faction'?'selected':''}>${l(req,'Team / Fraktion','Team / faction')}</option><option value="ping" ${type==='ping'?'selected':''}>Ping</option></select><select name="ruleOp_${index}" data-rule-op><option value="=" ${type!=='ping'?'selected':''}>=</option><option value=">" ${type==='ping'&&op==='>'?'selected':''}>&gt;</option><option value=">=" ${type==='ping'&&op==='>='?'selected':''}>&gt;=</option></select><input name="ruleValue_${index}" data-rule-value maxlength="100" value="${esc(row?.value||'')}" placeholder="${type==='ping'?'250':type==='steam'?'76561198000000001':l(req,'Wert','Value')}"><input name="ruleReason_${index}" maxlength="180" value="${esc(row?.reason||'')}" placeholder="${l(req,'Warn-/Banngrund (optional)','Alert/ban reason (optional)')}"><button class="button danger smallbtn" type="button" data-remove-rule>×</button></div>`;
+  const type=row?.type||'vac_bans';
+  const options=['vac_bans','game_bans','playtime','account_age','recent_ban','community_ban','economy_ban','private_profile'].map((key)=>`<option value="${key}" ${type===key?'selected':''}>${esc(managedRuleTypeLabel(req,key))}</option>`).join('');
+  const booleanType=['community_ban','economy_ban','private_profile'].includes(type);
+  const op=type==='playtime'||type==='account_age'?'&lt;':type==='recent_ban'?'≤':'≥';
+  const unit=type==='playtime'?l(req,'Stunden','hours'):['account_age','recent_ban'].includes(type)?l(req,'Tage','days'):l(req,'Anzahl','count');
+  return `<div class="managed-rule-row" data-rule-row><select name="ruleType_${index}" data-rule-type>${options}</select><span class="managed-rule-op" data-rule-op-label>${op}</span><input name="ruleValue_${index}" data-rule-value type="number" min="0" step="${type==='playtime'?'0.1':'1'}" value="${esc(row?.value||'')}" placeholder="${type==='playtime'?'10':type==='account_age'?'30':type==='recent_ban'?'365':'1'}" ${booleanType?'disabled':''}><span class="managed-rule-unit" data-rule-unit>${esc(booleanType?l(req,'aktiv','active'):unit)}</span><input name="ruleReason_${index}" maxlength="180" value="${esc(row?.reason||'')}" placeholder="${l(req,'Warn-/Banngrund (optional)','Alert/ban reason (optional)')}"><button class="button danger smallbtn" type="button" data-remove-rule>×</button></div>`;
 }
+
 function managedGrantRowHtml(req,row,index){
   const type=row?.type==='user'?'user':'role',perms=new Set(Array.isArray(row?.permissions)?row.permissions:[]);
   return `<div class="managed-grant-row" data-grant-row><div class="managed-grant-head"><select name="grantType_${index}"><option value="role" ${type==='role'?'selected':''}>${l(req,'Discord Rolle','Discord role')}</option><option value="user" ${type==='user'?'selected':''}>${l(req,'Discord Benutzer','Discord user')}</option></select><input name="grantId_${index}" inputmode="numeric" value="${esc(row?.id||'')}" placeholder="Discord ID"><button class="button danger smallbtn" type="button" data-remove-grant>×</button></div><div class="managed-perm-grid">${MANAGED_DISCORD_PERMISSION_KEYS.map((key)=>`<label class="check"><input type="checkbox" name="grantPerm_${index}_${key}" value="1" ${perms.has(key)?'checked':''}> ${esc((managedGrantLabels[key]||[key,key])[langOf(req)==='en'?1:0])}</label>`).join('')}</div></div>`;
@@ -703,9 +735,10 @@ function managedGrantRowHtml(req,row,index){
 
 function managedBotForm(req, service, bot) {
   const lang=langOf(req),u=currentUser(req),rt=managedBotRuntime(bot.id),auto=bot.autoBanEnabled===true;
-  const rules=managedRuleRows(bot.rulesText||''); if(!rules.length)rules.push({type:'steam',op:'=',value:'',reason:''});
+  const rules=managedRuleRows(bot.rulesText||'');
   const grants=managedGrantRows(bot); if(!grants.length)grants.push({type:'role',id:'',permissions:[]});
   const ruleRows=rules.map((row,i)=>managedRuleRowHtml(req,row,i)).join('');
+  const hasGlobalSteamKey=Boolean(String(process.env.STEAM_WEB_API_KEY||'').trim());
   const grantRows=grants.map((row,i)=>managedGrantRowHtml(req,row,i)).join('');
    return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid" id="managed-bot-config">
     <input type="hidden" name="_csrf" value="${esc(csrf(req))}">
@@ -725,10 +758,10 @@ function managedBotForm(req, service, bot) {
     <label>${tr(lang,'Announcement-Intervall','Announcement interval')}<input name="announcementIntervalMinutes" type="number" min="1" max="1440" value="${esc(bot.announcementIntervalMinutes||15)}"><span class="muted small">1–1440 min</span></label>
     <label class="span2">${tr(lang,'Automatische Announcements','Scheduled announcements')}<textarea name="announcementMessages" rows="5" maxlength="10050" placeholder="Welcome to our server!&#10;Read the rules in Discord.&#10;Have fun!">${esc(bot.announcementMessages||'')}</textarea><span class="muted small">${tr(lang,'Eine Nachricht pro Zeile, maximal 200 Zeichen. Die Nachrichten rotieren automatisch.','One message per line, maximum 200 characters. Messages rotate automatically.')}</span></label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
-    <div class="span2 managed-config-block"><div class="row between"><div><strong>${tr(lang,'Erkennungsregeln','Detection rules')}</strong><div class="muted small">${tr(lang,'Typ auswählen, Wert eingeben und optional einen eigenen Warn-/Banngrund setzen.','Choose a rule type, enter a value and optionally set a custom alert/ban reason.')}</div></div><button class="button ghost smallbtn" type="button" id="add-managed-rule">+ ${tr(lang,'Regel','Rule')}</button></div><div id="managed-rules" class="managed-rules" data-lang="${esc(lang)}" data-next-index="${rules.length}">${ruleRows}</div></div>
+    <div class="span2 managed-config-block"><div class="row between"><div><strong>${tr(lang,'Steam Detection Rules','Steam detection rules')}</strong><div class="muted small">${tr(lang,'VAC-/Game-Bans, geringe Spielzeit, neue Konten und weitere Steam-Risiken prüfen. Leere Regeln gibt es nicht mehr – ohne Regel kannst du andere Panel-Einstellungen normal speichern.','Check VAC/game bans, low playtime, new accounts and other Steam risk signals. There is no blank default rule anymore, so other panel settings can be saved without configuring a rule.')}</div></div><button class="button ghost smallbtn" type="button" id="add-managed-rule">+ ${tr(lang,'Regel','Rule')}</button></div><div class="managed-steam-settings"><label>${tr(lang,'Steam Web API Key','Steam Web API key')}<input name="steamWebApiKey" type="password" autocomplete="new-password" placeholder="${bot.steamWebApiKeyEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):hasGlobalSteamKey?tr(lang,'Globaler Key ist konfiguriert','Global key is configured'):tr(lang,'Für Steam-Regeln erforderlich','Required for Steam rules')}"><span class="muted small">${tr(lang,'Optional pro Bot. Alternativ kann der Host STEAM_WEB_API_KEY global setzen.','Optional per bot. The host can alternatively set STEAM_WEB_API_KEY globally.')}</span></label><label>${tr(lang,'Steam App ID','Steam App ID')}<input name="steamAppId" inputmode="numeric" pattern="[0-9]*" maxlength="10" value="${esc(bot.steamAppId||'')}" placeholder="123456"><span class="muted small">${tr(lang,'Nur für die Regel „Wenig Spielzeit“ nötig.','Only required for the “Low playtime” rule.')}</span></label></div><div id="managed-rules" class="managed-rules" data-lang="${esc(lang)}" data-next-index="${rules.length}">${ruleRows||`<div class="muted small managed-rule-empty">${tr(lang,'Noch keine Detection Rule aktiv.','No detection rule active yet.')}</div>`}</div></div>
     <div class="span2 help"><strong>${tr(lang,'Discord Warnung','Discord warning')}:</strong> ${tr(lang,'Bei einem Regel-Treffer postet der Bot Spieler, Grund, SteamID, Fraktion und Ping. Ban/Kick und das Management Panel prüfen die oben vergebenen Discord-Rechte.','When a rule matches, the bot posts player, reason, SteamID, faction and ping. Ban/kick and the management panel enforce the Discord grants configured above.')}</div>
     <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:''}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
-    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}
+    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}
   </form>
   <script src="/managed.js" defer></script>`;
 }
@@ -829,12 +862,17 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     const discordGrants=managedGrantsFromBody(req);
     const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
     const rulesText=managedRulesFromBody(req);
+    const parsedRules=parseManagedRules(rulesText);
+    const steamAppId=String(req.body.steamAppId||'').trim();
+    if(steamAppId&&!/^\d{1,10}$/.test(steamAppId))throw new Error(l(req,'Steam App ID ist ungültig.','Steam App ID is invalid.'));
+    if(parsedRules.some((rule)=>rule.type==='playtime')&&!steamAppId)throw new Error(l(req,'Für „Wenig Spielzeit“ muss eine Steam App ID eingetragen sein.','A Steam App ID is required for the “Low playtime” rule.'));
     const announcementMessages=String(req.body.announcementMessages||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean);
     if(announcementMessages.length>50)throw new Error(l(req,'Maximal 50 automatische Announcements sind erlaubt.','A maximum of 50 scheduled announcements is allowed.'));
     if(announcementMessages.some((x)=>x.length>200))throw new Error(l(req,'Jedes Announcement darf maximal 200 Zeichen lang sein.','Each announcement may contain at most 200 characters.'));
-    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,autoBanEnabled:req.body.autoBanEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+    const patch={id:bot.id,name,alertChannelId,mentionRoleId,controlPanelEnabled,controlPanelChannelId,discordGrants,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,steamAppId,autoBanEnabled:req.body.autoBanEnabled==='1',announcementEnabled:req.body.announcementEnabled==='1',announcementIntervalMinutes:Math.max(1,Math.min(1440,Number(req.body.announcementIntervalMinutes)||15)),announcementMessages:announcementMessages.join('\n'),enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
     if(patch.announcementEnabled&&!announcementMessages.length)throw new Error(l(req,'Für automatische Announcements muss mindestens eine Nachricht eingetragen sein.','At least one message is required when scheduled announcements are enabled.'));
     const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(!bot.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
+    const steamKey=String(req.body.steamWebApiKey||'').trim(); if(steamKey)patch.steamWebApiKeyEnc=encryptSecret(steamKey);
     const secret=String(req.body.wardogsSecret||'').trim(); if(secret)patch.wardogsSecretEnc=encryptSecret(secret); else if(!bot.wardogsSecretEnc)throw new Error(l(req,'WARDOGS RCON/API Passwort fehlt.','WARDOGS RCON/API password is required.'));
     bot=upsertManagedBot(patch); await syncManagedBots(readDb().managedBots||[]);
     flash(req,'ok',patch.autoBanEnabled?l(req,'Gespeichert. Auto-Ban ist AKTIV und greift nur bei deinen Regeln.','Saved. Auto-ban is ENABLED and only triggers on your rules.'):l(req,'Gespeichert. Auto-Ban ist AUS.','Saved. Auto-ban is OFF.'));
