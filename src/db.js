@@ -104,9 +104,14 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Spieler- & Server-Management', 'Regelbasierte Warnungen', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Warnungsgrund im Alert'],
-    featuresEn: ['Join monitoring', 'Player & server management', 'Rule-based alerts', 'Discord alert channel', 'Configurable role mentions', 'Alert reason included'],
+    featuresDe: ['Join-Überwachung', 'Spieler- & Server-Management', 'Regelbasierte Warnungen', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick & Steam-Profil', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Warnungsgrund im Alert'],
+    featuresEn: ['Join monitoring', 'Player & server management', 'Rule-based alerts', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick & Steam profile', 'Discord alert channel', 'Configurable role mentions', 'Alert reason included'],
     priceLabel: '€3.99 / month',
+    monthlyAmount: '3.99',
+    currency: 'EUR',
+    paypalProductId: '',
+    paypalPlanId: '',
+    paypalPlanMeta: {},
     status: 'available',
     purchaseUrl: '',
     supportUrl: '',
@@ -116,7 +121,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 16, users: [], servers: [], customBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 17, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -133,15 +138,17 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 16;
+  parsed.version = 17;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
+  if (!Array.isArray(parsed.managedBots)) parsed.managedBots = [];
   if (!Array.isArray(parsed.statusNodes)) parsed.statusNodes = [];
   if (!Array.isArray(parsed.supporters)) parsed.supporters = [];
   if (!Array.isArray(parsed.botServices)) parsed.botServices = previousVersion < 8 ? defaultBotServices() : [];
   if (!Array.isArray(parsed.paypalPurchases)) parsed.paypalPurchases = [];
   if (!Array.isArray(parsed.paypalSubscriptions)) parsed.paypalSubscriptions = [];
+  if (!Array.isArray(parsed.paypalServiceSubscriptions)) parsed.paypalServiceSubscriptions = [];
   if (!Array.isArray(parsed.paypalWebhookEvents)) parsed.paypalWebhookEvents = [];
   if (!Array.isArray(parsed.stripePurchases)) parsed.stripePurchases = [];
   if (!Array.isArray(parsed.stripeSubscriptions)) parsed.stripeSubscriptions = [];
@@ -170,13 +177,31 @@ function migrate(parsed) {
   parsed.servers = parsed.servers.map((s) => s.gameType ? s : ({ ...s, gameType: 'wardogs', queryConfig: { baseUrl: s.rconUrl || '' }, querySecretEnc: s.rconPasswordEnc || null }));
   parsed.statusNodes = parsed.statusNodes.map((n) => ({ ...n, disabled: Boolean(n.disabled), acceptNewBots: n.acceptNewBots !== false }));
   parsed.supporters = parsed.supporters.map((s) => ({ ...s, id: s.id || crypto.randomUUID(), visible: s.visible !== false, featured: Boolean(s.featured) }));
-  parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [] }));
+  parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [], monthlyAmount: String(x.monthlyAmount || ''), currency: /^[A-Z]{3}$/.test(String(x.currency || '').toUpperCase()) ? String(x.currency).toUpperCase() : 'EUR', paypalProductId: String(x.paypalProductId || ''), paypalPlanId: String(x.paypalPlanId || ''), paypalPlanMeta: x.paypalPlanMeta && typeof x.paypalPlanMeta === 'object' ? x.paypalPlanMeta : {} }));
   if (previousVersion < 16) {
     const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
     const managedService = defaultBotServices()[0];
     if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], ...managedService, updatedAt: migrationNow };
     else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
   }
+  if (previousVersion < 17) {
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    const managedService = defaultBotServices()[0];
+    if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...managedService, ...parsed.botServices[serviceIndex], monthlyAmount: '3.99', currency: 'EUR', priceLabel: '€3.99 / month', status: 'available', updatedAt: migrationNow };
+    else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
+  }
+  parsed.managedBots = parsed.managedBots.map((b) => ({
+    ...b,
+    id: b.id || crypto.randomUUID(),
+    serviceId: String(b.serviceId || 'wardogs-warning-bot'),
+    enabled: Boolean(b.enabled),
+    autoBanEnabled: b.autoBanEnabled === true,
+    pollSeconds: Math.max(10, Math.min(300, Number(b.pollSeconds) || 20)),
+    rulesText: String(b.rulesText || ''),
+    accessSource: String(b.accessSource || ''),
+    accessUntil: b.accessUntil || null,
+    adminGrant: Boolean(b.adminGrant)
+  }));
   return parsed;
 }
 
@@ -210,6 +235,7 @@ export function assignLegacyOwnership(adminDiscordId) {
   updateDb((db) => {
     for (const s of db.servers) if (!s.ownerDiscordId) s.ownerDiscordId = adminDiscordId;
     for (const b of db.customBots) if (!b.ownerDiscordId) b.ownerDiscordId = adminDiscordId;
+    for (const b of db.managedBots || []) if (!b.ownerDiscordId) b.ownerDiscordId = adminDiscordId;
   });
 }
 
@@ -250,6 +276,21 @@ export function upsertCustomBot(bot) {
   });
 }
 export function deleteCustomBot(id) { updateDb((db) => { db.customBots = db.customBots.filter((b) => b.id !== id); }); }
+
+export function getManagedBot(id) { return (readDb().managedBots || []).find((b) => b.id === id) || null; }
+export function getManagedBotForUserService(discordId, serviceId) { return (readDb().managedBots || []).find((b) => b.ownerDiscordId === discordId && b.serviceId === serviceId) || null; }
+export function listManagedBotsFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId); }
+export function upsertManagedBot(bot) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.managedBots)) db.managedBots = [];
+    const now = new Date().toISOString();
+    const index = db.managedBots.findIndex((b) => b.id === bot.id);
+    if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, pollSeconds: 20, rulesText: '', createdAt: now, updatedAt: now, ...bot };
+    db.managedBots.push(entry); return entry;
+  });
+}
+export function deleteManagedBot(id) { updateDb((db) => { db.managedBots = (db.managedBots || []).filter((b) => b.id !== id); }); }
 
 export function listStatusNodes() { return readDb().statusNodes || []; }
 export function getStatusNode(id) { return listStatusNodes().find((n) => n.id === id) || null; }
@@ -351,6 +392,28 @@ export function updatePaypalSubscriptionRecord(id, patch) {
     if (index < 0) return null;
     db.paypalSubscriptions[index] = { ...db.paypalSubscriptions[index], ...patch, updatedAt: new Date().toISOString() };
     return db.paypalSubscriptions[index];
+  });
+}
+
+export function createPaypalServiceSubscriptionRecord(subscription) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.paypalServiceSubscriptions)) db.paypalServiceSubscriptions = [];
+    const now = new Date().toISOString();
+    const entry = { id: subscription.id || crypto.randomUUID(), status: 'creating', createdAt: now, updatedAt: now, ...subscription };
+    db.paypalServiceSubscriptions.push(entry);
+    return entry;
+  });
+}
+export function getPaypalServiceSubscriptionRecord(id) { return (readDb().paypalServiceSubscriptions || []).find((x) => x.id === id) || null; }
+export function getPaypalServiceSubscriptionByPaypalId(subscriptionId) { return (readDb().paypalServiceSubscriptions || []).find((x) => x.subscriptionId === subscriptionId) || null; }
+export function listPaypalServiceSubscriptionsForUser(discordId, serviceId = '') { return (readDb().paypalServiceSubscriptions || []).filter((x) => x.userDiscordId === discordId && (!serviceId || x.serviceId === serviceId)).sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
+export function updatePaypalServiceSubscriptionRecord(id, patch) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.paypalServiceSubscriptions)) db.paypalServiceSubscriptions = [];
+    const index = db.paypalServiceSubscriptions.findIndex((x) => x.id === id);
+    if (index < 0) return null;
+    db.paypalServiceSubscriptions[index] = { ...db.paypalServiceSubscriptions[index], ...patch, updatedAt: new Date().toISOString() };
+    return db.paypalServiceSubscriptions[index];
   });
 }
 

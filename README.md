@@ -1,6 +1,17 @@
-# status-hub.lol v3.11.7
+# status-hub.lol v3.11.8
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
+
+
+## v3.11.8
+
+- Admin panel now exposes start/rebuild, stop, approve/revoke, logs, source and delete controls for Custom Bots.
+- WARDOGS Warning & Management Bot is now a hosted managed service with its own configuration page.
+- Separate PayPal monthly subscription per managed bot service; WARDOGS service defaults to €3.99/month and does not consume Premium status-bot slots.
+- Admin accounts can activate their own WARDOGS managed bot for free.
+- Rule-based join alerts support optional automatic bans. Auto-ban is OFF by default and must be explicitly enabled.
+- Discord warning messages include Ban, Kick and Steam Profile buttons.
+- Managed bot access and runtime are synchronized automatically when a subscription expires or configuration changes.
 
 ## v3.10.0 Lifecycle
 

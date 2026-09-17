@@ -99,6 +99,44 @@ export async function createSubscriptionProduct({ settings = getSiteSettings() }
   });
 }
 
+export async function createManagedServiceProduct({ name, description, homeUrl = 'https://status-hub.lol', settings = getSiteSettings() }) {
+  return api('/v1/catalogs/products', {
+    method: 'POST', requestId: crypto.randomUUID(), settings,
+    body: {
+      name: String(name || 'status-hub.lol Managed Bot').slice(0, 127),
+      description: String(description || 'Managed bot service subscription').slice(0, 255),
+      type: 'SERVICE', category: 'SOFTWARE', home_url: String(homeUrl || 'https://status-hub.lol').slice(0, 2048)
+    }
+  });
+}
+
+export async function createManagedServicePlan({ productId, name, description, amount, currency, settings = getSiteSettings() }) {
+  return api('/v1/billing/plans', {
+    method: 'POST', requestId: crypto.randomUUID(), settings,
+    body: {
+      product_id: productId,
+      name: String(name || 'Managed Bot').slice(0, 127),
+      description: String(description || 'Managed bot monthly subscription').slice(0, 127),
+      billing_cycles: [{ frequency: { interval_unit: 'MONTH', interval_count: 1 }, tenure_type: 'REGULAR', sequence: 1, total_cycles: 0, pricing_scheme: { fixed_price: { value: amount, currency_code: currency } } }],
+      payment_preferences: { auto_bill_outstanding: true, setup_fee_failure_action: 'CANCEL', payment_failure_threshold: 1 }
+    }
+  });
+}
+
+export async function ensureManagedServiceSubscriptionPlan({ productId = '', planId = '', planMeta = {}, name, description, amount, currency = 'EUR', homeUrl = 'https://status-hub.lol', settings = getSiteSettings() }) {
+  let finalProductId = String(productId || '');
+  if (!finalProductId) {
+    const product = await createManagedServiceProduct({ name, description, homeUrl, settings });
+    if (!product?.id) throw new Error('PayPal did not return a product ID for the bot service');
+    finalProductId = product.id;
+  }
+  const meta = planMeta && typeof planMeta === 'object' ? planMeta : {};
+  if (planId && meta.amount === amount && meta.currency === currency) return { productId: finalProductId, planId, planMeta: meta };
+  const plan = await createManagedServicePlan({ productId: finalProductId, name, description, amount, currency, settings });
+  if (!plan?.id) throw new Error('PayPal did not return a plan ID for the bot service');
+  return { productId: finalProductId, planId: plan.id, planMeta: { amount, currency, createdAt: new Date().toISOString() } };
+}
+
 export async function createSubscriptionPlan({ productId, planId, amount, currency, settings = getSiteSettings() }) {
   const names = { premium5: 'Premium 5', premium10: 'Premium 10', premium15: 'Premium 15', premium20: 'Premium 20' };
   return api('/v1/billing/plans', {

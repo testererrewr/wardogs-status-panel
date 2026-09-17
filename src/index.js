@@ -8,10 +8,12 @@ import { rateLimit } from 'express-rate-limit';
 import {
   readDb, findUser, upsertUser, deleteUser, getServer, listServersFor, upsertServer, deleteServer,
   getCustomBot, listCustomBotsFor, upsertCustomBot, deleteCustomBot, assignLegacyOwnership,
+  getManagedBot, getManagedBotForUserService, listManagedBotsFor, upsertManagedBot, deleteManagedBot,
   listStatusNodes, getStatusNode, upsertStatusNode, deleteStatusNode, getSiteSettings, updateSiteSettings,
   listSupporters, upsertSupporter, deleteSupporter, listBotServices, getBotService, upsertBotService, deleteBotService,
   createPaypalPurchase, getPaypalPurchase, getPaypalPurchaseByOrder, updatePaypalPurchase, rememberPaypalWebhookEvent, paypalWebhookEventSeen,
   createPaypalSubscriptionRecord, getPaypalSubscriptionRecord, getPaypalSubscriptionByPaypalId, listPaypalSubscriptionsForUser, updatePaypalSubscriptionRecord,
+  createPaypalServiceSubscriptionRecord, getPaypalServiceSubscriptionRecord, getPaypalServiceSubscriptionByPaypalId, listPaypalServiceSubscriptionsForUser, updatePaypalServiceSubscriptionRecord,
   createStripePurchase, getStripePurchase, getStripePurchaseBySession, updateStripePurchase, createStripeSubscriptionRecord, getStripeSubscriptionRecord, getStripeSubscriptionByStripeId, getStripeSubscriptionBySession, listStripeSubscriptionsForUser, updateStripeSubscriptionRecord, rememberStripeWebhookEvent, stripeWebhookEventSeen
 } from './db.js';
 import { encryptSecret, decryptSecret } from './crypto.js';
@@ -21,11 +23,12 @@ import { tr, normalizeLang, localeCode } from './i18n.js';
 import { FileSessionStore } from './file-session-store.js';
 import { prepareCustomBot, parseEnvText, deleteCustomBotFiles } from './custom-bots.js';
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
+import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots } from './managed-bots.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
 import { verifyFreeBoostForUser, refreshDueFreeBoosts, freeBoostRanges, recalculateStoredFreeBoostLimits } from './free-boost.js';
-import { paypalConfigured, paypalEnvironment, paypalCredentialState, createCheckoutOrder, getCheckoutOrder, captureCheckoutOrder, extractCompletedCapture, verifyWebhook, ensureWebhook, ensureSubscriptionCatalog, createSubscription, getSubscription, cancelSubscription } from './paypal.js';
+import { paypalConfigured, paypalEnvironment, paypalCredentialState, createCheckoutOrder, getCheckoutOrder, captureCheckoutOrder, extractCompletedCapture, verifyWebhook, ensureWebhook, ensureSubscriptionCatalog, ensureManagedServiceSubscriptionPlan, createSubscription, getSubscription, cancelSubscription } from './paypal.js';
 import { stripeConfigured, stripeCredentialState, testStripeConnection, createStripeCheckout, retrieveStripeCheckout, retrieveStripeSubscription, cancelStripeSubscriptionAtPeriodEnd, verifyStripeWebhook, ensureStripeWebhook } from './stripe.js';
 import { runLifecycleSweep, renewFreeAccess, freeRenewState, markPremiumDowngrade, FREE_RENEW_DAYS, GRACE_DAYS } from './lifecycle.js';
 
@@ -222,6 +225,42 @@ async function stopCancelledPaypalSubscription(record, details, settings = getSi
   }
   return true;
 }
+function applyPaypalServiceSubscription(record, details, reason = 'service_subscription') {
+  const fresh = getPaypalServiceSubscriptionRecord(record?.id || '');
+  if (!fresh) throw new Error('PayPal bot-service subscription record not found');
+  const user = findUser(fresh.userDiscordId);
+  const service = getBotService(fresh.serviceId);
+  if (!user || !service) throw new Error('Bot service or user no longer exists');
+  const status = String(details?.status || fresh.status || '').toUpperCase();
+  if (fresh.cancelledAt) return updatePaypalServiceSubscriptionRecord(fresh.id, { remoteStatus: status, lastSyncAt: new Date().toISOString() });
+  if (fresh.paypalPlanId && details?.plan_id && String(details.plan_id) !== String(fresh.paypalPlanId)) throw new Error('PayPal bot-service plan mismatch');
+  if (!['ACTIVE','APPROVED'].includes(status)) return updatePaypalServiceSubscriptionRecord(fresh.id, { status, lastSyncAt: new Date().toISOString() });
+  const hasConfirmedPayment = Boolean(details?.billing_info?.last_payment?.time) || reason === 'recurring_payment';
+  if (!hasConfirmedPayment) return updatePaypalServiceSubscriptionRecord(fresh.id, { status: 'ACTIVE_PENDING_PAYMENT', subscriptionId: fresh.subscriptionId || details?.id || '', nextBillingAt: details?.billing_info?.next_billing_time || null, lastSyncAt: new Date().toISOString() });
+  const expiresAt = subscriptionEntitlementExpiry(details);
+  let bot = managedServiceForUser(user.discordId, service.id);
+  if (!bot) bot = upsertManagedBot({ ownerDiscordId: user.discordId, serviceId: service.id, name: service.nameDe || service.nameEn || 'Managed Bot', enabled: false, autoBanEnabled: false, pollSeconds: 20, rulesText: '', adminGrant: false });
+  upsertManagedBot({ id: bot.id, accessSource: 'paypal_subscription', accessRecordId: fresh.id, accessUntil: expiresAt });
+  const updated = updatePaypalServiceSubscriptionRecord(fresh.id, { status: 'ACTIVE', subscriptionId: fresh.subscriptionId || details?.id || '', nextBillingAt: details?.billing_info?.next_billing_time || null, entitlementExpiresAt: expiresAt, activatedAt: fresh.activatedAt || new Date().toISOString(), lastSyncAt: new Date().toISOString() });
+  syncManagedBots(readDb().managedBots || []).catch((error) => console.error('Managed bot sync:', error.message));
+  return updated;
+}
+async function stopCancelledPaypalServiceSubscription(record, details, settings = getSiteSettings()) {
+  if (!record?.cancelledAt) return false;
+  const subscriptionId = String(record.subscriptionId || details?.id || '');
+  const remoteStatus = String(details?.status || '').toUpperCase();
+  const terminal = ['CANCELLED','EXPIRED'].includes(remoteStatus);
+  if (subscriptionId && !terminal) {
+    try {
+      await cancelSubscription(subscriptionId, 'Cancelled earlier by customer from status-hub.lol', settings);
+      updatePaypalServiceSubscriptionRecord(record.id, { status: 'CANCELLED', remoteStatus: remoteStatus || null, remoteCancelError: null, lastSyncAt: new Date().toISOString() });
+    } catch (error) {
+      updatePaypalServiceSubscriptionRecord(record.id, { remoteStatus: remoteStatus || null, remoteCancelError: String(error.message || error).slice(0,500), lastSyncAt: new Date().toISOString() });
+      console.error(`PayPal cancelled service-subscription guard (${subscriptionId}):`, error.message);
+    }
+  } else updatePaypalServiceSubscriptionRecord(record.id, { remoteStatus: remoteStatus || null, lastSyncAt: new Date().toISOString() });
+  return true;
+}
 function subscriptionFromPaypalEvent(event) {
   const resource = event?.resource || {};
   const directId = String(resource.id || '');
@@ -237,6 +276,25 @@ function subscriptionFromPaypalEvent(event) {
   const customId = String(resource.custom_id || '');
   if (customId) {
     const byRecord = getPaypalSubscriptionRecord(customId);
+    if (byRecord) return byRecord;
+  }
+  return null;
+}
+function serviceSubscriptionFromPaypalEvent(event) {
+  const resource = event?.resource || {};
+  const directId = String(resource.id || '');
+  if (directId) {
+    const direct = getPaypalServiceSubscriptionByPaypalId(directId);
+    if (direct) return direct;
+  }
+  const billingId = String(resource.billing_agreement_id || resource?.supplementary_data?.related_ids?.subscription_id || '');
+  if (billingId) {
+    const byBilling = getPaypalServiceSubscriptionByPaypalId(billingId);
+    if (byBilling) return byBilling;
+  }
+  const customId = String(resource.custom_id || '');
+  if (customId) {
+    const byRecord = getPaypalServiceSubscriptionRecord(customId);
     if (byRecord) return byRecord;
   }
   return null;
@@ -345,6 +403,19 @@ function ownedCustom(req, id) {
   if (!bot || !u) return null;
   return u.role === 'admin' || bot.ownerDiscordId === u.discordId ? bot : null;
 }
+function ownedManaged(req, id) {
+  const bot = getManagedBot(id); const u = currentUser(req);
+  if (!bot || !u) return null;
+  return u.role === 'admin' || bot.ownerDiscordId === u.discordId ? bot : null;
+}
+function managedAccessActive(bot) {
+  if (!bot) return false;
+  if (bot.adminGrant) return true;
+  const until = Date.parse(bot.accessUntil || '');
+  return Number.isFinite(until) && until > Date.now();
+}
+function managedServiceForUser(discordId, serviceId) { return getManagedBotForUserService(discordId, serviceId); }
+function latestServiceSubscription(discordId, serviceId) { return listPaypalServiceSubscriptionsForUser(discordId, serviceId)[0] || null; }
 
 async function discordApi(path, options = {}) {
   const response = await fetch(`https://discord.com/api/v10${path}`, options);
@@ -543,7 +614,7 @@ app.get('/games', (req, res) => {
 });
 
 app.get('/bot-services', (req, res) => {
-  const lang = langOf(req); const settings = getSiteSettings(); const services = listBotServices(true);
+  const lang = langOf(req); const settings = getSiteSettings(); const services = listBotServices(true); const user = currentUser(req);
   const cards = services.map((service) => {
     const name = lang === 'en' ? (service.nameEn || service.nameDe) : (service.nameDe || service.nameEn);
     const description = lang === 'en' ? (service.descriptionEn || service.descriptionDe) : (service.descriptionDe || service.descriptionEn);
@@ -552,12 +623,130 @@ app.get('/bot-services', (req, res) => {
     const statusClass = service.status === 'available' ? 'online' : service.status === 'paused' ? 'offline' : 'neutral';
     const purchaseUrl = /^https?:\/\//i.test(String(service.purchaseUrl || '')) ? service.purchaseUrl : '';
     const fallbackSupport = /^https?:\/\//i.test(String(service.supportUrl || '')) ? service.supportUrl : (/^https?:\/\//i.test(String(settings.supportUrl || '')) ? settings.supportUrl : '');
+    const instance = user ? managedServiceForUser(user.discordId, service.id) : null;
+    const subscription = user ? latestServiceSubscription(user.discordId, service.id) : null;
+    const subState = String(subscription?.status || '').toUpperCase();
+    const pending = subscription && ['CREATING','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(subState) && !subscription.cancelledAt;
     let action = `<span class="button ghost disabled">${esc(status)}</span>`;
-    if (service.status === 'available' && purchaseUrl) action = `<a class="button primary" href="${esc(purchaseUrl)}" target="_blank" rel="noopener">${tr(lang,'Bot kaufen','Buy bot')}</a>`;
+    if (service.id === 'wardogs-warning-bot' && service.status === 'available') {
+      if (!user) action = `<a class="button primary" href="/auth/discord?returnTo=${encodeURIComponent('/bot-services')}">${tr(lang,'Einloggen & Bot aktivieren','Login & activate bot')}</a>`;
+      else if (instance && (managedAccessActive(instance) || user.role === 'admin')) action = `<a class="button primary" href="/bot-services/${encodeURIComponent(service.id)}/manage">${tr(lang,'Bot verwalten','Manage bot')}</a>`;
+      else if (user.role === 'admin') action = `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/admin-activate" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button success" type="submit">${tr(lang,'Gratis für Admin aktivieren','Activate free for admin')}</button></form>`;
+      else if (pending) action = `<a class="button ghost" href="/bot-services/${encodeURIComponent(service.id)}/manage">${tr(lang,'Abo wird verarbeitet','Subscription pending')}</a>`;
+      else if (paypalConfigured(settings) && normalizedMoney(service.monthlyAmount)) action = `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/paypal/subscribe" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary" type="submit">PayPal · ${esc(normalizedMoney(service.monthlyAmount))} ${esc(service.currency || 'EUR')} / ${tr(lang,'Monat','month')}</button></form>`;
+      else if (fallbackSupport) action = `<a class="button primary" href="${esc(fallbackSupport)}" target="_blank" rel="noopener">${tr(lang,'Support kontaktieren','Contact support')}</a>`;
+    } else if (service.status === 'available' && purchaseUrl) action = `<a class="button primary" href="${esc(purchaseUrl)}" target="_blank" rel="noopener">${tr(lang,'Bot kaufen','Buy bot')}</a>`;
     else if (fallbackSupport) action = `<a class="button ${service.status === 'available' ? 'primary' : 'ghost'}" href="${esc(fallbackSupport)}" target="_blank" rel="noopener">${service.status === 'available' ? tr(lang,'Kaufen / Support','Buy / support') : tr(lang,'Mehr erfahren','Learn more')}</a>`;
-    return `<article class="service-card panel ${service.featured ? 'featured' : ''}"><div class="row between"><div><span class="eyebrow">${tr(lang,'Managed Bot Service','Managed bot service')}</span><h2>${esc(name)}</h2></div><span class="badge ${statusClass}">${esc(status)}</span></div>${service.priceLabel ? `<div class="service-price">${esc(service.priceLabel)}</div>` : ''}<p>${esc(description)}</p><ul class="service-features">${features.map((x)=>`<li>${esc(x)}</li>`).join('')}</ul><div class="actions wrap">${action}</div></article>`;
+    const accessBadge = instance && managedAccessActive(instance) ? `<span class="badge online">${instance.adminGrant ? tr(lang,'Admin-Freischaltung','Admin grant') : tr(lang,'Aktiv bezahlt','Paid access active')}</span>` : pending ? `<span class="badge starting">${esc(subState)}</span>` : '';
+    return `<article class="service-card panel ${service.featured ? 'featured' : ''}"><div class="row between"><div><span class="eyebrow">${tr(lang,'Managed Bot Service','Managed bot service')}</span><h2>${esc(name)}</h2></div><span class="badge ${statusClass}">${esc(status)}</span></div>${service.priceLabel ? `<div class="service-price">${esc(service.priceLabel)}</div>` : ''}${accessBadge}<p>${esc(description)}</p><ul class="service-features">${features.map((x)=>`<li>${esc(x)}</li>`).join('')}</ul><div class="actions wrap">${action}</div></article>`;
   }).join('');
-  render(req,res,tr(lang,'Bot Services','Bot Services'),`<div class="pagehead"><div><h1>${tr(lang,'Bots as a Service','Bots as a Service')}</h1><p>${tr(lang,'Einzelne, von status-hub.lol betriebene Spezial-Bots. Diese Produkte sind unabhängig von deinem Status-Bot-Limit.','Individual specialist bots operated by status-hub.lol. These products are separate from your status-bot quota.')}</p></div></div><section class="service-grid">${cards || `<div class="panel empty">${tr(lang,'Noch keine Bot Services veröffentlicht.','No bot services published yet.')}</div>`}</section><div class="panel help service-note"><strong>${tr(lang,'Wichtig','Important')}:</strong> ${tr(lang,'Status-Bot-Pläne und Custom-Bot-Freigaben bleiben davon getrennt. Kaufbare Bot Services sind eigene Managed-Produkte.','Status-bot plans and custom-bot permissions remain separate. Purchasable bot services are independent managed products.')}</div>`);
+  render(req,res,tr(lang,'Bot Services','Bot Services'),`<div class="pagehead"><div><h1>${tr(lang,'Bots as a Service','Bots as a Service')}</h1><p>${tr(lang,'Einzelne, von status-hub.lol betriebene Spezial-Bots. Diese Produkte sind unabhängig von deinem Status-Bot-Limit.','Individual specialist bots operated by status-hub.lol. These products are separate from your status-bot quota.')}</p></div></div><section class="service-grid">${cards || `<div class="panel empty">${tr(lang,'Noch keine Bot Services veröffentlicht.','No bot services published yet.')}</div>`}</section><div class="panel help service-note"><strong>${tr(lang,'Wichtig','Important')}:</strong> ${tr(lang,'Jeder Managed Bot Service hat sein eigenes Abo. Premium-Status-Bots und Custom-Bot-Freigaben bleiben davon getrennt.','Each managed bot service has its own subscription. Premium status bots and custom-bot permissions remain separate.')}</div>`);
+});
+
+
+function managedBotForm(req, service, bot) {
+  const lang=langOf(req),u=currentUser(req),rt=managedBotRuntime(bot.id),auto=bot.autoBanEnabled===true;
+  return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid">
+    <input type="hidden" name="_csrf" value="${esc(csrf(req))}">
+    <label>${tr(lang,'Bot-Name','Bot name')}<input name="name" maxlength="80" required value="${esc(bot.name||service.nameDe||service.nameEn||'WARDOGS Bot')}"></label>
+    <label>Discord Bot Token<input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
+    <label>Discord Alert Channel ID<input name="alertChannelId" inputmode="numeric" required value="${esc(bot.alertChannelId||'')}" placeholder="123456789012345678"></label>
+    <label>${tr(lang,'Rollen-Ping ID (optional)','Role mention ID (optional)')}<input name="mentionRoleId" inputmode="numeric" value="${esc(bot.mentionRoleId||'')}" placeholder="123456789012345678"></label>
+    <label class="span2">WARDOGS API / RCON URL<input name="wardogsBaseUrl" required value="${esc(bot.wardogsBaseUrl||'')}" placeholder="https://server.example.com:7776"></label>
+    <label class="span2">WARDOGS RCON / Bearer Password<input name="wardogsSecret" type="password" autocomplete="new-password" placeholder="${bot.wardogsSecretEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
+    <label>${tr(lang,'Prüfintervall','Poll interval')}<input name="pollSeconds" type="number" min="10" max="300" value="${esc(bot.pollSeconds||20)}"><span class="muted small">10–300 s</span></label>
+    <label class="check"><input type="checkbox" name="enabled" value="1" ${bot.enabled?'checked':''}> ${tr(lang,'Bot aktiv / gehostet','Bot enabled / hosted')}</label>
+    <label class="check span2 auto-ban-toggle"><input type="checkbox" name="autoBanEnabled" value="1" ${auto?'checked':''}> <strong>${tr(lang,'Auto-Ban AKTIVIEREN','ENABLE auto-ban')}</strong> · ${tr(lang,'Standard ist AUS. Nur bei Regel-Treffern wird automatisch gebannt.','Default is OFF. Automatic bans happen only on matching rules.')}</label>
+    ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
+    <label class="span2">${tr(lang,'Erkennungsregeln','Detection rules')}<textarea name="rulesText" rows="9" placeholder="steam:76561198000000001 | bekannte Sperre&#10;name:badword | unerlaubter Name&#10;ping&gt;250 | Ping über 250 ms&#10;faction:Valkyra | gesperrte Fraktion">${esc(bot.rulesText||'')}</textarea><span class="muted small">${tr(lang,'Eine Regel pro Zeile. Syntax: steam:SteamID64, name:Text, faction:Text oder ping>150. Hinter | kann ein eigener Warn-/Banngrund stehen.','One rule per line. Syntax: steam:SteamID64, name:Text, faction:Text or ping>150. Add a custom warning/ban reason after |.')}</span></label>
+    <div class="span2 help"><strong>${tr(lang,'Discord Warnung','Discord warning')}:</strong> ${tr(lang,'Bei einem Regel-Treffer postet der Bot Spieler, Grund, SteamID, Fraktion und Ping. Darunter erscheinen Ban, Kick und Steam Profile. Ban/Kick dürfen nur Discord-Mitglieder mit den entsprechenden Moderationsrechten ausführen.','When a rule matches, the bot posts player, reason, SteamID, faction and ping. Buttons for Ban, Kick and Steam Profile appear below. Ban/Kick require the matching Discord moderation permission.')}</div>
+    <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:''}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
+    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}
+  </form>`;
+}
+
+app.post('/bot-services/:id/admin-activate', requireAdmin, checkCsrf, (req,res)=>{
+  const service=getBotService(req.params.id),user=currentUser(req); if(!service||service.id!=='wardogs-warning-bot')return res.status(404).send('Service not found');
+  let bot=managedServiceForUser(user.discordId,service.id);
+  if(!bot)bot=upsertManagedBot({ownerDiscordId:user.discordId,serviceId:service.id,name:service.nameDe||service.nameEn||'WARDOGS Bot',enabled:false,autoBanEnabled:false,pollSeconds:20,rulesText:'',adminGrant:true,accessSource:'admin',accessUntil:null});
+  else bot=upsertManagedBot({id:bot.id,adminGrant:true,accessSource:'admin',accessUntil:null});
+  flash(req,'ok',l(req,'Managed Bot wurde für deinen Admin-Account kostenlos freigeschaltet. Auto-Ban bleibt standardmäßig AUS.','Managed bot was enabled free for your admin account. Auto-ban remains OFF by default.'));
+  res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);
+});
+
+app.get('/bot-services/:id/manage', requireLogin, (req,res)=>{
+  const service=getBotService(req.params.id),user=currentUser(req); if(!service||service.id!=='wardogs-warning-bot')return res.status(404).send('Service not found');
+  const bot=managedServiceForUser(user.discordId,service.id),sub=latestServiceSubscription(user.discordId,service.id),state=String(sub?.status||'').toUpperCase();
+  const access=bot&&managedAccessActive(bot);
+  if(!bot||(!access&&user.role!=='admin')){
+    const pending=sub&&['CREATING','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(state)&&!sub.cancelledAt;
+    const action=user.role==='admin'?`<form method="post" action="/bot-services/${esc(service.id)}/admin-activate"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button success">${l(req,'Gratis aktivieren','Activate free')}</button></form>`:pending?`<div class="actions wrap"><span class="badge starting">${esc(state)}</span>${sub.subscriptionId?`<form method="post" action="/bot-services/${esc(service.id)}/subscription/cancel" class="inline" onsubmit="return confirm('${l(req,'Offenen Aboabschluss wirklich abbrechen?','Cancel the pending subscription checkout?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(sub.id)}"><button class="button danger">${l(req,'Aboabschluss abbrechen','Cancel checkout')}</button></form>`:''}</div>`:`<form method="post" action="/bot-services/${esc(service.id)}/paypal/subscribe"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">PayPal · ${esc(normalizedMoney(service.monthlyAmount)||'3.99')} ${esc(service.currency||'EUR')} / ${l(req,'Monat','month')}</button></form>`;
+    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(service.nameDe||service.nameEn)}</h1><p>${l(req,'Eigenständiger Managed Bot Service.','Independent managed bot service.')}</p></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div><div class="panel"><h2>${pending?l(req,'PayPal-Abo wird verarbeitet','PayPal subscription is pending'):l(req,'Service noch nicht aktiv','Service not active yet')}</h2><p>${pending?l(req,'Der Bot wird erst nach bestätigter erster PayPal-Zahlung freigeschaltet.','The bot is unlocked only after the first confirmed PayPal payment.'):l(req,'Dieser Service benötigt ein eigenes Abo und zählt nicht zu deinen Premium-Statusbots.','This service requires its own subscription and does not count toward your Premium status bots.')}</p><div class="actions">${action}</div></div>`);
+  }
+  const subHtml=sub?`<article class="panel"><span class="eyebrow">PayPal Service Abo</span><h2>${esc(service.nameDe||service.nameEn)}</h2><p>Status: <strong>${esc(state||'—')}</strong></p>${bot.accessUntil?`<p>${l(req,'Zugang bis','Access until')}: ${esc(new Date(bot.accessUntil).toLocaleString(localeCode(langOf(req))))}</p>`:''}${sub.subscriptionId&&!sub.cancelledAt&&['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(state)?`<form method="post" action="/bot-services/${esc(service.id)}/subscription/cancel" onsubmit="return confirm('${l(req,'Dieses Bot-Service-Abo wirklich kündigen?','Cancel this bot-service subscription?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(sub.id)}"><button class="button danger">${l(req,'Service-Abo kündigen','Cancel service subscription')}</button></form>`:''}</article>`:`<article class="panel"><span class="eyebrow">Access</span><h2>${bot.adminGrant?l(req,'Admin-Freischaltung','Admin grant'):l(req,'Managed Bot','Managed bot')}</h2><p>${bot.adminGrant?l(req,'Für Admins kostenlos aktiviert.','Activated free for admins.'):l(req,'Servicezugang aktiv.','Service access active.')}</p></article>`;
+  render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(service.nameDe||service.nameEn)}</h1><p>${l(req,'Hosting, Regeln und Discord-Aktionen zentral im Panel verwalten.','Manage hosting, rules and Discord actions centrally in the panel.')}</p></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div><section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Auto-Ban</span><h2>${bot.autoBanEnabled?l(req,'AKTIV','ENABLED'):l(req,'AUS','OFF')}</h2><p>${l(req,'Auto-Ban ist standardmäßig AUS und muss ausdrücklich aktiviert werden.','Auto-ban is OFF by default and must be explicitly enabled.')}</p></article></section>${managedBotForm(req,service,bot)}`);
+});
+
+app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
+  const service=getBotService(req.params.id),user=currentUser(req); if(!service||service.id!=='wardogs-warning-bot')return res.status(404).send('Service not found');
+  let bot=managedServiceForUser(user.discordId,service.id); if(!bot||(!managedAccessActive(bot)&&user.role!=='admin'))return res.status(403).send('Service access required');
+  try{
+    const name=String(req.body.name||'').trim().slice(0,80); if(!name)throw new Error(l(req,'Bot-Name fehlt.','Bot name is required.'));
+    const alertChannelId=String(req.body.alertChannelId||'').trim(); if(!validSnowflake(alertChannelId))throw new Error(l(req,'Discord Alert Channel ID ist ungültig.','Discord alert channel ID is invalid.'));
+    const mentionRoleId=String(req.body.mentionRoleId||'').trim(); if(mentionRoleId&&!validSnowflake(mentionRoleId))throw new Error(l(req,'Discord Rollen-ID ist ungültig.','Discord role ID is invalid.'));
+    const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
+    const rulesText=String(req.body.rulesText||'').trim().slice(0,30000); parseManagedRules(rulesText);
+    const patch={id:bot.id,name,alertChannelId,mentionRoleId,wardogsBaseUrl,pollSeconds:Math.max(10,Math.min(300,Number(req.body.pollSeconds)||20)),rulesText,autoBanEnabled:req.body.autoBanEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+    const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(!bot.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
+    const secret=String(req.body.wardogsSecret||'').trim(); if(secret)patch.wardogsSecretEnc=encryptSecret(secret); else if(!bot.wardogsSecretEnc)throw new Error(l(req,'WARDOGS RCON/API Passwort fehlt.','WARDOGS RCON/API password is required.'));
+    bot=upsertManagedBot(patch); await syncManagedBots(readDb().managedBots||[]);
+    flash(req,'ok',patch.autoBanEnabled?l(req,'Gespeichert. Auto-Ban ist AKTIV und greift nur bei deinen Regeln.','Saved. Auto-ban is ENABLED and only triggers on your rules.'):l(req,'Gespeichert. Auto-Ban ist AUS.','Saved. Auto-ban is OFF.'));
+  }catch(error){flash(req,'err',error.message);}res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);
+});
+
+app.post('/bot-services/:id/test', requireLogin, checkCsrf, async(req,res)=>{
+  const service=getBotService(req.params.id),user=currentUser(req); if(!service||service.id!=='wardogs-warning-bot')return res.status(404).send('Service not found');
+  const old=managedServiceForUser(user.discordId,service.id); if(!old||(!managedAccessActive(old)&&user.role!=='admin'))return res.status(403).send('Service access required');
+  try{
+    const test={...old,wardogsBaseUrl:String(req.body.wardogsBaseUrl||old.wardogsBaseUrl||'').trim().replace(/\/+$/,''),allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(old.allowPrivateTarget)};
+    const secret=String(req.body.wardogsSecret||'').trim(); if(secret)test.wardogsSecretEnc=encryptSecret(secret);
+    const token=String(req.body.botToken||'').trim(); if(token)await validateBotToken(token); else if(!old.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
+    const result=await testManagedWardogs(test); flash(req,'ok',l(req,`WARDOGS Verbindung OK · ${result.playerCount} Spieler über /v1/players.`,`WARDOGS connection OK · ${result.playerCount} players via /v1/players.`));
+  }catch(error){flash(req,'err',`${l(req,'Test fehlgeschlagen','Test failed')}: ${error.message}`);}res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);
+});
+
+app.post('/managed-bots/:id/restart', requireLogin, checkCsrf, async(req,res)=>{const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');try{const fresh=upsertManagedBot({id:bot.id,enabled:true,restartNonce:Date.now()});await restartManagedBot(fresh);flash(req,'ok',l(req,'Managed Bot neu gestartet.','Managed bot restarted.'));}catch(error){upsertManagedBot({id:bot.id,enabled:false});flash(req,'err',error.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':`/bot-services/${encodeURIComponent(bot.serviceId)}/manage`);});
+app.post('/managed-bots/:id/stop', requireLogin, checkCsrf, async(req,res)=>{const bot=ownedManaged(req,req.params.id);if(!bot)return res.status(404).send('Not found');const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');await stopManagedBot(bot.id);upsertManagedBot({id:bot.id,enabled:false});flash(req,'ok',l(req,'Managed Bot gestoppt.','Managed bot stopped.'));res.redirect(fromAdmin?'/admin?tab=bots#bots':`/bot-services/${encodeURIComponent(bot.serviceId)}/manage`);});
+
+app.post('/bot-services/:id/paypal/subscribe', requireLogin, rateLimit({windowMs:60_000,limit:10}), checkCsrf, async(req,res)=>{
+  const user=currentUser(req),service=getBotService(req.params.id); if(!service||service.id!=='wardogs-warning-bot'||service.status!=='available')return res.status(404).send('Service not found');
+  if(user.role==='admin')return res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);
+  const amount=normalizedMoney(service.monthlyAmount),currency=/^[A-Z]{3}$/.test(String(service.currency||'').toUpperCase())?String(service.currency).toUpperCase():'EUR';
+  if(!amount||!paypalConfigured()) {flash(req,'err',l(req,'PayPal ist für diesen Bot Service noch nicht eingerichtet.','PayPal is not configured for this bot service yet.'));return res.redirect('/bot-services');}
+  const existing=listPaypalServiceSubscriptionsForUser(user.discordId,service.id).find((x)=>['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT','CREATING'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
+  if(existing){flash(req,'err',l(req,'Für diesen Bot Service existiert bereits ein aktives oder offenes Abo.','This bot service already has an active or pending subscription.'));return res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);}
+  try{
+    let settings=getSiteSettings();
+    const auto=paypalAutoConfig(settings);
+    if(!auto.webhookId){
+      const webhook=await ensureWebhook('',`${baseUrl}/webhooks/paypal`,settings);
+      settings=updateSiteSettings({premiumSales:{paypalAuto:{...auto,webhookId:webhook.id}}});
+    }
+    const catalog=await ensureManagedServiceSubscriptionPlan({productId:service.paypalProductId,planId:service.paypalPlanId,planMeta:service.paypalPlanMeta,name:`status-hub.lol ${service.nameEn||service.nameDe}`,description:service.descriptionEn||service.descriptionDe,amount,currency,homeUrl:`${baseUrl}/bot-services`,settings});
+    const updatedService=upsertBotService({id:service.id,paypalProductId:catalog.productId,paypalPlanId:catalog.planId,paypalPlanMeta:catalog.planMeta,monthlyAmount:amount,currency});
+    const record=createPaypalServiceSubscriptionRecord({id:crypto.randomUUID(),provider:'paypal_service_subscription',userDiscordId:user.discordId,serviceId:service.id,amount,currency,paypalPlanId:updatedService.paypalPlanId,status:'creating'});
+    const result=await createSubscription({recordId:record.id,paypalPlanId:updatedService.paypalPlanId,returnUrl:`${baseUrl}/bot-services/${encodeURIComponent(service.id)}/paypal/return?record=${encodeURIComponent(record.id)}`,cancelUrl:`${baseUrl}/bot-services/${encodeURIComponent(service.id)}/paypal/cancel?record=${encodeURIComponent(record.id)}`,settings});
+    updatePaypalServiceSubscriptionRecord(record.id,{subscriptionId:result.subscriptionId,status:result.status||'APPROVAL_PENDING'});return res.redirect(result.approvalUrl);
+  }catch(error){flash(req,'err',`PayPal: ${error.message}`);return res.redirect('/bot-services');}
+});
+
+app.get('/bot-services/:id/paypal/return', requireLogin, rateLimit({windowMs:60_000,limit:20}), async(req,res)=>{
+  const user=currentUser(req),service=getBotService(req.params.id);try{if(!service)throw new Error('Service not found');const record=getPaypalServiceSubscriptionRecord(String(req.query.record||''));if(!record||record.userDiscordId!==user.discordId||record.serviceId!==service.id)throw new Error('PayPal bot-service subscription not found');const subscriptionId=String(req.query.subscription_id||record.subscriptionId||'');if(!subscriptionId)throw new Error('PayPal subscription ID missing');const details=await getSubscription(subscriptionId);if(record.cancelledAt){await stopCancelledPaypalServiceSubscription({...record,subscriptionId},details);flash(req,'err',l(req,'Dieser Aboabschluss wurde bereits abgebrochen.','This subscription checkout was already cancelled.'));return res.redirect('/bot-services');}updatePaypalServiceSubscriptionRecord(record.id,{subscriptionId,status:String(details.status||record.status||'').toUpperCase(),nextBillingAt:details?.billing_info?.next_billing_time||null,lastSyncAt:new Date().toISOString()});if(String(details.status||'').toUpperCase()==='ACTIVE'&&details?.billing_info?.last_payment?.time){applyPaypalServiceSubscription({...record,subscriptionId},details,'approved');flash(req,'ok',l(req,'Bot-Service-Abo aktiv. Du kannst den Bot jetzt im Panel konfigurieren.','Bot-service subscription active. You can now configure the bot in the panel.'));}else flash(req,'ok',l(req,'PayPal verarbeitet die erste Zahlung noch. Der Bot wird erst nach bestätigter Zahlung freigeschaltet.','PayPal is still processing the first payment. The bot is unlocked after payment confirmation.'));}catch(error){flash(req,'err',`PayPal: ${error.message}`);}res.redirect(service?`/bot-services/${encodeURIComponent(service.id)}/manage`:'/bot-services');
+});
+app.get('/bot-services/:id/paypal/cancel', requireLogin, (req,res)=>{const user=currentUser(req),service=getBotService(req.params.id),record=getPaypalServiceSubscriptionRecord(String(req.query.record||''));if(record&&record.userDiscordId===user.discordId&&record.serviceId===req.params.id&&!record.activatedAt)updatePaypalServiceSubscriptionRecord(record.id,{status:'CANCELLED_BEFORE_APPROVAL',cancelledAt:new Date().toISOString()});flash(req,'err',l(req,'PayPal-Aboabschluss abgebrochen.','PayPal subscription checkout cancelled.'));res.redirect(service?`/bot-services/${encodeURIComponent(service.id)}/manage`:'/bot-services');});
+
+app.post('/bot-services/:id/subscription/cancel', requireLogin, checkCsrf, rateLimit({windowMs:60_000,limit:5}), async(req,res)=>{
+  const user=currentUser(req),service=getBotService(req.params.id);try{if(!service)throw new Error('Service not found');const record=getPaypalServiceSubscriptionRecord(String(req.body.recordId||''));if(!record||record.userDiscordId!==user.discordId||record.serviceId!==service.id||!record.subscriptionId)throw new Error(l(req,'Service-Abo nicht gefunden.','Service subscription not found.'));if(record.cancelledAt){flash(req,'ok',l(req,'Dieses Service-Abo wurde bereits beendet.','This service subscription has already been ended.'));return res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);}let details=null,lookupError=null;try{details=await getSubscription(record.subscriptionId);}catch(error){lookupError=error;}const localState=String(record.status||'').toUpperCase(),remoteState=String(details?.status||'').toUpperCase(),effectiveState=remoteState||localState,now=new Date().toISOString();if(['CANCELLED','EXPIRED'].includes(effectiveState)){updatePaypalServiceSubscriptionRecord(record.id,{status:effectiveState,cancelledAt:record.cancelledAt||now,nextBillingAt:null,remoteStatus:remoteState||null,lastSyncAt:now});flash(req,'ok',l(req,'Dieses Service-Abo ist bereits beendet.','This service subscription is already ended.'));return res.redirect(`/bot-services/${encodeURIComponent(service.id)}/manage`);}if(effectiveState==='APPROVAL_PENDING'){try{await cancelSubscription(record.subscriptionId,'Cancelled before approval by customer');updatePaypalServiceSubscriptionRecord(record.id,{status:'CANCELLED',cancelledAt:now,nextBillingAt:null,remoteStatus:remoteState||'APPROVAL_PENDING',remoteCancelError:null,lastSyncAt:now});}catch(error){if(!details||remoteState!=='APPROVAL_PENDING')throw lookupError||error;updatePaypalServiceSubscriptionRecord(record.id,{status:'CANCELLED_BEFORE_APPROVAL',cancelledAt:now,nextBillingAt:null,remoteStatus:remoteState,remoteCancelError:String(error.message||error).slice(0,500),lastSyncAt:now});}flash(req,'ok',l(req,'Offener Bot-Service-Aboabschluss abgebrochen.','Pending bot-service subscription checkout cancelled.'));return res.redirect('/bot-services');}await cancelSubscription(record.subscriptionId,'Cancelled bot service by customer');updatePaypalServiceSubscriptionRecord(record.id,{status:'CANCELLED',cancelledAt:now,entitlementExpiresAt:record.entitlementExpiresAt||null,nextBillingAt:null,remoteStatus:remoteState||effectiveState,remoteCancelError:null,lastSyncAt:now});flash(req,'ok',record.entitlementExpiresAt?l(req,'Service-Abo gekündigt. Der Bot bleibt bis zum Ende des bereits bezahlten Zeitraums verfügbar.','Service subscription cancelled. The bot remains available until the end of the paid period.'):l(req,'Service-Abo gekündigt.','Service subscription cancelled.'));}catch(error){flash(req,'err',`PayPal: ${error.message}`);}res.redirect(service?`/bot-services/${encodeURIComponent(service.id)}/manage`:'/bot-services');
 });
 
 app.post('/stripe/checkout/:planId', requireLogin, rateLimit({ windowMs: 60_000, limit: 10 }), checkCsrf, async (req, res) => {
@@ -830,6 +1019,7 @@ app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async 
     if (!await verifyWebhook(req.headers, event, auto.webhookId, settings)) return res.status(400).send('Invalid PayPal signature');
     const purchase = purchaseFromPaypalEvent(event);
     const subscription = subscriptionFromPaypalEvent(event);
+    const serviceSubscription = serviceSubscriptionFromPaypalEvent(event);
     const type = String(event.event_type || '');
     if (type === 'PAYMENT.CAPTURE.COMPLETED') {
       if (purchase) {
@@ -847,14 +1037,27 @@ app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async 
     } else if (type === 'PAYMENT.CAPTURE.REVERSED') {
       if (purchase) revokePaypalPurchase(purchase, 'reversed');
     } else if (type === 'BILLING.SUBSCRIPTION.ACTIVATED' || type === 'BILLING.SUBSCRIPTION.UPDATED') {
-      const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || '')) || getPaypalSubscriptionRecord(String(event.resource?.custom_id || ''));
-      if (record) {
+      const serviceRecord = serviceSubscription || getPaypalServiceSubscriptionByPaypalId(String(event.resource?.id || '')) || getPaypalServiceSubscriptionRecord(String(event.resource?.custom_id || ''));
+      if (serviceRecord) {
+        const details = event.resource?.billing_info ? event.resource : await getSubscription(serviceRecord.subscriptionId || event.resource?.id, settings);
+        if (!await stopCancelledPaypalServiceSubscription(serviceRecord, details, settings)) applyPaypalServiceSubscription(serviceRecord, details, 'webhook');
+      } else {
+        const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || '')) || getPaypalSubscriptionRecord(String(event.resource?.custom_id || ''));
+        if (!record) { rememberPaypalWebhookEvent(event.id, event.event_type); return res.status(200).send('OK'); }
         const details = event.resource?.billing_info ? event.resource : await getSubscription(record.subscriptionId || event.resource?.id, settings);
         if (!await stopCancelledPaypalSubscription(record, details, settings)) applyPaypalSubscription(record, details, 'webhook');
       }
     } else if (type === 'PAYMENT.SALE.COMPLETED') {
-      const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.billing_agreement_id || ''));
-      if (record) {
+      const serviceRecord = serviceSubscription || getPaypalServiceSubscriptionByPaypalId(String(event.resource?.billing_agreement_id || ''));
+      if (serviceRecord) {
+        const details = await getSubscription(serviceRecord.subscriptionId, settings);
+        if (!await stopCancelledPaypalServiceSubscription(serviceRecord, details, settings)) {
+          applyPaypalServiceSubscription(serviceRecord, details, 'recurring_payment');
+          updatePaypalServiceSubscriptionRecord(serviceRecord.id, { lastPaymentId: String(event.resource?.id || ''), lastPaymentAt: event.resource?.create_time || new Date().toISOString(), lastPaymentAmount: event.resource?.amount?.total || event.resource?.amount?.value || '' });
+        }
+      } else {
+        const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.billing_agreement_id || ''));
+        if (!record) { rememberPaypalWebhookEvent(event.id, event.event_type); return res.status(200).send('OK'); }
         const details = await getSubscription(record.subscriptionId, settings);
         if (!await stopCancelledPaypalSubscription(record, details, settings)) {
           applyPaypalSubscription(record, details, 'recurring_payment');
@@ -862,8 +1065,14 @@ app.post('/webhooks/paypal', rateLimit({ windowMs: 60_000, limit: 120 }), async 
         }
       }
     } else if (['BILLING.SUBSCRIPTION.CANCELLED','BILLING.SUBSCRIPTION.EXPIRED','BILLING.SUBSCRIPTION.SUSPENDED','BILLING.SUBSCRIPTION.PAYMENT.FAILED'].includes(type)) {
-      const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || event.resource?.billing_agreement_id || ''));
-      if (record) updatePaypalSubscriptionRecord(record.id, { status: type.split('.').pop(), statusEvent: type, cancelledAt: type === 'BILLING.SUBSCRIPTION.CANCELLED' ? (record.cancelledAt || new Date().toISOString()) : record.cancelledAt, lastSyncAt: new Date().toISOString() });
+      const serviceRecord = serviceSubscription || getPaypalServiceSubscriptionByPaypalId(String(event.resource?.id || event.resource?.billing_agreement_id || ''));
+      if (serviceRecord) {
+        updatePaypalServiceSubscriptionRecord(serviceRecord.id, { status: type.split('.').pop(), statusEvent: type, cancelledAt: type === 'BILLING.SUBSCRIPTION.CANCELLED' ? (serviceRecord.cancelledAt || new Date().toISOString()) : serviceRecord.cancelledAt, lastSyncAt: new Date().toISOString() });
+        syncManagedBots(readDb().managedBots || []).catch(()=>{});
+      } else {
+        const record = subscription || getPaypalSubscriptionByPaypalId(String(event.resource?.id || event.resource?.billing_agreement_id || ''));
+        if (record) updatePaypalSubscriptionRecord(record.id, { status: type.split('.').pop(), statusEvent: type, cancelledAt: type === 'BILLING.SUBSCRIPTION.CANCELLED' ? (record.cancelledAt || new Date().toISOString()) : record.cancelledAt, lastSyncAt: new Date().toISOString() });
+      }
     }
     rememberPaypalWebhookEvent(event.id, event.event_type);
     res.status(200).send('OK');
@@ -1099,11 +1308,11 @@ app.post('/custom-bots/new', requireLogin, rateLimit({ windowMs: 60_000, limit: 
 
 app.post('/custom-bots/:id/approve', requireAdmin, checkCsrf, async (req,res)=>{let b=null;try{b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');const bot=upsertCustomBot({id:b.id,approvalState:'approved',enabled:true,reviewNote:l(req,'Von Admin freigegeben','Approved by admin')});await ensureCustomBot(bot);flash(req,'ok',l(req,'Custom Bot freigegeben und gestartet.','Custom bot approved and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,approvalState:'approved',enabled:false,reviewNote:l(req,`Freigegeben, Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Approved, start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect('/admin?tab=bots#bots');});
 app.post('/custom-bots/:id/revoke', requireAdmin, checkCsrf, async (req,res)=>{const b=getCustomBot(req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,approvalState:'rejected',enabled:false,reviewNote:l(req,'Freigabe entzogen','Approval revoked')});flash(req,'ok',l(req,'Freigabe entzogen.','Approval revoked.'));res.redirect('/admin?tab=bots#bots');});
-app.post('/custom-bots/:id/start', requireLogin, checkCsrf, async (req,res)=>{let b=null;try{b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});await restartCustomBot(bot);upsertCustomBot({id:b.id,reviewNote:''});flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,enabled:false,reviewNote:l(req,`Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect('/custom-bots');});
-app.post('/custom-bots/:id/stop', requireLogin, checkCsrf, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,enabled:false});flash(req,'ok',l(req,'Custom Bot gestoppt.','Custom bot stopped.'));res.redirect('/custom-bots');});
+app.post('/custom-bots/:id/start', requireLogin, checkCsrf, async (req,res)=>{let b=null;const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');try{b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');if(b.approvalState!=='approved')throw new Error(l(req,'Bot ist nicht freigegeben','Bot is not approved'));const bot=upsertCustomBot({id:b.id,enabled:true});await restartCustomBot(bot);upsertCustomBot({id:b.id,reviewNote:''});flash(req,'ok',l(req,'Custom Bot neu gebaut und gestartet.','Custom bot rebuilt and started.'));}catch(e){if(b)upsertCustomBot({id:b.id,enabled:false,reviewNote:l(req,`Start fehlgeschlagen: ${String(e.message||e).slice(0,300)}`,`Start failed: ${String(e.message||e).slice(0,300)}`)});flash(req,'err',e.message);}res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
+app.post('/custom-bots/:id/stop', requireLogin, checkCsrf, async (req,res)=>{const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await stopCustomBot(b).catch(()=>{});upsertCustomBot({id:b.id,enabled:false});flash(req,'ok',l(req,'Custom Bot gestoppt.','Custom bot stopped.'));res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
 app.get('/custom-bots/:id/source', requireLogin, (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');const file=`custom-bots/${b.id}/source.zip`;res.download(file,`${String(b.name||'custom-bot').replace(/[^A-Za-z0-9._-]+/g,'_')}.zip`);});
 app.get('/custom-bots/:id/logs', requireLogin, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');let logs='';try{logs=(await customBotLogs(b)).logs||'';}catch(e){logs=`Logs unavailable: ${e.message}`;}render(req,res,'Custom Bot Logs',`<div class="pagehead"><div><h1>${esc(b.name)} · Logs</h1></div><a class="button ghost" href="/custom-bots">${l(req,'Zurück','Back')}</a></div><pre class="panel logbox">${esc(logs)}</pre>`);});
-app.post('/custom-bots/:id/delete', requireLogin, checkCsrf, async (req,res)=>{const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await deleteCustomBotRuntime(b).catch(()=>{});deleteCustomBotFiles(b.id);deleteCustomBot(b.id);flash(req,'ok',l(req,'Custom Bot gelöscht.','Custom bot deleted.'));res.redirect('/custom-bots');});
+app.post('/custom-bots/:id/delete', requireLogin, checkCsrf, async (req,res)=>{const fromAdmin=isAdmin(req)&&String(req.get('referer')||'').includes('/admin');const b=ownedCustom(req,req.params.id);if(!b)return res.status(404).send('Not found');await deleteCustomBotRuntime(b).catch(()=>{});deleteCustomBotFiles(b.id);deleteCustomBot(b.id);flash(req,'ok',l(req,'Custom Bot gelöscht.','Custom bot deleted.'));res.redirect(fromAdmin?'/admin?tab=bots#bots':'/custom-bots');});
 
 function adminShell(req, active, content) {
   const lang=langOf(req);
@@ -1128,8 +1337,16 @@ function adminBotsContent(req) {
     const game=server.gameType==='gamedig'?(gameDigMeta(server.queryConfig?.gameId)?.name||server.queryConfig?.gameId||'GameDig'):gameTypeLabel(server.gameType);
     return `<tr><td><strong>${esc(server.name)}</strong><div class="muted small">${esc(server.id)}</div></td><td>${esc(owner?.globalName||owner?.username||server.ownerDiscordId||'—')}<div class="muted small">${esc(server.ownerDiscordId||'')}</div></td><td>${esc(game)}</td><td><span class="badge ${state==='online'?'online':state==='error'?'error':'neutral'}">${esc(state)}</span></td><td>${esc(runtime.nodeName||server.assignedNodeId||'—')}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/servers/${esc(server.id)}/edit">${tr(lang,'Bearbeiten','Edit')}</a>${server.enabled?`<form method="post" action="/servers/${esc(server.id)}/stop" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">${tr(lang,'Offline','Offline')}</button></form>`:''}<form method="post" action="/servers/${esc(server.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">${server.enabled?tr(lang,'Neustart','Restart'):tr(lang,'Starten','Start')}</button></form></div></td></tr>`;
   }).join('');
-  const customRows=db.customBots.map((bot)=>{const owner=db.users.find((u)=>u.discordId===bot.ownerDiscordId);const approval=bot.approvalState||'pending';return `<tr><td><strong>${esc(bot.name)}</strong><div class="muted small">${esc(bot.id)}</div></td><td>${esc(owner?.globalName||owner?.username||bot.ownerDiscordId||'—')}</td><td>${esc(bot.runtime||'—')}</td><td>${esc(approval)}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/custom-bots/${esc(bot.id)}/logs">Logs</a><a class="button ghost smallbtn" href="/custom-bots/${esc(bot.id)}/source">Source</a>${approval!=='approved'?`<form method="post" action="/custom-bots/${esc(bot.id)}/approve" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary smallbtn">${tr(lang,'Freigeben','Approve')}</button></form>`:`<form method="post" action="/custom-bots/${esc(bot.id)}/revoke" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Entziehen','Revoke')}</button></form>`}</div></td></tr>`;}).join('');
-  return `<div class="pagehead"><div><h1>${tr(lang,'Alle Bots','All bots')}</h1><p>${tr(lang,'Bots anderer Benutzer werden nur hier im Adminbereich angezeigt.','Bots owned by other users are shown only here in the admin area.')}</p></div></div><div class="admin-subhead"><h2>Status Bots</h2></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Owner</th><th>Game</th><th>Status</th><th>Node</th><th>${tr(lang,'Aktionen','Actions')}</th></tr></thead><tbody>${statusRows||`<tr><td colspan="6">${tr(lang,'Keine Status Bots','No status bots')}</td></tr>`}</tbody></table></div><div class="admin-subhead subsection"><h2>Custom Bots</h2></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Owner</th><th>Runtime</th><th>${tr(lang,'Freigabe','Approval')}</th><th>${tr(lang,'Aktionen','Actions')}</th></tr></thead><tbody>${customRows||`<tr><td colspan="5">${tr(lang,'Keine Custom Bots','No custom bots')}</td></tr>`}</tbody></table></div>`;
+  const customRows=db.customBots.map((bot)=>{
+    const owner=db.users.find((u)=>u.discordId===bot.ownerDiscordId),approval=bot.approvalState||'pending';
+    const runButtons=approval==='approved'?`${bot.enabled?`<form method="post" action="/custom-bots/${esc(bot.id)}/stop" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Stop</button></form>`:''}<form method="post" action="/custom-bots/${esc(bot.id)}/start" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ${bot.enabled?'ghost':'success'} smallbtn">${bot.enabled?tr(lang,'Neu bauen / Neustart','Rebuild / restart'):tr(lang,'Starten','Start')}</button></form>`:'';
+    return `<tr><td><strong>${esc(bot.name)}</strong><div class="muted small">${esc(bot.id)}</div></td><td>${esc(owner?.globalName||owner?.username||bot.ownerDiscordId||'—')}</td><td>${esc(bot.runtime||'—')}</td><td><span class="badge ${approval==='approved'?'online':approval==='rejected'?'error':'neutral'}">${esc(approval)}</span><div class="muted small">${bot.enabled?tr(lang,'enabled','enabled'):tr(lang,'stopped','stopped')}</div></td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/custom-bots/${esc(bot.id)}/logs">Logs</a><a class="button ghost smallbtn" href="/custom-bots/${esc(bot.id)}/source">Source</a>${runButtons}${approval!=='approved'?`<form method="post" action="/custom-bots/${esc(bot.id)}/approve" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary smallbtn">${tr(lang,'Freigeben','Approve')}</button></form>`:`<form method="post" action="/custom-bots/${esc(bot.id)}/revoke" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Freigabe entziehen','Revoke approval')}</button></form>`}<form method="post" action="/custom-bots/${esc(bot.id)}/delete" class="inline" onsubmit="return confirm('${tr(lang,'Custom Bot wirklich löschen?','Delete this custom bot?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Löschen','Delete')}</button></form></div></td></tr>`;
+  }).join('');
+  const managedRows=(db.managedBots||[]).map((bot)=>{
+    const owner=db.users.find((u)=>u.discordId===bot.ownerDiscordId),service=db.botServices.find((x)=>x.id===bot.serviceId),rt=managedBotRuntime(bot.id),access=managedAccessActive(bot);
+    return `<tr><td><strong>${esc(bot.name||service?.nameDe||'Managed Bot')}</strong><div class="muted small">${esc(bot.id)}</div></td><td>${esc(owner?.globalName||owner?.username||bot.ownerDiscordId||'—')}</td><td>${esc(service?.nameDe||service?.nameEn||bot.serviceId)}</td><td><span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span><div class="muted small">${access?(bot.adminGrant?tr(lang,'Admin gratis','Admin free'):tr(lang,'bezahlt','paid')):tr(lang,'Zugang abgelaufen','access expired')}</div></td><td><div class="actions wrap">${bot.enabled&&access?`<form method="post" action="/managed-bots/${esc(bot.id)}/stop" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost smallbtn">Stop</button></form>`:''}${access?`<form method="post" action="/managed-bots/${esc(bot.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary smallbtn">${tr(lang,'Neustart','Restart')}</button></form>`:''}</div></td></tr>`;
+  }).join('');
+  return `<div class="pagehead"><div><h1>${tr(lang,'Alle Bots','All bots')}</h1><p>${tr(lang,'Status-, Custom- und Managed Bots zentral steuern.','Control status, custom and managed bots centrally.')}</p></div></div><div class="admin-subhead"><h2>Status Bots</h2></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Owner</th><th>Game</th><th>Status</th><th>Node</th><th>${tr(lang,'Aktionen','Actions')}</th></tr></thead><tbody>${statusRows||`<tr><td colspan="6">${tr(lang,'Keine Status Bots','No status bots')}</td></tr>`}</tbody></table></div><div class="admin-subhead subsection"><h2>Custom Bots</h2></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Owner</th><th>Runtime</th><th>${tr(lang,'Freigabe / Status','Approval / status')}</th><th>${tr(lang,'Admin Controls','Admin controls')}</th></tr></thead><tbody>${customRows||`<tr><td colspan="5">${tr(lang,'Keine Custom Bots','No custom bots')}</td></tr>`}</tbody></table></div><div class="admin-subhead subsection"><h2>Managed Bot Services</h2></div><div class="panel tablewrap"><table><thead><tr><th>Bot</th><th>Owner</th><th>Service</th><th>Status</th><th>${tr(lang,'Admin Controls','Admin controls')}</th></tr></thead><tbody>${managedRows||`<tr><td colspan="5">${tr(lang,'Keine Managed Bots','No managed bots')}</td></tr>`}</tbody></table></div>`;
 }
 
 function adminUsersContent(req) {
@@ -1142,7 +1359,7 @@ function adminUsersContent(req) {
 function adminServicesContent(req) {
   const lang=langOf(req),services=listBotServices(false),editId=String(req.query.edit||''),edit=editId?getBotService(editId):null,f=edit||{};
   const rows=services.map((x)=>`<tr><td><strong>${esc(x.nameDe||x.nameEn)}</strong></td><td>${esc(x.priceLabel||'—')}</td><td>${esc(x.status)}</td><td><div class="actions wrap"><a class="button ghost smallbtn" href="/admin?tab=services&edit=${encodeURIComponent(x.id)}#services">${tr(lang,'Bearbeiten','Edit')}</a><form method="post" action="/admin/bot-services/${esc(x.id)}/delete" class="inline" onsubmit="return confirm('${tr(lang,'Bot Service löschen?','Delete bot service?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger smallbtn">${tr(lang,'Löschen','Delete')}</button></form></div></td></tr>`).join('');
-  return `<div class="pagehead"><div><h1>${tr(lang,'Bot Services','Bot services')}</h1><p>${tr(lang,'Einzeln kaufbare Managed Bots verwalten.','Manage individually purchasable managed bots.')}</p></div><a class="button ghost" href="/bot-services" target="_blank">${tr(lang,'Öffentliche Seite','Public page')}</a></div><form method="post" action="/admin/bot-services" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="id" value="${esc(f.id||'')}"><label>${tr(lang,'Name Deutsch','Name German')}<input name="nameDe" required value="${esc(f.nameDe||'')}"></label><label>${tr(lang,'Name Englisch','Name English')}<input name="nameEn" required value="${esc(f.nameEn||'')}"></label><label class="span2">${tr(lang,'Beschreibung Deutsch','Description German')}<textarea name="descriptionDe" rows="3" required>${esc(f.descriptionDe||'')}</textarea></label><label class="span2">${tr(lang,'Beschreibung Englisch','Description English')}<textarea name="descriptionEn" rows="3" required>${esc(f.descriptionEn||'')}</textarea></label><label>${tr(lang,'Preis','Price')}<input name="priceLabel" value="${esc(f.priceLabel||'')}"></label><label>Status<select name="status"><option value="coming_soon" ${f.status==='coming_soon'||!f.status?'selected':''}>Coming soon</option><option value="available" ${f.status==='available'?'selected':''}>Available</option><option value="paused" ${f.status==='paused'?'selected':''}>Paused</option></select></label><label>${tr(lang,'Kauf-Link','Purchase URL')}<input name="purchaseUrl" value="${esc(f.purchaseUrl||'')}"></label><label>${tr(lang,'Support-Link','Support URL')}<input name="supportUrl" value="${esc(f.supportUrl||'')}"></label><label class="check"><input type="checkbox" name="visible" value="1" ${f.visible!==false?'checked':''}> ${tr(lang,'Sichtbar','Visible')}</label><label class="check"><input type="checkbox" name="featured" value="1" ${f.featured?'checked':''}> Featured</label><label class="span2">${tr(lang,'Features Deutsch','Features German')}<textarea name="featuresDe" rows="5">${esc((f.featuresDe||[]).join('\n'))}</textarea></label><label class="span2">${tr(lang,'Features Englisch','Features English')}<textarea name="featuresEn" rows="5">${esc((f.featuresEn||[]).join('\n'))}</textarea></label><div class="span2 actions"><button class="button primary">${edit?tr(lang,'Speichern','Save'):tr(lang,'Hinzufügen','Add')}</button></div></form><div class="panel tablewrap"><table><thead><tr><th>Service</th><th>${tr(lang,'Preis','Price')}</th><th>Status</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="4">${tr(lang,'Keine Services','No services')}</td></tr>`}</tbody></table></div>`;
+  return `<div class="pagehead"><div><h1>${tr(lang,'Bot Services','Bot services')}</h1><p>${tr(lang,'Einzeln kaufbare Managed Bots verwalten.','Manage individually purchasable managed bots.')}</p></div><a class="button ghost" href="/bot-services" target="_blank">${tr(lang,'Öffentliche Seite','Public page')}</a></div><form method="post" action="/admin/bot-services" class="panel formgrid"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="id" value="${esc(f.id||'')}"><label>${tr(lang,'Name Deutsch','Name German')}<input name="nameDe" required value="${esc(f.nameDe||'')}"></label><label>${tr(lang,'Name Englisch','Name English')}<input name="nameEn" required value="${esc(f.nameEn||'')}"></label><label class="span2">${tr(lang,'Beschreibung Deutsch','Description German')}<textarea name="descriptionDe" rows="3" required>${esc(f.descriptionDe||'')}</textarea></label><label class="span2">${tr(lang,'Beschreibung Englisch','Description English')}<textarea name="descriptionEn" rows="3" required>${esc(f.descriptionEn||'')}</textarea></label><label>${tr(lang,'Preis-Anzeige','Price label')}<input name="priceLabel" value="${esc(f.priceLabel||'')}"></label><label>Status<select name="status"><option value="coming_soon" ${f.status==='coming_soon'||!f.status?'selected':''}>Coming soon</option><option value="available" ${f.status==='available'?'selected':''}>Available</option><option value="paused" ${f.status==='paused'?'selected':''}>Paused</option></select></label><label>${tr(lang,'Monatspreis PayPal','PayPal monthly price')}<input name="monthlyAmount" inputmode="decimal" value="${esc(f.monthlyAmount||'')}"></label><label>${tr(lang,'Währung','Currency')}<input name="currency" maxlength="3" value="${esc(f.currency||'EUR')}"></label><label>${tr(lang,'Kauf-Link','Purchase URL')}<input name="purchaseUrl" value="${esc(f.purchaseUrl||'')}"></label><label>${tr(lang,'Support-Link','Support URL')}<input name="supportUrl" value="${esc(f.supportUrl||'')}"></label><label class="check"><input type="checkbox" name="visible" value="1" ${f.visible!==false?'checked':''}> ${tr(lang,'Sichtbar','Visible')}</label><label class="check"><input type="checkbox" name="featured" value="1" ${f.featured?'checked':''}> Featured</label><label class="span2">${tr(lang,'Features Deutsch','Features German')}<textarea name="featuresDe" rows="5">${esc((f.featuresDe||[]).join('\n'))}</textarea></label><label class="span2">${tr(lang,'Features Englisch','Features English')}<textarea name="featuresEn" rows="5">${esc((f.featuresEn||[]).join('\n'))}</textarea></label><div class="span2 actions"><button class="button primary">${edit?tr(lang,'Speichern','Save'):tr(lang,'Hinzufügen','Add')}</button></div></form><div class="panel tablewrap"><table><thead><tr><th>Service</th><th>${tr(lang,'Preis','Price')}</th><th>Status</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="4">${tr(lang,'Keine Services','No services')}</td></tr>`}</tbody></table></div>`;
 }
 
 function adminSettingsContent(req) {
@@ -1272,7 +1489,9 @@ app.post('/admin/bot-services', requireAdmin, checkCsrf, (req,res) => {
   const lines=(value)=>String(value||'').split(/\r?\n/).map((x)=>x.trim()).filter(Boolean).slice(0,20).map((x)=>x.slice(0,160));
   const status=['coming_soon','available','paused'].includes(req.body.status)?req.body.status:'coming_soon';
   const slug=(old?.slug||nameEn.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,80)||`service-${Date.now()}`);
-  upsertBotService({id:old?.id,slug,nameDe:nameDe.slice(0,100),nameEn:nameEn.slice(0,100),descriptionDe:String(req.body.descriptionDe||'').trim().slice(0,800),descriptionEn:String(req.body.descriptionEn||'').trim().slice(0,800),featuresDe:lines(req.body.featuresDe),featuresEn:lines(req.body.featuresEn),priceLabel:String(req.body.priceLabel||'').trim().slice(0,60),status,purchaseUrl:url(req.body.purchaseUrl),supportUrl:url(req.body.supportUrl),visible:req.body.visible==='1',featured:req.body.featured==='1',sortOrder:Math.max(0,Math.min(9999,Number(req.body.sortOrder)||10))});
+  const monthlyAmount=normalizedMoney(req.body.monthlyAmount); const currency=/^[A-Za-z]{3}$/.test(String(req.body.currency||''))?String(req.body.currency).toUpperCase():(old?.currency||'EUR');
+  const priceChanged=Boolean(old)&&(monthlyAmount!==String(old.monthlyAmount||'')||currency!==String(old.currency||'EUR').toUpperCase());
+  upsertBotService({id:old?.id,slug,nameDe:nameDe.slice(0,100),nameEn:nameEn.slice(0,100),descriptionDe:String(req.body.descriptionDe||'').trim().slice(0,800),descriptionEn:String(req.body.descriptionEn||'').trim().slice(0,800),featuresDe:lines(req.body.featuresDe),featuresEn:lines(req.body.featuresEn),priceLabel:String(req.body.priceLabel||'').trim().slice(0,60),monthlyAmount,currency,paypalPlanId:priceChanged?'':(old?.paypalPlanId||''),paypalPlanMeta:priceChanged?{}:(old?.paypalPlanMeta||{}),paypalProductId:old?.paypalProductId||'',status,purchaseUrl:url(req.body.purchaseUrl),supportUrl:url(req.body.supportUrl),visible:req.body.visible==='1',featured:req.body.featured==='1',sortOrder:Math.max(0,Math.min(9999,Number(req.body.sortOrder)||10))});
   flash(req,'ok',l(req,'Bot Service gespeichert.','Bot service saved.')); res.redirect('/admin?tab=services#services');
 });
 
@@ -1415,10 +1634,12 @@ const httpServer = app.listen(port, async () => {
       try { await ensureCustomBot(b); } catch (e) { console.error(`Custom Bot ${b.id}:`, e.message); }
     }
   }, 3000).unref();
+  setTimeout(() => { syncManagedBots(readDb().managedBots || []).catch((e) => console.error('Managed bot startup:', e.message)); }, 3500).unref();
+  setInterval(() => { syncManagedBots(readDb().managedBots || []).catch((e) => console.error('Managed bot sync:', e.message)); }, 15_000).unref();
   setInterval(() => { try { rebalanceAssignments(); } catch (e) { console.error('Status-Node-Rebalance:', e.message); } }, 10_000).unref();
   setInterval(() => { try { const r=runLifecycleSweep(); if(r.premiumDeleted||r.renewDeleted||r.premiumGraceStarted||r.renewGraceStarted) rebalanceAssignments(); } catch (e) { console.error('Lifecycle:', e.message); } }, 60_000).unref();
   setTimeout(() => { refreshDueFreeBoosts().then(()=>rebalanceAssignments()).catch(()=>{}); }, 5000).unref();
   setInterval(() => { refreshDueFreeBoosts().then(()=>rebalanceAssignments()).catch(()=>{}); }, 15 * 60_000).unref();
 });
-async function shutdown(signal){console.log(`\n${signal}: fahre herunter...`);httpServer.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();}
+async function shutdown(signal){console.log(`\n${signal}: fahre herunter...`);try{await shutdownManagedBots();}catch(error){console.error('Managed bot shutdown:',error.message);}httpServer.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();}
 process.on('SIGINT',()=>shutdown('SIGINT')); process.on('SIGTERM',()=>shutdown('SIGTERM'));
