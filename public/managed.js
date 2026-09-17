@@ -230,3 +230,76 @@
       .replaceAll("'", '&#39;');
   }
 })();
+
+(() => {
+  const modal = document.querySelector('[data-managed-ban-modal]');
+  if (!modal) return;
+  const form = modal.querySelector('[data-managed-ban-form]');
+  const steamInput = modal.querySelector('[data-ban-steam-id]');
+  const reason = modal.querySelector('[data-ban-reason]');
+  const reasonCount = modal.querySelector('[data-ban-reason-count]');
+  const template = modal.querySelector('[data-ban-template]');
+  const targetLabel = modal.querySelector('[data-ban-target-label]');
+  const duration = modal.querySelector('[data-ban-duration]');
+  const durationUnit = duration?.querySelector('[data-duration-unit]');
+  const durationValue = duration?.querySelector('[data-duration-value]');
+  const submit = modal.querySelector('.managed-ban-confirm');
+
+  const syncDuration = () => {
+    if (!durationUnit || !durationValue) return;
+    const permanent = durationUnit.value === 'permanent';
+    durationValue.hidden = permanent;
+    durationValue.disabled = permanent;
+    if (!permanent && (!Number(durationValue.value) || Number(durationValue.value) <= 0)) durationValue.value = '1';
+  };
+  const syncCount = () => { if (reasonCount) reasonCount.textContent = String(reason?.value?.length || 0); };
+  const resetForm = () => {
+    form?.reset();
+    if (template) template.value = '';
+    if (reason) reason.value = '';
+    if (durationUnit) durationUnit.value = 'permanent';
+    if (durationValue) durationValue.value = '1';
+    syncDuration(); syncCount();
+    if (submit) submit.disabled = false;
+  };
+  const open = (button) => {
+    resetForm();
+    const steam = String(button?.dataset?.steamId || '');
+    const player = String(button?.dataset?.playerName || '').trim();
+    if (steamInput) {
+      steamInput.value = steam;
+      steamInput.readOnly = Boolean(steam);
+    }
+    if (targetLabel) targetLabel.textContent = steam ? `${player || 'Player'} · ${steam}` : 'SteamID64';
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    window.setTimeout(() => (steam ? reason : steamInput)?.focus(), 0);
+  };
+  const close = () => {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  };
+
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const opener = target.closest('[data-open-managed-ban]');
+    if (opener) { open(opener); return; }
+    if (target.closest('[data-close-managed-ban]')) { close(); return; }
+    if (target === modal) close();
+  });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !modal.hidden) close(); });
+  reason?.addEventListener('input', () => { if (template?.value) template.value = ''; syncCount(); });
+  durationUnit?.addEventListener('change', () => { if (template?.value) template.value = ''; syncDuration(); });
+  durationValue?.addEventListener('input', () => { if (template?.value) template.value = ''; });
+  template?.addEventListener('change', () => {
+    const option = template.selectedOptions?.[0];
+    if (!option || !option.value) return;
+    if (reason) reason.value = option.dataset.banReason || '';
+    if (durationUnit) durationUnit.value = option.dataset.banUnit || 'permanent';
+    if (durationValue) durationValue.value = option.dataset.banValue || '1';
+    syncDuration(); syncCount();
+  });
+  form?.addEventListener('submit', () => { if (submit) { submit.disabled = true; submit.textContent = 'BAN…'; } });
+  syncDuration(); syncCount();
+})();

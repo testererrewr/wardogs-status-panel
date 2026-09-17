@@ -1,7 +1,10 @@
-# status-hub.lol v3.12.15
+# status-hub.lol v3.12.17
 
 
-## v3.12.15 – Ban message settings and duration controls
+## v3.12.17 – Service feature-list cleanup
+
+- Removed the redundant “redundant Discord moderation-buttons” bullet from the WARDOGS Warning & Management Bot service card.
+- The Discord moderation buttons themselves remain fully available in the bot.
 
 - WARDOGS Management Bot has a dedicated **Ban messages** settings block with an optional Discord server/invite link.
 - The invite is appended automatically to permanent and temporary bans, including manual bans, ban templates and detection-rule bans.

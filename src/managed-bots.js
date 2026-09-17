@@ -444,6 +444,44 @@ export async function whisperManagedPlayer(bot, steamId, message) {
   if (!clean || clean.length > 200) throw new Error('Player message must be 1–200 characters long');
   return wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/message`, { method: 'POST', body: { message: clean } });
 }
+export async function whisperManagedFaction(bot, faction, message) {
+  const cleanFaction = String(faction || '').trim();
+  const cleanMessage = String(message || '').trim();
+  if (!cleanFaction || cleanFaction.length > 80) throw new Error('Faction is invalid');
+  if (!cleanMessage || cleanMessage.length > 200) throw new Error('Faction whisper must be 1–200 characters long');
+
+  const payload = await wardogsRequest(bot, '/v1/players');
+  const players = Array.isArray(payload?.players) ? payload.players : [];
+  const targetFaction = cleanFaction.toLocaleLowerCase('en-US');
+  const targets = players.filter((player) => {
+    const steamId = playerSteamId(player);
+    const currentFaction = playerFaction(player).toLocaleLowerCase('en-US');
+    return Boolean(steamId) && currentFaction === targetFaction;
+  });
+  if (!targets.length) return { faction: cleanFaction, matched: 0, sent: 0, failed: 0, failures: [] };
+
+  let cursor = 0;
+  let sent = 0;
+  const failures = [];
+  const workerCount = Math.min(5, targets.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= targets.length) return;
+      const player = targets[index];
+      const steamId = playerSteamId(player);
+      const rendered = renderManagedWelcomeMessage(cleanMessage, player) || cleanMessage;
+      try {
+        await whisperManagedPlayer(bot, steamId, rendered);
+        sent += 1;
+      } catch (error) {
+        failures.push({ steamId, name: String(player?.name || ''), error: String(error?.message || error || 'Whisper failed').slice(0, 180) });
+      }
+    }
+  });
+  await Promise.all(workers);
+  return { faction: cleanFaction, matched: targets.length, sent, failed: failures.length, failures: failures.slice(0, 10) };
+}
 export async function moveManagedPlayer(bot, steamId, faction) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
