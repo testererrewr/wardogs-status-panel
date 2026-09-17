@@ -104,8 +104,8 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Warning & Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Regelbasierte Warnungen', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick & Steam-Profil', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings'],
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Rule-based alerts', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick & Steam profile', 'Discord alert channel', 'Configurable role mentions'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Regelbasierte Warnungen', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Discord Buttons: Ban, Kick & Steam-Profil', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Rule-based alerts', 'Optional auto-ban (OFF by default)', 'Discord buttons: Ban, Kick & Steam profile', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -121,7 +121,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 18, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 19, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -138,7 +138,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 18;
+  parsed.version = 19;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -196,6 +196,12 @@ function migrate(parsed) {
     if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], descriptionDe: managedService.descriptionDe, descriptionEn: managedService.descriptionEn, featuresDe: managedService.featuresDe, featuresEn: managedService.featuresEn, updatedAt: migrationNow };
     else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
   }
+  if (previousVersion < 19) {
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    const managedService = defaultBotServices()[0];
+    if (serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], descriptionDe: managedService.descriptionDe, descriptionEn: managedService.descriptionEn, featuresDe: managedService.featuresDe, featuresEn: managedService.featuresEn, updatedAt: migrationNow };
+    else parsed.botServices.push({ ...managedService, createdAt: migrationNow, updatedAt: migrationNow });
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -205,6 +211,15 @@ function migrate(parsed) {
     announcementEnabled: b.announcementEnabled === true,
     announcementIntervalMinutes: Math.max(1, Math.min(1440, Number(b.announcementIntervalMinutes) || 15)),
     announcementMessages: String(b.announcementMessages || ''),
+    controlPanelEnabled: b.controlPanelEnabled === true,
+    controlPanelChannelId: /^\d{17,20}$/.test(String(b.controlPanelChannelId || '')) ? String(b.controlPanelChannelId) : '',
+    controlPanelMessageId: /^\d{17,20}$/.test(String(b.controlPanelMessageId || '')) ? String(b.controlPanelMessageId) : '',
+    controlPanelMessageChannelId: /^\d{17,20}$/.test(String(b.controlPanelMessageChannelId || '')) ? String(b.controlPanelMessageChannelId) : '',
+    discordGrants: (Array.isArray(b.discordGrants) ? b.discordGrants : Array.isArray(b.discordRoleGrants) ? b.discordRoleGrants.map((x) => ({ ...x, type: 'role', id: x.id || x.roleId })) : []).map((g) => ({
+      type: g?.type === 'user' ? 'user' : 'role',
+      id: String(g?.id || g?.roleId || ''),
+      permissions: Array.isArray(g?.permissions) ? [...new Set(g.permissions.map(String).filter((x) => ['view','announce','whisper','kick','ban','unban','kill','setteam','match','map','lighting'].includes(x)))] : []
+    })).filter((g) => /^\d{17,20}$/.test(g.id) && g.permissions.length).slice(0, 20),
     pollSeconds: Math.max(10, Math.min(300, Number(b.pollSeconds) || 20)),
     rulesText: String(b.rulesText || ''),
     accessSource: String(b.accessSource || ''),

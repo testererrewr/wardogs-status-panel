@@ -1,6 +1,17 @@
-# status-hub.lol v3.11.9
+# status-hub.lol v3.12.0
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
+
+
+## v3.12.0
+
+- Detection rules for the WARDOGS managed bot now use structured dropdowns and input fields instead of raw rule syntax.
+- Player team changes use the live factions reported by WARDOGS as a dropdown.
+- Map management uses dropdown-driven map, lighting, map-specific experiences and zone alternators.
+- Optional persistent Discord management panel that automatically moves back to the bottom of its configured channel.
+- Discord panel supports live players, Whisper, Kick, Ban, Kill/Respawn, Set Team, Steam profile, server announcements, ban management, match controls, map changes and lighting.
+- Granular Discord role/user grants can be configured by Discord ID for View, Announcement, Whisper, Kick, Ban, Unban, Kill, Set Team, Match, Map and Lighting permissions.
+- Database version 19 migrates existing managed bots safely; the Discord panel remains OFF until explicitly enabled.
 
 
 ## v3.11.9

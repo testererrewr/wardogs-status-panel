@@ -1,12 +1,29 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, GatewayIntentBits, PermissionsBitField } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  ModalBuilder,
+  PermissionsBitField,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle
+} from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { assertSafeUrl } from './target-safety.js';
-import { getManagedBot } from './db.js';
+import { getManagedBot, upsertManagedBot } from './db.js';
 import { parseManagedRules, evaluateManagedRules } from './managed-rules.js';
 export { parseManagedRules, evaluateManagedRules } from './managed-rules.js';
 
+export const MANAGED_DISCORD_PERMISSION_KEYS = Object.freeze([
+  'view', 'announce', 'whisper', 'kick', 'ban', 'unban', 'kill', 'setteam', 'match', 'map', 'lighting'
+]);
+
 const instances = new Map();
 const runtime = new Map();
+const discordUiState = new Map();
 
 function nowIso() { return new Date().toISOString(); }
 function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, ''); }
@@ -16,7 +33,20 @@ function accessActive(bot) {
   return Number.isFinite(until) && until > Date.now();
 }
 function validSteamId(value) { return /^\d{17}$/.test(String(value || '').trim()); }
+function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
 function setRuntime(id, patch) { runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: nowIso() }); }
+function cut(value, max = 100) { return String(value ?? '').slice(0, max); }
+function uiKey(botId, userId) { return `${botId}:${userId}`; }
+function setUiState(botId, userId, patch) {
+  const key = uiKey(botId, userId);
+  discordUiState.set(key, { ...(discordUiState.get(key) || {}), ...patch, updatedAt: Date.now() });
+  if (discordUiState.size > 500) {
+    const oldest = [...discordUiState.entries()].sort((a, b) => Number(a[1]?.updatedAt || 0) - Number(b[1]?.updatedAt || 0)).slice(0, 100);
+    for (const [oldKey] of oldest) discordUiState.delete(oldKey);
+  }
+  return discordUiState.get(key);
+}
+function getUiState(botId, userId) { return discordUiState.get(uiKey(botId, userId)) || {}; }
 export function managedBotRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
 
 async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
@@ -37,7 +67,10 @@ async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
   const text = (await response.text()).slice(0, 1024 * 1024);
   let data = {};
   if (text) { try { data = JSON.parse(text); } catch { data = { message: text.slice(0, 300) }; } }
-  if (!response.ok) throw new Error(`WARDOGS API ${response.status}: ${String(data?.message || data?.error || 'Fehler').slice(0, 240)}`);
+  if (!response.ok) {
+    const detail = data?.error?.message || data?.message || data?.error || 'Fehler';
+    throw new Error(`WARDOGS API ${response.status}: ${String(detail).slice(0, 240)}`);
+  }
   return data;
 }
 
@@ -112,6 +145,25 @@ export async function changeManagedMap(bot, { map, experiences = [], lighting = 
   return wardogsRequest(bot, '/v1/match/map', { method: 'POST', body });
 }
 
+export async function managedMapOptions(bot, map) {
+  const cleanMap = String(map || '').trim();
+  if (!cleanMap || cleanMap.length > 100 || !/^[A-Za-z0-9_.-]+$/.test(cleanMap)) throw new Error('Map ist ungültig');
+  const encoded = encodeURIComponent(cleanMap);
+  const [experiences, alternators] = await Promise.allSettled([
+    wardogsRequest(bot, `/v1/catalog/maps/${encoded}/experiences`),
+    wardogsRequest(bot, `/v1/catalog/maps/${encoded}/alternators`)
+  ]);
+  return {
+    map: cleanMap,
+    experiences: experiences.status === 'fulfilled' && Array.isArray(experiences.value?.experiences) ? experiences.value.experiences : [],
+    alternators: alternators.status === 'fulfilled' && Array.isArray(alternators.value?.alternators) ? alternators.value.alternators : [],
+    errors: {
+      ...(experiences.status === 'rejected' ? { experiences: String(experiences.reason?.message || experiences.reason) } : {}),
+      ...(alternators.status === 'rejected' ? { alternators: String(alternators.reason?.message || alternators.reason) } : {})
+    }
+  };
+}
+
 export async function managedDashboard(bot) {
   const requests = {
     status: ['/v1/status'],
@@ -142,9 +194,44 @@ function announcementMessages(bot) {
   return String(bot?.announcementMessages || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 50);
 }
 
+function normalizeDiscordGrants(bot) {
+  const raw = Array.isArray(bot?.discordGrants) ? bot.discordGrants : Array.isArray(bot?.discordRoleGrants) ? bot.discordRoleGrants.map((x) => ({ ...x, type: 'role' })) : [];
+  return raw.map((grant) => ({
+    type: grant?.type === 'user' ? 'user' : 'role',
+    id: String(grant?.id || grant?.roleId || '').trim(),
+    permissions: Array.isArray(grant?.permissions) ? [...new Set(grant.permissions.map(String).filter((x) => MANAGED_DISCORD_PERMISSION_KEYS.includes(x)))] : []
+  })).filter((grant) => validSnowflake(grant.id) && grant.permissions.length);
+}
+
+function interactionRoleIds(interaction) {
+  const roles = interaction?.member?.roles;
+  if (roles?.cache && typeof roles.cache.keys === 'function') return [...roles.cache.keys()].map(String);
+  if (Array.isArray(roles)) return roles.map(String);
+  return [];
+}
+
+function discordPermission(bot, interaction, key) {
+  if (!MANAGED_DISCORD_PERMISSION_KEYS.includes(key)) return false;
+  const userId = String(interaction?.user?.id || '');
+  if (userId && userId === String(bot?.ownerDiscordId || '')) return true;
+  if (interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.Administrator)) return true;
+  const grants = normalizeDiscordGrants(bot);
+  if (!grants.length) {
+    if (key === 'ban') return Boolean(interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.BanMembers));
+    if (key === 'kick') return Boolean(interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.KickMembers));
+    return false;
+  }
+  const roleIds = new Set(interactionRoleIds(interaction));
+  return grants.some((grant) => {
+    const subject = grant.type === 'user' ? grant.id === userId : roleIds.has(grant.id);
+    return subject && grant.permissions.includes(key);
+  });
+}
+
 function signature(bot) {
   return JSON.stringify({
     enabled: Boolean(bot.enabled), botTokenEnc: bot.botTokenEnc || '', alertChannelId: bot.alertChannelId || '', mentionRoleId: bot.mentionRoleId || '',
+    controlPanelEnabled: bot.controlPanelEnabled === true, controlPanelChannelId: bot.controlPanelChannelId || '', discordGrants: normalizeDiscordGrants(bot),
     wardogsBaseUrl: bot.wardogsBaseUrl || '', wardogsSecretEnc: bot.wardogsSecretEnc || '', allowPrivateTarget: Boolean(bot.allowPrivateTarget),
     pollSeconds: Number(bot.pollSeconds || 20), rulesText: bot.rulesText || '', autoBanEnabled: bot.autoBanEnabled === true,
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
@@ -178,8 +265,105 @@ async function postAlert(bot, client, player, reasons, autoResult = null) {
       { name: 'Auto-Ban', value: bot.autoBanEnabled ? (autoResult?.ok ? 'Executed' : `Enabled${autoResult?.error ? ` · failed: ${String(autoResult.error).slice(0, 160)}` : ''}`) : 'OFF', inline: false }
     )
     .setTimestamp(new Date());
-  const content = /^\d{17,20}$/.test(String(bot.mentionRoleId || '')) ? `<@&${bot.mentionRoleId}>` : '';
+  const content = validSnowflake(bot.mentionRoleId) ? `<@&${bot.mentionRoleId}>` : '';
   await channel.send({ content, embeds: [embed], components: alertComponents(bot, player), allowedMentions: content ? { roles: [String(bot.mentionRoleId)] } : { parse: [] } });
+}
+
+function controlPanelComponents(bot) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wd:players:${bot.id}`).setLabel('Players').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`wd:announce:${bot.id}`).setLabel('Announcement').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`wd:bans:${bot.id}`).setLabel('Bans').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`wd:server:${bot.id}`).setLabel('Server').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`wd:refresh:${bot.id}`).setLabel('Refresh').setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+async function controlPanelPayload(bot) {
+  let status = null;
+  let players = null;
+  try {
+    [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]);
+  } catch {}
+  const playerList = Array.isArray(players?.players) ? players.players : [];
+  const scores = Array.isArray(status?.factionScores) ? status.factionScores : [];
+  const scoreText = scores.length ? scores.slice(0, 6).map((x) => `${cut(x.name, 40)}: ${Number.isFinite(Number(x.score)) ? x.score : '—'}`).join(' · ') : '—';
+  const embed = new EmbedBuilder()
+    .setTitle('WARDOGS Management Panel')
+    .setDescription('Server verwalten · Aktionen werden anhand der im Webpanel vergebenen Discord-Rechte geprüft.')
+    .addFields(
+      { name: 'Server', value: cut(status?.serverName || 'Nicht erreichbar', 1024), inline: true },
+      { name: 'Map', value: cut(status?.map || '—', 1024), inline: true },
+      { name: 'Players', value: `${status?.players?.current ?? playerList.length} / ${status?.players?.max ?? '—'}`, inline: true },
+      { name: 'Scores', value: cut(scoreText, 1024), inline: false },
+      { name: 'Auto-Ban', value: bot.autoBanEnabled === true ? 'ON' : 'OFF', inline: true },
+      { name: 'Auto-Announcements', value: bot.announcementEnabled === true ? 'ON' : 'OFF', inline: true }
+    )
+    .setFooter({ text: 'status-hub.lol · WARDOGS' })
+    .setTimestamp(new Date());
+  return { embeds: [embed], components: controlPanelComponents(bot), allowedMentions: { parse: [] } };
+}
+
+async function deleteStoredControlPanel(bot, client, state) {
+  const messageId = String(state?.panelMessageId || bot?.controlPanelMessageId || '');
+  const channelId = String(state?.panelChannelId || bot?.controlPanelMessageChannelId || bot?.controlPanelChannelId || '');
+  if (messageId && validSnowflake(channelId)) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      const message = await channel?.messages?.fetch?.(messageId);
+      await message?.delete?.();
+    } catch {}
+  }
+  if (state) { state.panelMessageId = ''; state.panelChannelId = ''; }
+  if (bot?.id && (bot.controlPanelMessageId || bot.controlPanelMessageChannelId)) {
+    try { upsertManagedBot({ id: bot.id, controlPanelMessageId: '', controlPanelMessageChannelId: '' }); } catch {}
+  }
+}
+
+async function ensureControlPanel(bot, client, state, { repost = false } = {}) {
+  if (!bot?.controlPanelEnabled || !validSnowflake(bot?.controlPanelChannelId)) return null;
+  if (state.panelPosting) return null;
+  state.panelPosting = true;
+  try {
+    const channelId = String(bot.controlPanelChannelId);
+    const oldChannelId = String(state.panelChannelId || bot.controlPanelMessageChannelId || '');
+    const oldMessageId = String(state.panelMessageId || bot.controlPanelMessageId || '');
+    if (oldMessageId && oldChannelId && oldChannelId !== channelId) await deleteStoredControlPanel(bot, client, state);
+    const channel = await client.channels.fetch(channelId);
+    if (!channel?.isTextBased?.() || typeof channel.send !== 'function') throw new Error('Discord Management-Panel-Channel ist nicht beschreibbar');
+    const payload = await controlPanelPayload(bot);
+    let message = null;
+    const currentMessageId = String(state.panelMessageId || bot.controlPanelMessageId || '');
+    if (currentMessageId) {
+      try {
+        message = await channel.messages.fetch(currentMessageId);
+        if (repost) { await message.delete(); message = null; }
+        else await message.edit(payload);
+      } catch { message = null; }
+    }
+    if (!message) message = await channel.send(payload);
+    state.panelMessageId = String(message.id);
+    state.panelChannelId = channelId;
+    state.lastPanelRefreshAt = Date.now();
+    if (String(bot.controlPanelMessageId || '') !== String(message.id) || String(bot.controlPanelMessageChannelId || '') !== channelId) {
+      try { upsertManagedBot({ id: bot.id, controlPanelMessageId: String(message.id), controlPanelMessageChannelId: channelId }); } catch {}
+    }
+    setRuntime(bot.id, { controlPanelMessageId: String(message.id), controlPanelChannelId: channelId });
+    return message;
+  } finally {
+    state.panelPosting = false;
+  }
+}
+
+function scheduleControlPanelBottom(botId, client, state) {
+  clearTimeout(state.panelRepostTimer);
+  state.panelRepostTimer = setTimeout(async () => {
+    const fresh = getManagedBot(botId);
+    if (!fresh?.enabled || !accessActive(fresh) || !fresh.controlPanelEnabled) return;
+    try { await ensureControlPanel(fresh, client, state, { repost: true }); }
+    catch (error) { setRuntime(botId, { lastPanelError: error.message }); }
+  }, 750);
+  state.panelRepostTimer.unref?.();
 }
 
 async function pollPlayers(bot, state, client) {
@@ -193,6 +377,7 @@ async function pollPlayers(bot, state, client) {
       state.lastAnnouncementAt = Date.now();
       state.announcementIndex = 0;
       setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null, lastAnnouncementAt: null });
+      if (bot.controlPanelEnabled) await ensureControlPanel(bot, client, state).catch((error) => setRuntime(bot.id, { lastPanelError: error.message }));
       return;
     }
     const rules = parseManagedRules(bot.rulesText || '');
@@ -226,39 +411,418 @@ async function pollPlayers(bot, state, client) {
         }
       }
     }
+    if (bot.controlPanelEnabled && Date.now() - Number(state.lastPanelRefreshAt || 0) >= 30_000) {
+      await ensureControlPanel(bot, client, state).catch((error) => setRuntime(bot.id, { lastPanelError: error.message }));
+    }
     setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null });
   } catch (error) {
     setRuntime(bot.id, { state: 'error', lastCheck: nowIso(), lastError: error.message });
   }
 }
 
-async function handleButton(interaction) {
-  if (!interaction.isButton?.()) return;
-  const match = String(interaction.customId || '').match(/^(wdban|wdkick):([0-9a-f-]{36}):(\d{17})$/i);
-  if (!match) return;
-  const [, action, botId, steamId] = match;
+function deny(interaction, key = '') {
+  const content = key ? `Dir fehlt die im Webpanel vergebene Berechtigung „${key}“.` : 'Du darfst diese Aktion nicht ausführen.';
+  if (interaction.deferred || interaction.replied) return interaction.followUp({ content, ephemeral: true }).catch(() => {});
+  return interaction.reply({ content, ephemeral: true }).catch(() => {});
+}
+
+function interactionBot(interaction, botId, permission = '') {
   const bot = getManagedBot(botId);
-  if (!bot || !bot.enabled || !accessActive(bot)) return interaction.reply({ content: 'Dieser Managed Bot ist nicht aktiv.', ephemeral: true }).catch(() => {});
-  const permission = action === 'wdban' ? PermissionsBitField.Flags.BanMembers : PermissionsBitField.Flags.KickMembers;
-  if (!interaction.memberPermissions?.has(permission)) return interaction.reply({ content: 'Dir fehlt die Discord-Berechtigung für diese Aktion.', ephemeral: true }).catch(() => {});
+  if (!bot || !bot.enabled || !accessActive(bot)) {
+    if (!interaction.replied && !interaction.deferred) interaction.reply({ content: 'Dieser Managed Bot ist nicht aktiv.', ephemeral: true }).catch(() => {});
+    return null;
+  }
+  if (permission && !discordPermission(bot, interaction, permission)) { deny(interaction, permission); return null; }
+  return bot;
+}
+
+function modal(customId, title, fields) {
+  const builder = new ModalBuilder().setCustomId(customId).setTitle(cut(title, 45));
+  for (const field of fields) {
+    const input = new TextInputBuilder()
+      .setCustomId(field.id)
+      .setLabel(cut(field.label, 45))
+      .setStyle(field.style || TextInputStyle.Short)
+      .setRequired(field.required !== false)
+      .setMaxLength(field.maxLength || 200);
+    if (field.placeholder) input.setPlaceholder(cut(field.placeholder, 100));
+    if (field.value) input.setValue(cut(field.value, field.maxLength || 200));
+    builder.addComponents(new ActionRowBuilder().addComponents(input));
+  }
+  return builder;
+}
+
+async function playerPage(bot, page = 0) {
+  const data = await wardogsRequest(bot, '/v1/players');
+  const players = Array.isArray(data?.players) ? data.players.filter((p) => validSteamId(p?.steamId || p?.steamId64)) : [];
+  const pages = Math.max(1, Math.ceil(players.length / 25));
+  const safePage = Math.max(0, Math.min(pages - 1, Number(page) || 0));
+  const slice = players.slice(safePage * 25, safePage * 25 + 25);
+  const rows = [];
+  if (slice.length) {
+    const select = new StringSelectMenuBuilder().setCustomId(`wd:playersel:${bot.id}:${safePage}`).setPlaceholder('Spieler auswählen').addOptions(slice.map((p) => ({
+      label: cut(p?.name || p?.steamId || 'Player', 100),
+      value: String(p?.steamId || p?.steamId64),
+      description: cut(`${p?.faction || '—'} · ${p?.pingMs ?? p?.ping ?? '—'} ms`, 100)
+    })));
+    rows.push(new ActionRowBuilder().addComponents(select));
+  }
+  if (pages > 1) rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wd:playerpage:${bot.id}:${safePage - 1}`).setLabel('←').setStyle(ButtonStyle.Secondary).setDisabled(safePage <= 0),
+    new ButtonBuilder().setCustomId(`wd:playerpage:${bot.id}:${safePage + 1}`).setLabel('→').setStyle(ButtonStyle.Secondary).setDisabled(safePage >= pages - 1)
+  ));
+  return { content: `**Live Players** · ${players.length} online · Seite ${safePage + 1}/${pages}`, components: rows, ephemeral: true };
+}
+
+async function playerControl(bot, steamId) {
+  const data = await wardogsRequest(bot, '/v1/players');
+  const players = Array.isArray(data?.players) ? data.players : [];
+  const player = players.find((p) => String(p?.steamId || p?.steamId64 || '') === steamId);
+  const name = player?.name || steamId;
+  const embed = new EmbedBuilder().setTitle(cut(name, 256)).setDescription(`SteamID64: ${steamId}`)
+    .addFields(
+      { name: 'Faction', value: cut(player?.faction || '—', 1024), inline: true },
+      { name: 'K/D', value: `${player?.kills ?? '—'} / ${player?.deaths ?? '—'}`, inline: true },
+      { name: 'Ping', value: `${player?.pingMs ?? player?.ping ?? '—'} ms`, inline: true },
+      { name: 'Cash', value: String(player?.cash ?? '—'), inline: true }
+    );
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`wd:pkick:${bot.id}:${steamId}`).setLabel('Kick').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`wd:pban:${bot.id}:${steamId}`).setLabel('Ban').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`wd:pwhisper:${bot.id}:${steamId}`).setLabel('Whisper').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`wd:pkill:${bot.id}:${steamId}`).setLabel('Kill').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setLabel('Steam').setStyle(ButtonStyle.Link).setURL(`https://steamcommunity.com/profiles/${steamId}`)
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`wd:pteam:${bot.id}:${steamId}`).setLabel('Set Team').setStyle(ButtonStyle.Primary)
+      )
+    ],
+    ephemeral: true
+  };
+}
+
+async function bansPanel(bot) {
+  const data = await wardogsRequest(bot, '/v1/bans');
+  const bans = Array.isArray(data?.bans) ? data.bans.filter((b) => validSteamId(b?.steamId)) : [];
+  const rows = [];
+  if (bans.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`wd:unban:${bot.id}`).setPlaceholder('Ban zum Entsperren auswählen').addOptions(bans.slice(0, 25).map((b) => ({
+        label: cut(b.steamId, 100), value: String(b.steamId), description: cut(b.reason || 'Kein Grund', 100)
+      })))
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`wd:manualban:${bot.id}`).setLabel('SteamID bannen').setStyle(ButtonStyle.Danger)));
+  return { content: `**Bans** · ${bans.length} Einträge${bans.length > 25 ? ' · Auswahl zeigt die ersten 25' : ''}`, components: rows, ephemeral: true };
+}
+
+async function serverPanel(bot) {
+  const status = await wardogsRequest(bot, '/v1/status');
+  return {
+    content: `**Server Controls** · ${cut(status?.serverName || 'WARDOGS', 80)} · ${cut(status?.map || '—', 80)}`,
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`wd:restartmatch:${bot.id}`).setLabel('Restart Match').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`wd:endmatch:${bot.id}`).setLabel('End Match').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`wd:map:${bot.id}`).setLabel('Change Map').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`wd:light:${bot.id}`).setLabel('Lighting').setStyle(ButtonStyle.Secondary)
+    )],
+    ephemeral: true
+  };
+}
+
+async function mapPicker(bot) {
+  const data = await wardogsRequest(bot, '/v1/catalog/maps');
+  const maps = Array.isArray(data?.maps) ? data.maps : [];
+  if (!maps.length) throw new Error('Keine Maps vom Server erhalten');
+  return {
+    content: '**Map auswählen**',
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`wd:mapsel:${bot.id}`).setPlaceholder('Map auswählen').addOptions(maps.slice(0, 25).map((m) => ({
+        label: cut(m.displayName || m.id || m.name || 'Map', 100), value: cut(m.id || m.name || '', 100)
+      })).filter((x) => x.value))
+    )],
+    ephemeral: true
+  };
+}
+
+function mapSetupComponents(bot, state) {
+  const rows = [];
+  const exp = Array.isArray(state.mapExperiences) ? state.mapExperiences.slice(0, 24) : [];
+  const expOptions = [{ label: 'Server default / none', value: '__none__', default: !state.experiences?.length }, ...exp.map((id) => ({ label: cut(id, 100), value: cut(id, 100), default: state.experiences?.includes(String(id)) }))];
+  rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`wd:mapexp:${bot.id}`).setPlaceholder('Experiences').setMinValues(1).setMaxValues(Math.min(expOptions.length, 10)).addOptions(expOptions)
+  ));
+  const lighting = Array.isArray(state.lightings) ? state.lightings.slice(0, 24) : [];
+  rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`wd:maplight:${bot.id}`).setPlaceholder('Lighting').addOptions([
+      { label: 'Server default', value: '__default__', default: !state.lighting },
+      ...lighting.map((x) => ({ label: cut(x.displayName || x.id || x.name || 'Lighting', 100), value: cut(x.id || x.name || '', 100), default: state.lighting === String(x.id || x.name || '') })).filter((x) => x.value)
+    ])
+  ));
+  const alternators = Array.isArray(state.alternators) ? state.alternators.slice(0, 24) : [];
+  rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`wd:mapalt:${bot.id}`).setPlaceholder('Zone Alternator').addOptions([
+      { label: 'Server default', value: '__default__', default: !state.zoneAlternator },
+      ...alternators.map((x) => ({ label: cut(x.displayName || x.tag || 'Alternator', 100), value: cut(x.tag || x.id || '', 100), default: state.zoneAlternator === String(x.tag || x.id || '') })).filter((x) => x.value)
+    ])
+  ));
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wd:mapapply:${bot.id}`).setLabel('Mapwechsel senden').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`wd:mapcancel:${bot.id}`).setLabel('Abbrechen').setStyle(ButtonStyle.Secondary)
+  ));
+  return rows;
+}
+
+async function setupMapState(bot, interaction, map) {
+  const [details, lightingData] = await Promise.all([managedMapOptions(bot, map), wardogsRequest(bot, '/v1/catalog/lightings')]);
+  const state = setUiState(bot.id, interaction.user.id, {
+    map,
+    experiences: [],
+    lighting: '',
+    zoneAlternator: '',
+    mapExperiences: details.experiences.map((x) => String(typeof x === 'string' ? x : (x.id || x.name || ''))).filter(Boolean),
+    alternators: details.alternators,
+    lightings: Array.isArray(lightingData?.lightings) ? lightingData.lightings : []
+  });
+  return { content: `**Map Setup** · ${cut(map, 90)}\nExperiences, Lighting und Zone Alternator auswählen und anschließend anwenden.`, components: mapSetupComponents(bot, state), ephemeral: true };
+}
+
+async function lightingPicker(bot) {
+  const data = await wardogsRequest(bot, '/v1/catalog/lightings');
+  const lightings = Array.isArray(data?.lightings) ? data.lightings : [];
+  if (!lightings.length) throw new Error('Keine Lighting-Werte vom Server erhalten');
+  return {
+    content: '**Lighting auswählen**',
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`wd:lightset:${bot.id}`).setPlaceholder('Lighting auswählen').addOptions(lightings.slice(0, 25).map((x) => ({
+        label: cut(x.displayName || x.id || x.name || 'Lighting', 100), value: cut(x.id || x.name || '', 100)
+      })).filter((x) => x.value))
+    )],
+    ephemeral: true
+  };
+}
+
+async function teamPicker(bot, steamId) {
+  const status = await wardogsRequest(bot, '/v1/status');
+  const factions = Array.isArray(status?.factionScores) ? [...new Set(status.factionScores.map((x) => String(x?.name || '').trim()).filter(Boolean))] : [];
+  if (!factions.length) throw new Error('Keine Teams/Fraktionen vom Server erhalten');
+  return {
+    content: `**Set Team** · ${steamId}`,
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`wd:teamset:${bot.id}:${steamId}`).setPlaceholder('Team auswählen').addOptions(factions.slice(0, 25).map((name) => ({ label: cut(name, 100), value: cut(name, 100) })))
+    )],
+    ephemeral: true
+  };
+}
+
+async function handleLegacyAlertButton(interaction) {
+  if (!interaction.isButton?.()) return false;
+  const match = String(interaction.customId || '').match(/^(wdban|wdkick):([0-9a-f-]{36}):(\d{17})$/i);
+  if (!match) return false;
+  const [, action, botId, steamId] = match;
+  const permission = action === 'wdban' ? 'ban' : 'kick';
+  const bot = interactionBot(interaction, botId, permission);
+  if (!bot) return true;
   await interaction.deferReply({ ephemeral: true }).catch(() => {});
   try {
-    if (action === 'wdban') await banManagedPlayer(bot, steamId, `Manual Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
-    else await kickManagedPlayer(bot, steamId, `Manual Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
+    if (action === 'wdban') await banManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
+    else await kickManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
     await interaction.editReply(`${action === 'wdban' ? 'Ban' : 'Kick'} für ${steamId} wurde an den WARDOGS-Server gesendet.`).catch(() => {});
+  } catch (error) { await interaction.editReply(`Aktion fehlgeschlagen: ${cut(error.message || error, 300)}`).catch(() => {}); }
+  return true;
+}
+
+async function handleButton(interaction, client, state) {
+  if (!interaction.isButton?.()) return false;
+  if (await handleLegacyAlertButton(interaction)) return true;
+  const parts = String(interaction.customId || '').split(':');
+  if (parts[0] !== 'wd') return false;
+  const action = parts[1];
+  const botId = parts[2];
+  if (!botId) return false;
+  try {
+    if (action === 'players') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      await interaction.reply(await playerPage(bot, 0)); return true;
+    }
+    if (action === 'playerpage') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      { const payload=await playerPage(bot, Number(parts[3] || 0)); delete payload.ephemeral; await interaction.update(payload); } return true;
+    }
+    if (action === 'announce') {
+      const bot = interactionBot(interaction, botId, 'announce'); if (!bot) return true;
+      await interaction.showModal(modal(`wd:mannounce:${bot.id}`, 'Server Announcement', [{ id: 'message', label: 'Nachricht', style: TextInputStyle.Paragraph, maxLength: 200, placeholder: 'Server restart in 10 minutes…' }])); return true;
+    }
+    if (action === 'bans') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      await interaction.reply(await bansPanel(bot)); return true;
+    }
+    if (action === 'server') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      await interaction.reply(await serverPanel(bot)); return true;
+    }
+    if (action === 'refresh') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      await ensureControlPanel(bot, client, state);
+      await interaction.reply({ content: 'Management Panel aktualisiert.', ephemeral: true }); return true;
+    }
+    if (['pkick','pban','pwhisper','pkill','pteam'].includes(action)) {
+      const steamId = parts[3]; if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+      const permission = ({ pkick: 'kick', pban: 'ban', pwhisper: 'whisper', pkill: 'kill', pteam: 'setteam' })[action];
+      const bot = interactionBot(interaction, botId, permission); if (!bot) return true;
+      if (action === 'pkick') await interaction.showModal(modal(`wd:mkick:${bot.id}:${steamId}`, 'Spieler kicken', [{ id: 'reason', label: 'Grund', maxLength: 180, required: false, placeholder: 'Rule violation' }]));
+      else if (action === 'pban') await interaction.showModal(modal(`wd:mbanplayer:${bot.id}:${steamId}`, 'Spieler bannen', [{ id: 'reason', label: 'Grund', maxLength: 180, required: false, placeholder: 'Rule violation' }]));
+      else if (action === 'pwhisper') await interaction.showModal(modal(`wd:mwhisper:${bot.id}:${steamId}`, 'Whisper', [{ id: 'message', label: 'Nachricht', style: TextInputStyle.Paragraph, maxLength: 200 }]));
+      else if (action === 'pkill') { await killManagedPlayer(bot, steamId); await interaction.reply({ content: `Kill/Respawn für ${steamId} gesendet.`, ephemeral: true }); }
+      else await interaction.reply(await teamPicker(bot, steamId));
+      return true;
+    }
+    if (action === 'manualban') {
+      const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
+      await interaction.showModal(modal(`wd:mmanualban:${bot.id}`, 'SteamID bannen', [
+        { id: 'steamId', label: 'SteamID64', maxLength: 17, placeholder: '7656119…' },
+        { id: 'reason', label: 'Grund', maxLength: 180, required: false, placeholder: 'Rule violation' }
+      ])); return true;
+    }
+    if (action === 'restartmatch' || action === 'endmatch') {
+      const bot = interactionBot(interaction, botId, 'match'); if (!bot) return true;
+      if (action === 'restartmatch') await restartManagedMatch(bot); else await endManagedMatch(bot);
+      await interaction.reply({ content: action === 'restartmatch' ? 'Match-Restart gesendet.' : 'Match-Ende gesendet.', ephemeral: true }); return true;
+    }
+    if (action === 'map') {
+      const bot = interactionBot(interaction, botId, 'map'); if (!bot) return true;
+      await interaction.reply(await mapPicker(bot)); return true;
+    }
+    if (action === 'light') {
+      const bot = interactionBot(interaction, botId, 'lighting'); if (!bot) return true;
+      await interaction.reply(await lightingPicker(bot)); return true;
+    }
+    if (action === 'mapapply') {
+      const bot = interactionBot(interaction, botId, 'map'); if (!bot) return true;
+      const saved = getUiState(bot.id, interaction.user.id); if (!saved.map) throw new Error('Keine Map ausgewählt');
+      await changeManagedMap(bot, { map: saved.map, experiences: saved.experiences || [], lighting: saved.lighting || '', zoneAlternator: saved.zoneAlternator || '' });
+      discordUiState.delete(uiKey(bot.id, interaction.user.id));
+      await interaction.update({ content: `Mapwechsel zu **${cut(saved.map, 90)}** gesendet.`, components: [] }); return true;
+    }
+    if (action === 'mapcancel') {
+      interactionBot(interaction, botId, 'map');
+      discordUiState.delete(uiKey(botId, interaction.user.id));
+      await interaction.update({ content: 'Mapwechsel abgebrochen.', components: [] }); return true;
+    }
   } catch (error) {
-    await interaction.editReply(`Aktion fehlgeschlagen: ${String(error.message || error).slice(0, 300)}`).catch(() => {});
+    const payload = { content: `Aktion fehlgeschlagen: ${cut(error.message || error, 300)}`, ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {}); else await interaction.reply(payload).catch(() => {});
+    return true;
   }
+  return false;
+}
+
+async function handleSelect(interaction) {
+  if (!interaction.isStringSelectMenu?.()) return false;
+  const parts = String(interaction.customId || '').split(':');
+  if (parts[0] !== 'wd') return false;
+  const action = parts[1], botId = parts[2];
+  try {
+    if (action === 'playersel') {
+      const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
+      const steamId = String(interaction.values?.[0] || ''); if (!validSteamId(steamId)) throw new Error('Ungültige SteamID64');
+      await interaction.reply(await playerControl(bot, steamId)); return true;
+    }
+    if (action === 'unban') {
+      const bot = interactionBot(interaction, botId, 'unban'); if (!bot) return true;
+      const steamId = String(interaction.values?.[0] || ''); await unbanManagedPlayer(bot, steamId);
+      await interaction.update({ content: `Ban für ${steamId} entfernt.`, components: [] }); return true;
+    }
+    if (action === 'teamset') {
+      const steamId = parts[3]; const bot = interactionBot(interaction, botId, 'setteam'); if (!bot) return true;
+      const faction = String(interaction.values?.[0] || ''); await moveManagedPlayer(bot, steamId, faction);
+      await interaction.update({ content: `${steamId} wurde zu **${cut(faction, 80)}** verschoben und respawnt.`, components: [] }); return true;
+    }
+    if (action === 'mapsel') {
+      const bot = interactionBot(interaction, botId, 'map'); if (!bot) return true;
+      const map = String(interaction.values?.[0] || ''); { const payload=await setupMapState(bot, interaction, map); delete payload.ephemeral; await interaction.update(payload); } return true;
+    }
+    if (['mapexp','maplight','mapalt'].includes(action)) {
+      const bot = interactionBot(interaction, botId, 'map'); if (!bot) return true;
+      const state = getUiState(bot.id, interaction.user.id); if (!state.map) throw new Error('Map-Auswahl ist abgelaufen');
+      if (action === 'mapexp') state.experiences = interaction.values.includes('__none__') ? [] : interaction.values.slice(0, 10);
+      if (action === 'maplight') state.lighting = interaction.values[0] === '__default__' ? '' : String(interaction.values[0] || '');
+      if (action === 'mapalt') state.zoneAlternator = interaction.values[0] === '__default__' ? '' : String(interaction.values[0] || '');
+      setUiState(bot.id, interaction.user.id, state);
+      await interaction.update({ content: `**Map Setup** · ${cut(state.map, 90)}\nExperiences, Lighting und Zone Alternator auswählen und anschließend anwenden.`, components: mapSetupComponents(bot, state) }); return true;
+    }
+    if (action === 'lightset') {
+      const bot = interactionBot(interaction, botId, 'lighting'); if (!bot) return true;
+      const lighting = String(interaction.values?.[0] || ''); await setManagedLighting(bot, lighting);
+      await interaction.update({ content: `Lighting **${cut(lighting, 90)}** angewendet.`, components: [] }); return true;
+    }
+  } catch (error) {
+    const payload = { content: `Aktion fehlgeschlagen: ${cut(error.message || error, 300)}`, components: [], ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {}); else await interaction.reply(payload).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function handleModal(interaction) {
+  if (!interaction.isModalSubmit?.()) return false;
+  const parts = String(interaction.customId || '').split(':');
+  if (parts[0] !== 'wd') return false;
+  const action = parts[1], botId = parts[2], steamId = parts[3];
+  try {
+    if (action === 'mannounce') {
+      const bot = interactionBot(interaction, botId, 'announce'); if (!bot) return true;
+      const message = interaction.fields.getTextInputValue('message'); await broadcastManaged(bot, message);
+      await interaction.reply({ content: 'Server-Announcement gesendet.', ephemeral: true }); return true;
+    }
+    if (action === 'mkick') {
+      const bot = interactionBot(interaction, botId, 'kick'); if (!bot) return true;
+      const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel kick'; await kickManagedPlayer(bot, steamId, reason);
+      await interaction.reply({ content: `Kick für ${steamId} gesendet.`, ephemeral: true }); return true;
+    }
+    if (action === 'mbanplayer') {
+      const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
+      const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel ban'; await banManagedPlayer(bot, steamId, reason);
+      await interaction.reply({ content: `${steamId} wurde gebannt.`, ephemeral: true }); return true;
+    }
+    if (action === 'mwhisper') {
+      const bot = interactionBot(interaction, botId, 'whisper'); if (!bot) return true;
+      const message = interaction.fields.getTextInputValue('message'); await whisperManagedPlayer(bot, steamId, message);
+      await interaction.reply({ content: `Whisper an ${steamId} gesendet.`, ephemeral: true }); return true;
+    }
+    if (action === 'mmanualban') {
+      const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
+      const id = interaction.fields.getTextInputValue('steamId').trim(); if (!validSteamId(id)) throw new Error('Ungültige SteamID64');
+      const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel ban'; await banManagedPlayer(bot, id, reason);
+      await interaction.reply({ content: `${id} wurde gebannt.`, ephemeral: true }); return true;
+    }
+  } catch (error) {
+    const payload = { content: `Aktion fehlgeschlagen: ${cut(error.message || error, 300)}`, ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {}); else await interaction.reply(payload).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function handleInteraction(interaction, client, state) {
+  if (await handleButton(interaction, client, state)) return;
+  if (await handleSelect(interaction)) return;
+  await handleModal(interaction);
 }
 
 async function stopOne(id, keepRuntime = true) {
   const active = instances.get(id);
   if (active) {
     clearInterval(active.timer);
+    clearTimeout(active.state?.panelRepostTimer);
+    try { await deleteStoredControlPanel(getManagedBot(id) || { id }, active.client, active.state); } catch {}
     try { active.client.destroy(); } catch {}
     instances.delete(id);
   }
-  if (keepRuntime) setRuntime(id, { state: 'stopped', botTag: null, players: null });
+  if (keepRuntime) setRuntime(id, { state: 'stopped', botTag: null, players: null, controlPanelMessageId: null });
   else runtime.delete(id);
 }
 
@@ -268,16 +832,24 @@ async function startOne(bot) {
   parseManagedRules(bot.rulesText || '');
   if (!bot.botTokenEnc) throw new Error('Discord Bot Token fehlt');
   if (!bot.alertChannelId) throw new Error('Discord Alert-Channel ID fehlt');
+  if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord Management-Panel Channel ID fehlt oder ist ungültig');
   const token = decryptSecret(bot.botTokenEnc);
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-  const state = { initialized: false, seen: new Set() };
-  client.on('interactionCreate', (interaction) => handleButton(interaction).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+  const state = { initialized: false, seen: new Set(), panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
+  client.on('messageCreate', (message) => {
+    const fresh = getManagedBot(bot.id);
+    if (!fresh?.controlPanelEnabled || !fresh?.enabled || String(message.channelId || '') !== String(fresh.controlPanelChannelId || '')) return;
+    if (state.panelPosting || String(message.id || '') === String(state.panelMessageId || '')) return;
+    scheduleControlPanelBottom(bot.id, client, state);
+  });
   client.on('error', (error) => setRuntime(bot.id, { lastError: error.message }));
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Discord Login Timeout')), 20000);
     client.once('clientReady', () => { clearTimeout(timeout); resolve(); });
     client.login(token).catch((error) => { clearTimeout(timeout); reject(error); });
   });
+  if (!bot.controlPanelEnabled && (bot.controlPanelMessageId || bot.controlPanelMessageChannelId)) await deleteStoredControlPanel(bot, client, state);
   setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
   await pollPlayers(bot, state, client);
   const timer = setInterval(() => pollPlayers(getManagedBot(bot.id) || bot, state, client), Math.max(10, Math.min(300, Number(bot.pollSeconds) || 20)) * 1000);
