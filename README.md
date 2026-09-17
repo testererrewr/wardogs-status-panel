@@ -1,6 +1,12 @@
-# Server Status Hub v3.9.3
+# status-hub.lol v3.9.5
 
 Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic JSON APIs, text rotation, Premium plans, Free Boost, multi-VPS status nodes, managed bot services, donations and approved custom bots.
+
+## v3.9.5
+
+- Public header login now opens Discord OAuth directly on every public page.
+- Enabled status bots automatically reconnect after updates and status-node/container restarts.
+- Disabled or paused bots stay stopped.
 
 ## v3.9.3
 
@@ -8,6 +14,7 @@ Multi-user hosting for Discord status bots with WARDOGS, FiveM, GameDig, generic
 - The branding category must be the top category and visible to `@everyone`.
 - PayPal Sandbox/Live mode, Client ID and Client Secret are configured entirely in Admin -> Settings.
 - PayPal Client Secret is encrypted in the panel database; no PayPal `.env` or SSH setup is required.
+- PayPal Sandbox displays the same Buy now checkout button as Live so purchases can be tested end-to-end.
 - Admins see other users' status/custom bots only in Admin -> All bots. The normal dashboard shows only the admin's own bots.
 - Reaching a status/custom bot limit opens a panel popup instead of a plain white 403 page.
 - Games & FAQ is fully bilingual for DE/EN, including special GameDig setup notes and provider labels.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 cd "$(dirname "$0")"
-echo "=== Server Status Hub Diagnose ==="
+echo "=== status-hub.lol Diagnose ==="
 command -v docker >/dev/null && echo "[OK] Docker" || echo "[FEHLER] Docker fehlt"
 if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "[FEHLER] Compose fehlt"; exit 1; fi
 [[ -f .env ]] && echo "[OK] .env" || echo "[FEHLER] .env fehlt"

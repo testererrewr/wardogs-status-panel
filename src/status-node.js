@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { syncBots, shutdownBots, runtimeSnapshot, runningBotCount } from './bot-manager.js';
 
-const version = '3.8.0';
+const version = '3.9.5';
 const controlUrl = String(process.env.CONTROL_PLANE_URL || '').replace(/\/+$/, '');
 const joinSecret = String(process.env.STATUS_NODE_JOIN_SECRET || '');
 const nodeId = String(process.env.STATUS_NODE_ID || os.hostname()).trim().slice(0, 80);
@@ -106,8 +106,23 @@ async function syncWork() {
   await syncBots(servers);
 }
 
+async function restoreBotsAfterStartup() {
+  for (let attempt = 1; attempt <= 6 && !shuttingDown; attempt++) {
+    try {
+      await ensureRegistered();
+      await heartbeat();
+      await syncWork();
+      console.log(`[status-node] Startup restore complete: ${runningBotCount()} bot(s) running`);
+      return;
+    } catch (error) {
+      await handleApiError(error);
+      if (attempt < 6) await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+}
+
 async function loop() {
-  try { await ensureRegistered(); await heartbeat(); } catch (error) { await handleApiError(error); }
+  await restoreBotsAfterStartup();
   const heartbeatTimer = setInterval(() => { heartbeat().catch((e) => console.error(e)); }, Math.max(5, Math.floor(syncSeconds / 2)) * 1000);
   heartbeatTimer.unref?.();
   while (!shuttingDown) {
@@ -129,5 +144,5 @@ async function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-console.log(`Server Status Hub Node ${version} · ${nodeName} · Kapazität ${capacity}`);
+console.log(`status-hub.lol Node ${version} · ${nodeName} · Kapazität ${capacity}`);
 loop().catch((e) => { console.error(e); process.exit(1); });

@@ -37,3 +37,4 @@ if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else C
 "${COMPOSE[@]}" up -d --build --remove-orphans
 "${COMPOSE[@]}" ps
 echo "==> Update complete"
+echo "==> Enabled status bots restore automatically when the status node reconnects"

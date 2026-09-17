@@ -2,7 +2,7 @@
 set -euo pipefail
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then echo "Run as root: bash ./setup-vps.sh"; exit 1; fi
 cd "$(dirname "$0")"
-echo "=== Server Status Hub - Debian VPS Setup ==="
+echo "=== status-hub.lol - Debian VPS Setup ==="
 if ! command -v git >/dev/null 2>&1; then apt-get update && apt-get install -y git; fi
 if ! command -v docker >/dev/null 2>&1; then
   apt-get update
