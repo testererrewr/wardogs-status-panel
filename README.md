@@ -150,3 +150,8 @@ Discord OAuth can be changed in **Admin -> Settings**. Existing `.env` credentia
 ## Stripe
 
 Stripe can be configured completely in **Admin → Settings**. The panel supports Test/Live secret keys, automatic webhook setup, one-time Premium purchases, monthly subscriptions, automatic entitlement updates, and cancellation from **Your Account**. Stripe credentials and webhook secrets are encrypted in the panel database.
+
+
+## v3.11.1
+
+Sticky footer, clearer Free account expiry display and improved PayPal subscription setup status.
