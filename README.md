@@ -1,4 +1,12 @@
-# status-hub.lol v3.12.21
+# status-hub.lol v3.12.27
+
+## v3.12.27 – WARDOGS request-body transport fix
+
+- Fixed HTTP 501 `The request could not be parsed.` on WARDOGS actions that send a body.
+- Hardened HTTP transport now sends an explicit byte-accurate `Content-Length` instead of implicit `Transfer-Encoding: chunked`.
+- This central fix covers welcome/manual/faction whispers, broadcast, lighting, map/settings actions, bans, faction moves and config writes.
+- Added regression tests that emulate a WARDOGS-like listener rejecting chunked JSON/text bodies.
+
 
 ## v3.12.21 – Save/Origin fix & management cleanup
 

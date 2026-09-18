@@ -82,6 +82,25 @@ export async function safeHttpText(rawUrl, { allowPrivate = false, method = 'GET
   const requestMethod = String(method || 'GET').toUpperCase();
   const canRetry = requestMethod === 'GET' || requestMethod === 'HEAD';
 
+  // Node's http.request() automatically falls back to
+  // `Transfer-Encoding: chunked` when req.write() is used without a known
+  // Content-Length. The WARDOGS/Unreal HTTP listener does not reliably parse
+  // chunked request bodies and answers those mutations with HTTP 501
+  // ("The request could not be parsed."). Frame every known body explicitly
+  // with its byte length instead. This applies to both JSON actions (whisper,
+  // lighting, map/settings, …) and text/plain config writes.
+  const requestBody = body === undefined || body === null
+    ? null
+    : Buffer.isBuffer(body)
+      ? body
+      : body instanceof Uint8Array
+        ? Buffer.from(body)
+        : Buffer.from(String(body), 'utf8');
+  const headerNames = new Set(Object.keys(requestHeaders).map((name) => name.toLowerCase()));
+  if (requestBody !== null && !headerNames.has('content-length') && !headerNames.has('transfer-encoding')) {
+    requestHeaders['Content-Length'] = String(requestBody.byteLength);
+  }
+
   async function once() {
     return await new Promise((resolve, reject) => {
       let settled = false;
@@ -129,7 +148,7 @@ export async function safeHttpText(rawUrl, { allowPrivate = false, method = 'GET
       });
       req.setTimeout(timeoutMs, () => req.destroy(Object.assign(new Error('HTTP request timed out'), { code: 'ETIMEDOUT' })));
       req.on('error', finishReject);
-      if (body !== undefined && body !== null) req.write(body);
+      if (requestBody !== null) req.write(requestBody);
       req.end();
     });
   }
