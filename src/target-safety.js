@@ -79,49 +79,67 @@ export async function safeHttpText(rawUrl, { allowPrivate = false, method = 'GET
   const { url, addresses } = await resolveSafeUrl(rawUrl, { allowPrivate });
   const transport = url.protocol === 'https:' ? https : http;
   const requestHeaders = { 'Accept-Encoding': 'identity', ...headers };
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    const finishReject = (error) => { if (!settled) { settled = true; reject(error); } };
-    const req = transport.request({
-      protocol: url.protocol,
-      hostname: url.hostname,
-      port: url.port || undefined,
-      path: `${url.pathname}${url.search}`,
-      method,
-      headers: requestHeaders,
-      lookup: pinnedLookup(addresses),
-      autoSelectFamily: true,
-      servername: url.hostname
-    }, (res) => {
-      const chunks = [];
-      let total = 0;
-      res.on('data', (chunk) => {
-        if (settled) return;
-        total += chunk.length;
-        if (total > maxBytes) {
-          settled = true;
-          req.destroy();
-          res.destroy();
-          reject(new Error(`HTTP Antwort ist größer als ${Math.ceil(maxBytes / 1024)} KB`));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      res.on('end', () => {
-        if (settled) return;
-        settled = true;
-        resolve({
-          status: Number(res.statusCode || 0),
-          ok: Number(res.statusCode || 0) >= 200 && Number(res.statusCode || 0) < 300,
-          headers: res.headers,
-          text: Buffer.concat(chunks).toString('utf8')
+  const requestMethod = String(method || 'GET').toUpperCase();
+  const canRetry = requestMethod === 'GET' || requestMethod === 'HEAD';
+
+  async function once() {
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const finishReject = (error) => { if (!settled) { settled = true; reject(error); } };
+      const req = transport.request({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: requestMethod,
+        headers: requestHeaders,
+        lookup: pinnedLookup(addresses),
+        // Polling endpoints do not benefit from a pooled keep-alive socket. A
+        // fresh socket avoids reusing a peer-closed connection, which surfaced
+        // as intermittent `socket hang up`/ECONNRESET after the hardened HTTP
+        // transport was introduced.
+        agent: false,
+        servername: url.hostname
+      }, (res) => {
+        const chunks = [];
+        let total = 0;
+        res.on('data', (chunk) => {
+          if (settled) return;
+          total += chunk.length;
+          if (total > maxBytes) {
+            settled = true;
+            req.destroy();
+            res.destroy();
+            reject(new Error(`HTTP Antwort ist größer als ${Math.ceil(maxBytes / 1024)} KB`));
+            return;
+          }
+          chunks.push(chunk);
         });
+        res.on('end', () => {
+          if (settled) return;
+          settled = true;
+          resolve({
+            status: Number(res.statusCode || 0),
+            ok: Number(res.statusCode || 0) >= 200 && Number(res.statusCode || 0) < 300,
+            headers: res.headers,
+            text: Buffer.concat(chunks).toString('utf8')
+          });
+        });
+        res.on('error', finishReject);
       });
-      res.on('error', finishReject);
+      req.setTimeout(timeoutMs, () => req.destroy(Object.assign(new Error('HTTP request timed out'), { code: 'ETIMEDOUT' })));
+      req.on('error', finishReject);
+      if (body !== undefined && body !== null) req.write(body);
+      req.end();
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('HTTP request timed out')));
-    req.on('error', finishReject);
-    if (body !== undefined && body !== null) req.write(body);
-    req.end();
-  });
+  }
+
+  try {
+    return await once();
+  } catch (error) {
+    const code = String(error?.code || '').toUpperCase();
+    const transientReset = ['ECONNRESET', 'EPIPE'].includes(code) || /socket hang up/i.test(String(error?.message || ''));
+    if (!canRetry || !transientReset) throw error;
+    return await once();
+  }
 }

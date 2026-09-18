@@ -57,9 +57,16 @@ services:
       context: .
       dockerfile: Dockerfile.runner
     restart: unless-stopped
+    # The panel writes custom-bot sources as uid/gid 1000 with owner-only files.
+    # Run the runner with the same uid so cap_drop: ALL does not block access to
+    # /workspace. Docker-socket access is granted only through its host group.
+    user: "1000:1000"
+    group_add:
+      - "${DOCKER_GID:-0}"
     environment:
       RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET}
       RUNNER_PORT: 4000
+      HOME: /tmp/runner-home
     expose:
       - "4000"
     volumes:
@@ -68,7 +75,6 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,size=64m
-      - /root/.docker:rw,noexec,nosuid,size=16m
     security_opt:
       - no-new-privileges:true
     cap_drop:

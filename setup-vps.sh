@@ -49,6 +49,7 @@ SESSION_SECRET=$(openssl rand -hex 48)
 APP_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr -d '\n')
 RUNNER_SHARED_SECRET=$(openssl rand -hex 48)
 STATUS_NODE_JOIN_SECRET=$(openssl rand -hex 48)
+if [[ -S /var/run/docker.sock ]]; then DOCKER_GID=$(stat -c '%g' /var/run/docker.sock); else DOCKER_GID=0; fi
 cat > .env <<ENVEOF
 PUBLIC_URL=${PUBLIC_URL}
 PORT=3000
@@ -57,6 +58,7 @@ SESSION_SECRET=${SESSION_SECRET}
 APP_ENCRYPTION_KEY=${APP_ENCRYPTION_KEY}
 RUNNER_SHARED_SECRET=${RUNNER_SHARED_SECRET}
 RUNNER_URL=http://runner:4000
+DOCKER_GID=${DOCKER_GID}
 STATUS_NODE_JOIN_SECRET=${STATUS_NODE_JOIN_SECRET}
 LOCAL_STATUS_NODE_ID=local-main
 LOCAL_STATUS_NODE_NAME=Main VPS

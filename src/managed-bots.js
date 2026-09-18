@@ -95,12 +95,6 @@ function playerFaction(player) {
   if (raw && typeof raw === 'object') return String(raw.name ?? raw.label ?? raw.id ?? '').trim();
   return String(raw ?? '').trim();
 }
-function playerHasFaction(player) {
-  const faction = playerFaction(player);
-  if (!faction) return false;
-  return !['none', 'null', 'undefined', 'unassigned', 'no faction', 'no team'].includes(faction.toLowerCase());
-}
-
 export function renderManagedWelcomeMessage(template, player) {
   const steamId = playerSteamId(player);
   const values = {
@@ -143,7 +137,11 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
   const targets = [];
   for (const steamId of [...state.welcomePending]) {
     const player = bySteamId.get(steamId);
-    if (!player || !playerHasFaction(player) || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
+    // A join welcome belongs to the join event itself. Do not wait for faction/team
+    // assignment: some WARDOGS builds keep faction empty/unassigned for valid players,
+    // which previously left the welcome queued forever. Player readiness is handled by
+    // the whisper endpoint/retry path below instead.
+    if (!player || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
     if (Number(state.welcomeAttempts.get(steamId) || 0) >= WELCOME_MAX_ATTEMPTS) continue;
     targets.push({ ...player, steamId });
   }
@@ -181,9 +179,9 @@ export function createManagedJoinTracker() {
   return { initialized: false, active: new Set(), missing: new Map() };
 }
 
-// Polling APIs can briefly return incomplete/empty player lists. A player is only
-// considered to have left after several consecutive successful snapshots miss them.
-// That prevents the same live session from being screened and alerted repeatedly.
+// Polling APIs can briefly return incomplete/empty player lists. The caller chooses
+// how many consecutive successful missing snapshots confirm a leave: risk screening
+// uses a conservative threshold, while welcome joins intentionally use one snapshot.
 export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
   const state = tracker || createManagedJoinTracker();
   if (!(state.active instanceof Set)) state.active = new Set();
@@ -207,7 +205,7 @@ export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
     state.missing.delete(id);
   }
 
-  const threshold = Math.max(2, Math.min(10, Number(missingThreshold) || 3));
+  const threshold = Math.max(1, Math.min(10, Number(missingThreshold) || 3));
   for (const id of [...state.active]) {
     if (current.has(id)) continue;
     const misses = Number(state.missing.get(id) || 0) + 1;
@@ -596,9 +594,10 @@ async function pollManagedWelcome(bot, state) {
     const players = Array.isArray(data?.players) ? data.players : [];
     if (!state.welcomeJoinTracker) state.welcomeJoinTracker = createManagedJoinTracker();
     // Welcome detection is intentionally separate from risk/detection joins. It polls
-    // faster so a real leave + rejoin does not have to wait for three normal 20s
-    // detection snapshots before it can receive the next welcome.
-    const joined = managedJoinCandidates(state.welcomeJoinTracker, players, 2);
+    // faster and treats one successful missing snapshot as a leave, so every observable
+    // leave + rejoin creates a fresh welcome session. Detection/risk screening keeps its
+    // more conservative three-snapshot threshold.
+    const joined = managedJoinCandidates(state.welcomeJoinTracker, players, 1);
     managedWelcomeTargets(state, players, joined);
     await processManagedWelcomeQueue(bot, state, players);
   } catch (error) {

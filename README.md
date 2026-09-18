@@ -60,6 +60,7 @@
 
 - Fixed the join welcome whisper being marked as completed before WARDOGS actually accepted the whisper.
 - A welcome is now considered delivered only after a successful `POST /v1/players/{steamId}/message` response.
+- Welcome whispers are sent privately on every observable join session, including returning players; faction/team assignment is no longer required before the first send attempt.
 - Spawn/player-readiness HTTP errors are retried up to four times on later polls for the same join session; successful delivery is still exactly once per join.
 - Authentication, unsupported-route and ambiguous transport failures are not blindly retried, preventing duplicate whispers.
 - Faction detection now also tolerates object-shaped faction data while keeping unassigned/no-team states pending.

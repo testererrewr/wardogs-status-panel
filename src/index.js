@@ -982,7 +982,7 @@ function managedBotForm(req, service, bot) {
     <label class="check span2"><input type="checkbox" name="announcementEnabled" value="1" ${bot.announcementEnabled===true?'checked':''}> <strong>${tr(lang,'Automatische Server-Announcements aktivieren','Enable scheduled server announcements')}</strong></label>
     <label>${tr(lang,'Announcement-Intervall','Announcement interval')}<input name="announcementIntervalMinutes" type="number" min="1" max="1440" value="${esc(bot.announcementIntervalMinutes||15)}"><span class="muted small">1–1440 min</span></label>
     <label class="span2">${tr(lang,'Automatische Announcements','Scheduled announcements')}<textarea name="announcementMessages" rows="5" maxlength="10050" placeholder="Welcome to our server!&#10;Read the rules in Discord.&#10;Have fun!">${esc(bot.announcementMessages||'')}</textarea><span class="muted small">${tr(lang,'Eine Nachricht pro Zeile, maximal 200 Zeichen. Die Nachrichten rotieren automatisch.','One message per line, maximum 200 characters. Messages rotate automatically.')}</span></label>
-    <label class="check span2"><input type="checkbox" name="welcomeWhisperEnabled" value="1" ${bot.welcomeWhisperEnabled===true?'checked':''}> <strong>${tr(lang,'Join-Welcome-Whisper aktivieren','Enable join welcome whisper')}</strong></label>
+    <label class="check span2"><input type="checkbox" name="welcomeWhisperEnabled" value="1" ${bot.welcomeWhisperEnabled===true?'checked':''}> <strong>${tr(lang,'Welcome-Whisper bei jedem Join aktivieren','Enable welcome whisper on every join')}</strong></label>
     <label class="span2">${tr(lang,'Welcome-Whisper','Welcome whisper')}<textarea name="welcomeWhisperMessage" rows="3" maxlength="200" placeholder="Hello {player}, welcome to the server! Join our Discord: discord.gg/example">${esc(bot.welcomeWhisperMessage||'Hello {player}, welcome to the server! Join our Discord.')}</textarea><span class="muted small">${tr(lang,'Variablen: {player}, {steamid}, {faction}','Variables: {player}, {steamid}, {faction}')}</span></label>
     ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
     <div class="span2 managed-config-block"><strong>${tr(lang,'Ban-Nachrichten','Ban messages')}</strong><label>${tr(lang,'Discord Server / Invite-Link','Discord server / invite link')}<input name="banDiscordLink" maxlength="120" value="${esc(bot.banDiscordLink||'')}" placeholder="https://discord.gg/example"></label></div>
@@ -2415,7 +2415,10 @@ const httpServer = app.listen(port, async () => {
   setInterval(() => { refreshDueFreeBoosts().then(()=>rebalanceAssignments()).catch(()=>{}); }, 15 * 60_000).unref();
 });
 httpServer.headersTimeout = 15_000;
-httpServer.requestTimeout = 30_000;
+// ZIP uploads are capped by Multer (25 MB by default), but the complete request
+// can legitimately take longer than 30 seconds on slower uplinks. Keep the
+// strict header timeout while allowing enough time for a bounded upload body.
+httpServer.requestTimeout = 5 * 60_000;
 httpServer.keepAliveTimeout = 5_000;
 httpServer.maxRequestsPerSocket = 1000;
 httpServer.maxHeadersCount = 100;

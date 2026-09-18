@@ -16,6 +16,12 @@ if [[ -f compose.override.yaml ]] && grep -q "wardogs-panel" compose.override.ya
 chmod 600 .env
 if ! grep -q '^RUNNER_SHARED_SECRET=' .env; then echo "RUNNER_SHARED_SECRET=$(openssl rand -hex 48)" >> .env; fi
 if ! grep -q '^RUNNER_URL=' .env; then echo 'RUNNER_URL=http://runner:4000' >> .env; fi
+if [[ -S /var/run/docker.sock ]]; then
+  DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+else
+  DOCKER_GID=0
+fi
+if grep -q '^DOCKER_GID=' .env; then sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" .env; else echo "DOCKER_GID=${DOCKER_GID}" >> .env; fi
 if ! grep -q '^ALLOW_PUBLIC_REGISTRATION=' .env; then echo 'ALLOW_PUBLIC_REGISTRATION=true' >> .env; fi
 if grep -q '^CUSTOM_UPLOAD_MAX_MB=5$' .env; then sed -i 's/^CUSTOM_UPLOAD_MAX_MB=5$/CUSTOM_UPLOAD_MAX_MB=25/' .env; elif ! grep -q '^CUSTOM_UPLOAD_MAX_MB=' .env; then echo 'CUSTOM_UPLOAD_MAX_MB=25' >> .env; fi
 if ! grep -q '^PANEL_BIND=' .env; then echo 'PANEL_BIND=0.0.0.0:3000' >> .env; fi

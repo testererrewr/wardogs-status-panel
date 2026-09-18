@@ -89,7 +89,14 @@ async function recentLogs(container) {
 
 async function build(id, image) {
   const dir = path.join(root, id);
-  if (!fs.existsSync(path.join(dir, 'Dockerfile.generated'))) throw new Error('upload files missing');
+  const dockerfile = path.join(dir, 'Dockerfile.generated');
+  try {
+    fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK);
+    fs.accessSync(dockerfile, fs.constants.R_OK);
+  } catch (error) {
+    if (error?.code === 'EACCES') throw new Error('upload files inaccessible (runner permissions)');
+    throw new Error('upload files missing');
+  }
   await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
 }
 async function startFresh(id, envObj) {

@@ -18,8 +18,8 @@ function envFor(bot) {
   const raw = decryptSecret(bot.envEnc);
   try { return JSON.parse(raw); } catch { throw new Error('Custom-Bot ENV konnte nicht entschlüsselt werden'); }
 }
-export function ensureCustomBot(bot) { return call('/ensure', { id: bot.id, env: envFor(bot) }, 190000); }
-export function restartCustomBot(bot) { return call('/restart', { id: bot.id, env: envFor(bot) }, 190000); }
+export function ensureCustomBot(bot) { return call('/ensure', { id: bot.id, env: envFor(bot) }, 300000); }
+export function restartCustomBot(bot) { return call('/restart', { id: bot.id, env: envFor(bot) }, 300000); }
 export function stopCustomBot(bot) { return call('/stop', { id: bot.id }, 30000); }
 export function deleteCustomBotRuntime(bot) { return call('/delete', { id: bot.id }, 45000); }
 export function customBotStatus(bot) { return call('/status', { id: bot.id }, 7000); }
