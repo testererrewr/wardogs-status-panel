@@ -1,9 +1,22 @@
-# status-hub.lol v3.12.37
+# status-hub.lol v3.12.38
 
 
 
 
 
+
+
+## v3.12.38 – WARDOGS Status Bot: Playtime + Multi-Server Killfeed + globale Kill-Stats
+
+- Der bisher sichtbare **WARDOGS Playtime Tracker** heißt jetzt konsequent **WARDOGS Status Bot**. Bestehende Standardnamen werden bei der Datenbankmigration automatisch umbenannt.
+- Der WARDOGS Status Bot behält seine Multi-Server-Playtime-Funktionen und bekommt die Killfeed-/Stats-Funktionen direkt in dieselbe Bot-Service-Instanz.
+- In den Bot-Einstellungen hat **jeder eingetragene WARDOGS Server** eine eigene Discord Killfeed Channel ID und einen eigenen `Kill Feed konfigurieren`-Button.
+- Pro Gameserver bleibt genau **eine feste Discord-Killfeed-Nachricht** bestehen; sie wird in-place aktualisiert und zeigt die letzten **15 Kills dieses Servers**.
+- Kill-Statistiken werden innerhalb der Bot-Instanz **global über alle eingebundenen WARDOGS Server** per Steam64ID zusammengezählt.
+- Discord-Killfeed-Panels haben `Search player` und `Top kills`; die Suche arbeitet global nach Name, Alias oder Steam64ID, auch für offline Spieler.
+- Das Webpanel zeigt globale Kill-Top-25 und Spielersuche sowie pro Server einen Moderations-Killfeed mit den letzten **150 Events**, Distanz, Ursache/Waffe, Map und Kill-Tags.
+- Server-Feed-Tokens, Event-Verlauf und Discord-Message-IDs werden pro Server gespeichert. Ein Bot-Neustart erzeugt daher keine neuen Killfeed-Nachrichten.
+- Bestehende v3.12.37 Playtime-Tracker-Konfigurationen werden auf Schema 37 migriert; passende bereits vorhandene WARDOGS-Feed-Daten können übernommen werden.
 
 ## v3.12.37 – WARDOGS Status Bot: Status + per-server Killfeed + globale Stats
 

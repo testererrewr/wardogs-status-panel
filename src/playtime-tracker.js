@@ -1,8 +1,9 @@
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
+import { killStatsSnapshotFromStats, searchKillStatsSnapshot, prettyCause } from './kill-stats.js';
 
 export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
 const instances = new Map();
@@ -49,12 +50,18 @@ export function playtimeTrackerServers(bot) {
     id: String(row?.id || `server-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64) || `server-${index + 1}`,
     label: String(row?.label || `Server ${index + 1}`).trim().slice(0, 80) || `Server ${index + 1}`,
     baseUrl: baseUrl(row?.baseUrl || row?.wardogsBaseUrl || ''),
-    secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || '')
+    secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || ''),
+    killFeedChannelId: /^\d{17,20}$/.test(String(row?.killFeedChannelId || '')) ? String(row.killFeedChannelId) : '',
+    killFeedMessageId: /^\d{17,20}$/.test(String(row?.killFeedMessageId || '')) ? String(row.killFeedMessageId) : '',
+    killFeedTokenEnc: String(row?.killFeedTokenEnc || ''), killFeedConfiguredAt: row?.killFeedConfiguredAt || null,
+    killFeedPublicUrl: String(row?.killFeedPublicUrl || ''), killFeedNeedsGameRestart: row?.killFeedNeedsGameRestart === true,
+    killFeedLastEventAt: row?.killFeedLastEventAt || null, killFeedLastPublishedAt: row?.killFeedLastPublishedAt || null,
+    killFeedEvents: Array.isArray(row?.killFeedEvents) ? row.killFeedEvents.slice(-150) : []
   })).filter((row) => row.baseUrl);
   if (normalized.length) return normalized.slice(0, 12);
   const legacyUrl = baseUrl(bot?.wardogsBaseUrl);
   if (!legacyUrl) return [];
-  return [{ id: 'primary', label: String(bot?.serverLabel || bot?.name || 'Server 1').trim().slice(0, 80) || 'Server 1', baseUrl: legacyUrl, secretEnc: String(bot?.wardogsSecretEnc || '') }];
+  return [{ id: 'primary', label: String(bot?.serverLabel || bot?.name || 'Server 1').trim().slice(0, 80) || 'Server 1', baseUrl: legacyUrl, secretEnc: String(bot?.wardogsSecretEnc || ''), killFeedChannelId:'', killFeedMessageId:'', killFeedTokenEnc:'', killFeedConfiguredAt:null, killFeedPublicUrl:'', killFeedNeedsGameRestart:false, killFeedLastEventAt:null, killFeedLastPublishedAt:null, killFeedEvents:[] }];
 }
 
 async function wardogsRequest(bot, server, pathname) {
@@ -215,7 +222,7 @@ function snapshotFromStats(stats, servers, onlineByServer = new Map()) {
 function signature(bot) {
   return JSON.stringify({
     enabled: Boolean(bot.enabled), botTokenEnc: bot.botTokenEnc || '', leaderboardChannelId: bot.leaderboardChannelId || '',
-    playtimeServers: playtimeTrackerServers(bot).map((s) => ({ id: s.id, label: s.label, baseUrl: s.baseUrl, secretEnc: s.secretEnc })),
+    playtimeServers: playtimeTrackerServers(bot).map((s) => ({ id: s.id, label: s.label, baseUrl: s.baseUrl, secretEnc: s.secretEnc, killFeedChannelId: s.killFeedChannelId || '' })),
     allowPrivateTarget: Boolean(bot.allowPrivateTarget), pollSeconds: Number(bot.pollSeconds || 30), statsTimezone: timeZone(bot),
     accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
@@ -234,7 +241,7 @@ async function buildLeaderboardPayload(bot, state) {
   const snapshot = snapshotFromStats(state.stats, servers, state.onlineByServer || new Map());
   const lines = snapshot.top25.length ? snapshot.top25.map((p, index) => `**${index + 1}.** ${String(p.name).slice(0, 45)} — **${formatDuration(p.totalSeconds)}**`).join('\n') : 'No tracked players yet.';
   const embed = new EmbedBuilder()
-    .setTitle('WARDOGS Playtime · Top 25')
+    .setTitle('WARDOGS Status Bot · Playtime Top 25')
     .setDescription(lines.slice(0, 3900))
     .addFields(
       { name: 'Total tracked playtime', value: formatDuration(snapshot.totalSeconds), inline: true },
@@ -242,7 +249,7 @@ async function buildLeaderboardPayload(bot, state) {
       { name: 'Online now', value: String(snapshot.onlinePlayers), inline: true },
       { name: 'Tracked servers', value: String(servers.length), inline: true }
     )
-    .setFooter({ text: 'status-hub.lol · updates every 6 hours' })
+    .setFooter({ text: 'WARDOGS Status Bot · status-hub.lol · updates every 6 hours' })
     .setTimestamp(new Date());
   return { embeds: [embed], allowedMentions: { parse: [] } };
 }
@@ -264,6 +271,95 @@ async function publishLeaderboard(bot, state) {
   state.leaderboardMessageId = message.id;
   upsertManagedBot({ id: bot.id, leaderboardMessageId: message.id, lastLeaderboardAt: at });
   return { ok: true, messageId: message.id, at };
+}
+
+function killFlagText(event) {
+  return [event?.headshot ? '🎯' : '', event?.penetration ? '🧱' : '', event?.ricochet ? '↪' : '', event?.melee ? '🔪' : '', event?.roadKill ? '🚙' : '', event?.vehicleExplosion ? '💥' : ''].filter(Boolean).join('');
+}
+function killFeedLine(event) {
+  const killer = event?.suicide ? '☠️ Suicide' : event?.killerSteamId ? String(event.killerName || event.killerSteamId).slice(0, 28) : '🌍 Environment';
+  const victim = String(event?.victimName || event?.victimSteamId || 'Unknown').slice(0, 28);
+  const cause = prettyCause(event?.cause).slice(0, 24);
+  const distance = Number(event?.distanceMeters || 0) > 0 ? ` · ${Number(event.distanceMeters).toFixed(Number(event.distanceMeters) >= 100 ? 0 : 1)}m` : '';
+  const flags = killFlagText(event);
+  return `${killer} → **${victim}** · ${cause || 'Unknown'}${distance}${flags ? ` · ${flags}` : ''}`;
+}
+function killStatsPlayerEmbed(player) {
+  const causes = (player?.topCauses || Object.entries(player?.causes || {}).sort((a,b)=>b[1]-a[1]).slice(0,5)).map(([cause,count]) => `${prettyCause(cause)}: ${count}`).join('\n') || '—';
+  return new EmbedBuilder().setTitle(`Player stats · ${String(player?.name || player?.steamId || 'Unknown').slice(0, 120)}`)
+    .setDescription(`SteamID: \`${player?.steamId || '—'}\``)
+    .addFields(
+      { name: 'Kills', value: String(player?.kills || 0), inline: true }, { name: 'Deaths', value: String(player?.deaths || 0), inline: true },
+      { name: 'K/D', value: Number(player?.kd || 0).toFixed(2), inline: true }, { name: 'Headshots', value: String(player?.headshots || 0), inline: true },
+      { name: 'Longest kill', value: `${Number(player?.longestKillMeters || 0).toFixed(1)} m`, inline: true }, { name: 'Suicides', value: String(player?.suicides || 0), inline: true },
+      { name: 'Top kill causes', value: causes.slice(0, 1024), inline: false }
+    ).setFooter({ text: 'WARDOGS Status Bot · global stats across all tracked servers' }).setTimestamp(new Date(player?.lastSeenAt || Date.now()));
+}
+function killfeedPayload(bot, server) {
+  const snapshot = killStatsSnapshotFromStats(bot?.killStats);
+  const recent = (Array.isArray(server?.killFeedEvents) ? server.killFeedEvents : []).slice(-15).reverse();
+  const lines = recent.length ? recent.map(killFeedLine).join('\n') : 'No kills tracked yet. Configure the WARDOGS Server Feed and restart this game server once.';
+  const embed = new EmbedBuilder().setTitle(`WARDOGS · ${String(server?.label || 'Server').slice(0, 80)} · Live Killfeed`).setDescription(lines.slice(0, 4000))
+    .addFields(
+      { name: 'Server events', value: String((Array.isArray(server?.killFeedEvents) ? server.killFeedEvents : []).length), inline: true },
+      { name: 'Global tracked players', value: String(snapshot.players.length), inline: true },
+      { name: 'Global #1', value: snapshot.top25[0] ? `${String(snapshot.top25[0].name).slice(0, 35)} · ${snapshot.top25[0].kills} kills` : '—', inline: true }
+    ).setFooter({ text: 'Fixed message · latest 15 kills on this server · global player stats' }).setTimestamp(new Date());
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Search player').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`wdstatus:top:${bot.id}`).setLabel('Top kills').setStyle(ButtonStyle.Secondary)
+  );
+  return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
+}
+function killStatsSearchModal(botId) {
+  return new ModalBuilder().setCustomId(`wdstatus:searchmodal:${botId}`).setTitle('Search global player stats').addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('query').setLabel('Player name, alias or SteamID64').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100))
+  );
+}
+async function handleStatusInteraction(botId, interaction) {
+  const bot = getManagedBot(botId); if (!bot) return;
+  const id = String(interaction.customId || '');
+  if (id === `wdstatus:search:${botId}` && interaction.isButton()) return interaction.showModal(killStatsSearchModal(botId));
+  if (id === `wdstatus:top:${botId}` && interaction.isButton()) {
+    const top = killStatsSnapshotFromStats(bot.killStats).top25.slice(0, 10);
+    const text = top.length ? top.map((p,i) => `**${i+1}.** ${String(p.name).slice(0,40)} — **${p.kills}** kills · ${p.deaths} deaths · K/D ${Number(p.kd||0).toFixed(2)}`).join('\n') : 'No kill stats tracked yet.';
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle('Global all-time · Top kills').setDescription(text.slice(0, 3900))], allowedMentions: { parse: [] } });
+  }
+  if (id === `wdstatus:searchmodal:${botId}` && interaction.isModalSubmit()) {
+    const query = interaction.fields.getTextInputValue('query');
+    const matches = searchKillStatsSnapshot(killStatsSnapshotFromStats(bot.killStats), query);
+    if (!matches.length) return interaction.reply({ ephemeral: true, content: `No tracked player found for \`${String(query).slice(0,80)}\`.` });
+    const exact = normalizeSteamId64(query);
+    const player = exact ? matches.find((p) => p.steamId === exact) || matches[0] : matches[0];
+    return interaction.reply({ ephemeral: true, embeds: [killStatsPlayerEmbed(player)], allowedMentions: { parse: [] } });
+  }
+}
+async function publishServerKillfeed(bot, state, server, force = false) {
+  if (!state?.client?.isReady?.() || !validSnowflake(server?.killFeedChannelId)) return { skipped: true };
+  const lastEvent = Date.parse(server.killFeedLastEventAt || '') || 0;
+  const lastPublished = Date.parse(server.killFeedLastPublishedAt || '') || 0;
+  if (!force && server.killFeedMessageId && lastEvent <= lastPublished) return { skipped: true };
+  const channel = await state.client.channels.fetch(String(server.killFeedChannelId));
+  if (!channel?.isTextBased?.() || typeof channel.send !== 'function') throw new Error(`${server.label}: killfeed channel was not found or is not writable`);
+  const payload = killfeedPayload(bot, server);
+  let message = null;
+  if (server.killFeedMessageId) { try { message = await channel.messages.fetch(String(server.killFeedMessageId)); await message.edit(payload); } catch { message = null; } }
+  if (!message) message = await channel.send(payload);
+  const at = nowIso();
+  const fresh = getManagedBot(bot.id) || bot;
+  const nextServers = playtimeTrackerServers(fresh).map((row) => String(row.id) === String(server.id) ? { ...row, killFeedMessageId: message.id, killFeedLastPublishedAt: at } : row);
+  upsertManagedBot({ id: bot.id, playtimeServers: nextServers });
+  return { ok: true, messageId: message.id, at };
+}
+async function publishAllKillfeeds(bot, state, force = false) {
+  const fresh = getManagedBot(bot.id) || bot;
+  const errors = [];
+  for (const server of playtimeTrackerServers(fresh)) {
+    if (!validSnowflake(server.killFeedChannelId)) continue;
+    try { await publishServerKillfeed(fresh, state, server, force); }
+    catch (error) { errors.push(String(error?.message || error).slice(0, 220)); }
+  }
+  setRuntime(bot.id, { lastKillfeedError: errors.length ? errors.join(' · ').slice(0, 500) : null, lastKillfeedCheckAt: nowIso() });
 }
 
 function updateServerStats(bot, server, serverStats, previous, current, lastTick, now) {
@@ -367,6 +463,7 @@ async function stopOne(id, keepRuntime = true) {
   if (active) instances.delete(id);
   if (active) {
     clearInterval(active.timer);
+    if (active.feedTimer) clearInterval(active.feedTimer);
     try { await saveState(id, active.state, true); } catch {}
     try { await active.client?.destroy?.(); } catch {}
   }
@@ -381,12 +478,13 @@ async function startOne(bot) {
   const servers = playtimeTrackerServers(bot);
   if (!servers.length) throw new Error('At least one WARDOGS server is required');
   if (servers.some((server) => !server.secretEnc)) throw new Error('Every tracked WARDOGS server needs an RCON/API password');
-  const wantsDiscord = validSnowflake(bot.leaderboardChannelId);
+  const wantsDiscord = validSnowflake(bot.leaderboardChannelId) || servers.some((server) => validSnowflake(server.killFeedChannelId));
   let token = '';
   if (bot.botTokenEnc) { try { token = decryptSecret(bot.botTokenEnc); } catch {} }
-  if (wantsDiscord && !token) throw new Error('Discord bot token is required when a leaderboard channel is configured');
+  if (wantsDiscord && !token) throw new Error('Discord bot token is required when a leaderboard or killfeed channel is configured');
   const client = wantsDiscord ? new Client({ intents: [GatewayIntentBits.Guilds] }) : null;
   if (client) {
+    client.on('interactionCreate', (interaction) => { if (String(interaction.customId || '').endsWith(`:${bot.id}`)) handleStatusInteraction(bot.id, interaction).catch(() => {}); });
     client.on('shardDisconnect', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now() }));
     client.on('shardError', (error) => setRuntime(bot.id, { state: 'error', lastError: String(error?.message || error).slice(0, 300), needsRecovery: true, disconnectedAt: Date.now() }));
     client.on('invalidated', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now() }));
@@ -413,13 +511,20 @@ async function startOne(bot) {
     if (!fresh.enabled || !accessActive(fresh)) { if (client) await client.destroy(); setRuntime(bot.id, { state: accessActive(fresh) ? 'stopped' : 'access-expired' }); return; }
     setRuntime(bot.id, { state: client ? 'connected' : 'online', botTag: client?.user?.tag || null, botId: client?.user?.id || null, lastError: null, trackedServers: servers.length });
     await pollOne(fresh, state);
+    if (client) await publishAllKillfeeds(fresh, state, true);
     const timer = setInterval(() => {
       const latest = getManagedBot(bot.id);
       if (!latest?.enabled || !accessActive(latest)) return;
       pollOne(latest, state).catch(() => {});
     }, Math.max(10, Math.min(300, Number(fresh.pollSeconds) || 30)) * 1000);
     timer.unref?.();
-    instances.set(bot.id, { client, timer, signature: signature(fresh), state });
+    const feedTimer = client ? setInterval(() => {
+      const latest = getManagedBot(bot.id);
+      if (!latest?.enabled || !accessActive(latest)) return;
+      publishAllKillfeeds(latest, state, false).catch(() => {});
+    }, 5000) : null;
+    feedTimer?.unref?.();
+    instances.set(bot.id, { client, timer, feedTimer, signature: signature(fresh), state });
     clearRecovery(bot.id);
   } catch (error) {
     try { await client?.destroy?.(); } catch {}
@@ -490,7 +595,7 @@ export async function testPlaytimeWardogs(bot) {
 }
 export async function refreshPlaytimeTracker(bot, { publish = false } = {}) {
   const active = instances.get(bot.id);
-  if (!active) throw new Error('Playtime tracker is not running');
+  if (!active) throw new Error('WARDOGS Status Bot is not running');
   await pollOne(getManagedBot(bot.id) || bot, active.state, { forceLeaderboard: publish });
   if (publish && !validSnowflake((getManagedBot(bot.id) || bot).leaderboardChannelId)) throw new Error('Discord leaderboard channel ID is not configured');
   return playtimeTrackerSnapshot(getManagedBot(bot.id) || bot);

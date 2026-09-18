@@ -9,7 +9,8 @@ import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
 
 export const KILL_STATS_SERVICE_ID = 'wardogs-kill-stats';
-const SUPPORTED_FEED_SERVICES = new Set(['wardogs-warning-bot', KILL_STATS_SERVICE_ID]);
+const PLAYTIME_STATUS_SERVICE_ID = 'wardogs-playtime-tracker';
+const SUPPORTED_FEED_SERVICES = new Set(['wardogs-warning-bot', KILL_STATS_SERVICE_ID, PLAYTIME_STATUS_SERVICE_ID]);
 const instances = new Map();
 const runtime = new Map();
 const locks = new Map();
@@ -368,6 +369,14 @@ async function statusWardogsJson(server, pathname) {
   if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);
   return {data,headers:response.headers||{}};
 }
+async function playtimeWardogsJson(bot, server, pathname) {
+  const root=baseUrl(server?.baseUrl); if(!root)throw new Error('WARDOGS base URL is missing');
+  const secret=decryptMaybe(server?.secretEnc); if(!secret)throw new Error('WARDOGS RCON/API password is missing');
+  const response=await safeHttpText(`${root}${pathname}`,{allowPrivate:Boolean(bot?.allowPrivateTarget),headers:{Accept:'application/json',Authorization:`Bearer ${secret}`},timeoutMs:8000,maxBytes:1024*1024});
+  let data={}; if(response.text){try{data=JSON.parse(response.text);}catch{data={message:response.text.slice(0,300)};}}
+  if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);
+  return {data,headers:response.headers||{}};
+}
 export async function testKillStatsWardogs(bot){const [{data:players},{data:capabilities}]=await Promise.all([wardogsJson(bot,'/v1/players'),wardogsJson(bot,'/v1/capabilities').catch(()=>({data:{routes:[]}}))]);return{playerCount:Array.isArray(players?.players)?players.players.length:0,feedConfigSupported:true,routes:Array.isArray(capabilities?.routes)?capabilities.routes:[]};}
 function patchIniKey(lines, sectionName, key, value) {
   let start=-1,end=lines.length;
@@ -406,9 +415,38 @@ export async function configureWardogsStatusKillFeed(server, publicUrl = process
   return{server:fresh,origin,needsGameRestart:true,result};
 }
 
+export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl = process.env.PUBLIC_URL || '') {
+  if(bot?.serviceId!==PLAYTIME_STATUS_SERVICE_ID)throw new Error('WARDOGS Status Bot required');
+  const servers=Array.isArray(bot?.playtimeServers)?bot.playtimeServers:[];
+  const index=servers.findIndex((row)=>String(row?.id||'')===String(serverId||''));
+  if(index<0)throw new Error('Tracked WARDOGS server not found');
+  const server={...servers[index]};
+  const origin=new URL(String(publicUrl||'')).origin;
+  const root=baseUrl(server.baseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
+  const secret=decryptMaybe(server.secretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
+  let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
+  const {data:config}=await playtimeWardogsJson(bot,server,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
+  const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
+  const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(bot?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
+  let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
+  const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true}:row);
+  const fresh=upsertManagedBot({id:bot.id,playtimeServers:next});
+  return{bot:fresh,server:next[index],origin,needsGameRestart:true,result};
+}
+
 function statusServerForFeedToken(token) {
   const servers=(readDb().servers||[]).filter((server)=>server?.gameType==='wardogs'&&server.killFeedTokenEnc);
   for(const server of servers){const candidate=decryptMaybe(server.killFeedTokenEnc);if(candidate&&secureEqual(candidate,token))return server;}
+  return null;
+}
+function playtimeSourceForFeedToken(token) {
+  const bots=(readDb().managedBots||[]).filter((bot)=>bot?.serviceId===PLAYTIME_STATUS_SERVICE_ID);
+  for(const bot of bots){
+    for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){
+      const candidate=decryptMaybe(server?.killFeedTokenEnc);
+      if(candidate&&secureEqual(candidate,token))return {bot,server};
+    }
+  }
   return null;
 }
 function botForFeedToken(token) {
@@ -417,10 +455,14 @@ function botForFeedToken(token) {
   return null;
 }
 function sourceTargetKey(source, kind) {
-  return kind==='status' ? targetKey(source?.queryConfig?.baseUrl) : targetKey(source?.wardogsBaseUrl);
+  if(kind==='status')return targetKey(source?.queryConfig?.baseUrl);
+  if(kind==='playtime')return targetKey(source?.server?.baseUrl);
+  return targetKey(source?.wardogsBaseUrl);
 }
 function sourceSecret(source, kind) {
-  return kind==='status' ? decryptMaybe(source?.querySecretEnc) : decryptMaybe(source?.wardogsSecretEnc);
+  if(kind==='status')return decryptMaybe(source?.querySecretEnc);
+  if(kind==='playtime')return decryptMaybe(source?.server?.secretEnc);
+  return decryptMaybe(source?.wardogsSecretEnc);
 }
 function matchesSourceTarget(source, sourceKind, target, targetKind) {
   const a=sourceTargetKey(source,sourceKind), b=sourceTargetKey(target,targetKind);
@@ -438,6 +480,8 @@ function feedTargets(source, sourceKind) {
   if(sourceKind==='status'){
     const owner=String(source?.ownerDiscordId||'');
     if(owner){seenStatusOwners.add(owner);out.push({kind:'status',item:source});}
+  } else if(sourceKind==='playtime') {
+    out.push({kind:'playtime',item:source.bot,serverId:source.server.id});
   }
   for(const server of (db.servers||[])){
     if(server?.gameType!=='wardogs'||String(server?.id||'')===String(sourceKind==='status'?source?.id:'')||!matchesSourceTarget(source,sourceKind,server,'status'))continue;
@@ -446,8 +490,21 @@ function feedTargets(source, sourceKind) {
     seenStatusOwners.add(owner);out.push({kind:'status',item:server});
   }
   for(const bot of (db.managedBots||[])){
+    if(bot?.serviceId===PLAYTIME_STATUS_SERVICE_ID)continue;
     if(!SUPPORTED_FEED_SERVICES.has(String(bot?.serviceId||''))||!matchesSourceTarget(source,sourceKind,bot,'managed')||!accessActive(bot)||!bot.enabled)continue;
     out.push({kind:'managed',item:bot});
+  }
+  // A multi-server WARDOGS Status Bot may share the same gameserver target with
+  // a classic Status Bot or Management Bot. Feed events must still reach its
+  // global stats and the correct per-server killfeed exactly once.
+  for(const bot of (db.managedBots||[])){
+    if(bot?.serviceId!==PLAYTIME_STATUS_SERVICE_ID||!accessActive(bot)||!bot.enabled)continue;
+    for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){
+      if(sourceKind==='playtime'&&String(source?.bot?.id||'')===String(bot.id)&&String(source?.server?.id||'')===String(server?.id||''))continue;
+      const target={bot,server};
+      if(!matchesSourceTarget(source,sourceKind,target,'playtime'))continue;
+      out.push({kind:'playtime',item:bot,serverId:server.id});
+    }
   }
   return out;
 }
@@ -459,6 +516,19 @@ function updateStatusFeedTarget(server, events) {
   const ids=new Set(existing.map((event)=>`${event.serverId||''}:${event.id||''}`).filter((key)=>!key.endsWith(':')));
   const freshEvents=events.filter((event)=>!event.id||!ids.has(`${event.serverId||''}:${event.id}`));
   upsertServer({id:server.id,killStats:stats,killFeedEvents:[...existing,...freshEvents].slice(-500),killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
+  return changed;
+}
+function updatePlaytimeFeedTarget(bot, serverId, events) {
+  let stats=emptyStats(bot.killStats);let changed=0;
+  for(const event of events){const applied=applyEventToStats(stats,event);stats=applied.stats;if(!applied.duplicate)changed+=1;}
+  const servers=(Array.isArray(bot.playtimeServers)?bot.playtimeServers:[]).map((server)=>{
+    if(String(server?.id||'')!==String(serverId||''))return server;
+    const existing=(Array.isArray(server.killFeedEvents)?server.killFeedEvents:[]).map(normalizeStoredEvent).filter(Boolean);
+    const ids=new Set(existing.map((event)=>event.id).filter(Boolean));
+    const freshEvents=events.filter((event)=>!event.id||!ids.has(event.id));
+    return {...server,killFeedEvents:[...existing,...freshEvents].slice(-150),killFeedLastEventAt:events.length?nowIso():server.killFeedLastEventAt,killFeedNeedsGameRestart:false};
+  });
+  if(changed||events.length){upsertManagedBot({id:bot.id,killStats:stats,playtimeServers:servers,killFeedLastEventAt:events.length?nowIso():bot.killFeedLastEventAt});}
   return changed;
 }
 function updateManagedFeedTarget(bot, events) {
@@ -477,15 +547,20 @@ function updateManagedFeedTarget(bot, events) {
   return 0;
 }
 export async function ingestWardogsKillFeed(token, payload) {
-  const statusSource=statusServerForFeedToken(token); const managedSource=statusSource?null:botForFeedToken(token);
-  const source=statusSource||managedSource; const sourceKind=statusSource?'status':managedSource?'managed':'';
+  const statusSource=statusServerForFeedToken(token);
+  const playtimeSource=statusSource?null:playtimeSourceForFeedToken(token);
+  const managedSource=(statusSource||playtimeSource)?null:botForFeedToken(token);
+  const source=statusSource||playtimeSource||managedSource; const sourceKind=statusSource?'status':playtimeSource?'playtime':managedSource?'managed':'';
   if(!source)throw Object.assign(new Error('Invalid feed token'),{status:401});
-  const enrichedPayload={...payload,serverId:String(statusSource?.id||payload?.serverId||source?.id||''),serverName:String(payload?.serverName||statusSource?.name||source?.name||'WARDOGS')};
+  const sourceServer=sourceKind==='playtime'?source.server:null;
+  const sourceBot=sourceKind==='playtime'?source.bot:source;
+  const enrichedPayload={...payload,serverId:String(statusSource?.id||sourceServer?.id||payload?.serverId||sourceBot?.id||''),serverName:String(payload?.serverName||sourceServer?.label||statusSource?.name||sourceBot?.name||'WARDOGS')};
   const rawEvents=Array.isArray(payload?.events)?payload.events.slice(0,100):[];
   const events=rawEvents.map((raw)=>incomingEvent(enrichedPayload,raw)).filter(Boolean);
   const targets=feedTargets(source,sourceKind);let accepted=0;
   for(const target of targets){
     if(target.kind==='status')accepted+=updateStatusFeedTarget(target.item,events);
+    else if(target.kind==='playtime')accepted+=updatePlaytimeFeedTarget(target.item,target.serverId,events);
     else accepted+=updateManagedFeedTarget(target.item,events);
   }
   if(events.length&&sourceKind==='managed')upsertManagedBot({id:source.id,killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});

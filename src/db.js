@@ -124,12 +124,12 @@ function defaultBotServices() {
     id: 'wardogs-playtime-tracker',
     slug: 'wardogs-playtime-tracker',
     category: 'wardogs',
-    nameDe: 'WARDOGS Playtime Tracker',
-    nameEn: 'WARDOGS Playtime Tracker',
-    descriptionDe: 'Gehosteter WARDOGS Playtime Tracker. Er erfasst automatisch die Server-Spielzeit jedes Spielers per Steam64ID und zeigt Leaderboards sowie Langzeit-Statistiken im Webpanel und optional in Discord.',
-    descriptionEn: "Hosted WARDOGS playtime tracker. It automatically tracks every player's server playtime by Steam64ID and provides leaderboards plus long-term statistics in the web panel and optionally in Discord.",
-    featuresDe: ['Spielzeit pro Spieler & Steam64ID', 'Top-25 Leaderboard', 'Gesamtspielzeit aller Spieler', 'Discord Top-25 Channel mit 6h Auto-Update', 'Manuelles Leaderboard-Update im Webpanel', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Eigene Instanz & eigenes PayPal-Abo', 'Config Export / Import', 'Auto-Recovery', 'Spielersuche', 'Mehrere WARDOGS Server pro Tracker'],
-    featuresEn: ['Playtime per player & Steam64ID', 'Top 25 leaderboard', 'Total tracked player-hours', 'Discord Top 25 channel with 6h auto update', 'Manual leaderboard refresh from the web panel', 'Peak activity by hour of day', 'Most used clan tags', 'Dedicated instance & separate PayPal subscription', 'Config export / import', 'Auto recovery', 'Player search', 'Multiple WARDOGS servers per tracker'],
+    nameDe: 'WARDOGS Status Bot',
+    nameEn: 'WARDOGS Status Bot',
+    descriptionDe: 'Gehosteter WARDOGS Status Bot für mehrere Gameserver: Spielzeit, globale Spieler- und Kill-Statistiken sowie ein eigener fester Discord-Killfeed pro Server in einer Instanz.',
+    descriptionEn: 'Hosted WARDOGS Status Bot for multiple game servers: playtime, global player and kill statistics, plus one fixed Discord killfeed panel per server in a single instance.',
+    featuresDe: ['Mehrere WARDOGS Server pro Bot', 'Eigener Discord Killfeed pro Server (letzte 15 Kills)', 'Globale Kill-Stats über alle eingebundenen Server', 'Spielersuche nach Name / Alias / Steam64ID', 'Kills, Tode, K/D, Headshots, Distanz & Kill-Tags', 'Spielzeit pro Spieler & Steam64ID', 'Globale Top-25 Leaderboards', 'Discord Top-25 Spielzeit', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Webpanel mit letzten 150 Kills pro Server', 'Config Export / Import', 'Auto-Recovery'],
+    featuresEn: ['Multiple WARDOGS servers per bot', 'Dedicated Discord killfeed per server (latest 15 kills)', 'Global kill stats across all connected servers', 'Player search by name / alias / Steam64ID', 'Kills, deaths, K/D, headshots, distance & kill tags', 'Playtime per player & Steam64ID', 'Global Top-25 leaderboards', 'Discord Top-25 playtime', 'Peak activity by hour of day', 'Most used clan tags', 'Web panel with the latest 150 kills per server', 'Config export / import', 'Auto recovery'],
     priceLabel: '€1.99 / month',
     monthlyAmount: '1.99',
     currency: 'EUR',
@@ -146,7 +146,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 36, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 37, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -163,7 +163,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 36;
+  parsed.version = 37;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -491,6 +491,49 @@ function migrate(parsed) {
       bot.migratedToStatusServerId = target.id;
     }
   }
+  if (previousVersion < 37) {
+    // v3.12.38 turns the former Playtime Tracker service into the visible
+    // WARDOGS Status Bot and moves per-server killfeed configuration into it.
+    const defaults = defaultBotServices();
+    const serviceDefault = defaults.find((x) => x.id === 'wardogs-playtime-tracker');
+    const service = parsed.botServices.find((x) => x.id === 'wardogs-playtime-tracker' || x.slug === 'wardogs-playtime-tracker');
+    if (service && serviceDefault) {
+      Object.assign(service, {
+        nameDe: serviceDefault.nameDe, nameEn: serviceDefault.nameEn,
+        descriptionDe: serviceDefault.descriptionDe, descriptionEn: serviceDefault.descriptionEn,
+        featuresDe: serviceDefault.featuresDe, featuresEn: serviceDefault.featuresEn,
+        visible: true, status: 'available', updatedAt: migrationNow
+      });
+    } else if (serviceDefault) {
+      parsed.botServices.push({ ...serviceDefault, createdAt: migrationNow, updatedAt: migrationNow });
+    }
+    for (const bot of parsed.managedBots.filter((row) => row?.serviceId === 'wardogs-playtime-tracker')) {
+      if (/^(?:WARDOGS\s+)?Playtime Tracker(?:\s*#\d+)?$/i.test(String(bot.name || '').trim())) {
+        const suffix = String(bot.name).match(/(\s*#\d+)$/)?.[1] || '';
+        bot.name = `WARDOGS Status Bot${suffix}`;
+      }
+      if (!bot.killStats || typeof bot.killStats !== 'object') bot.killStats = null;
+      const normUrl = (value) => String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+      bot.playtimeServers = (Array.isArray(bot.playtimeServers) ? bot.playtimeServers : []).map((server) => {
+        const matchingStatus = parsed.servers.find((row) => row?.gameType === 'wardogs'
+          && String(row?.ownerDiscordId || '') === String(bot?.ownerDiscordId || '')
+          && normUrl(row?.queryConfig?.baseUrl) === normUrl(server?.baseUrl || server?.wardogsBaseUrl));
+        if (!bot.killStats && matchingStatus?.killStats && typeof matchingStatus.killStats === 'object') bot.killStats = matchingStatus.killStats;
+        return {
+          ...server,
+          killFeedChannelId: String(server?.killFeedChannelId || ''),
+          killFeedMessageId: String(server?.killFeedMessageId || ''),
+          killFeedTokenEnc: String(server?.killFeedTokenEnc || matchingStatus?.killFeedTokenEnc || ''),
+          killFeedConfiguredAt: server?.killFeedConfiguredAt || matchingStatus?.killFeedConfiguredAt || null,
+          killFeedPublicUrl: String(server?.killFeedPublicUrl || matchingStatus?.killFeedPublicUrl || ''),
+          killFeedNeedsGameRestart: server?.killFeedNeedsGameRestart === true || matchingStatus?.killFeedNeedsGameRestart === true,
+          killFeedLastEventAt: server?.killFeedLastEventAt || matchingStatus?.killFeedLastEventAt || null,
+          killFeedLastPublishedAt: server?.killFeedLastPublishedAt || null,
+          killFeedEvents: Array.isArray(server?.killFeedEvents) && server.killFeedEvents.length ? server.killFeedEvents.slice(-150) : (Array.isArray(matchingStatus?.killFeedEvents) ? matchingStatus.killFeedEvents.slice(-150) : [])
+        };
+      });
+    }
+  }
   parsed.servers = parsed.servers.map((server) => ({
     ...server,
     killFeedTokenEnc: String(server?.killFeedTokenEnc || ''),
@@ -605,7 +648,16 @@ function migrate(parsed) {
       id: String(row?.id || `server-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g,'-').slice(0,64) || `server-${index + 1}`,
       label: String(row?.label || `Server ${index + 1}`).trim().slice(0,80) || `Server ${index + 1}`,
       baseUrl: String(row?.baseUrl || row?.wardogsBaseUrl || '').trim().replace(/\/+$/,''),
-      secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || '')
+      secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || ''),
+      killFeedChannelId: /^\d{17,20}$/.test(String(row?.killFeedChannelId || '')) ? String(row.killFeedChannelId) : '',
+      killFeedMessageId: /^\d{17,20}$/.test(String(row?.killFeedMessageId || '')) ? String(row.killFeedMessageId) : '',
+      killFeedTokenEnc: String(row?.killFeedTokenEnc || ''),
+      killFeedConfiguredAt: row?.killFeedConfiguredAt || null,
+      killFeedPublicUrl: String(row?.killFeedPublicUrl || '').slice(0,300),
+      killFeedNeedsGameRestart: row?.killFeedNeedsGameRestart === true,
+      killFeedLastEventAt: row?.killFeedLastEventAt || null,
+      killFeedLastPublishedAt: row?.killFeedLastPublishedAt || null,
+      killFeedEvents: (Array.isArray(row?.killFeedEvents) ? row.killFeedEvents : []).slice(-150)
     })).filter((row)=>row.baseUrl).slice(0,12)
   }));
   return parsed;
