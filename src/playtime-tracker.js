@@ -2,7 +2,7 @@ import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
-import { normalizeSteamId64 } from './managed-bots.js';
+import { normalizeSteamId64 } from './wardogs-players.js';
 
 export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
 const instances = new Map();

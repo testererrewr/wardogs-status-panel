@@ -13,6 +13,10 @@ import {
 } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { safeHttpText } from './target-safety.js';
+import { normalizeSteamId64, playerFaction, playerSteamId, wardogsPlayerRows } from './wardogs-players.js';
+import { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
+export { normalizeSteamId64 } from './wardogs-players.js';
+export { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
 import { parseManagedRules, evaluateManagedRules, matchManagedRules, managedRulesNeedSteam } from './managed-rules.js';
 import { getSteamRiskProfiles, steamApiKeyAvailable } from './steam-risk.js';
@@ -33,6 +37,7 @@ const WELCOME_RETRY_MS = 5000;
 // message endpoint is ready for that player. Delay the first welcome attempt so
 // the join/session can finish initializing, then keep the existing retry path.
 const WELCOME_JOIN_DELAY_MS = 30_000;
+const WELCOME_LEAVE_CONFIRM_POLLS = 2;
 
 function withLifecycleLock(id, task) {
   const key = String(id || '');
@@ -67,167 +72,6 @@ function accessActive(bot) {
   if (bot?.adminGrant) return true;
   const until = Date.parse(bot?.accessUntil || '');
   return Number.isFinite(until) && until > Date.now();
-}
-const STEAM64_ACCOUNT_BASE = 76561197960265728n;
-export function normalizeSteamId64(value) {
-  const raw = String(value ?? '').trim();
-  if (/^\d{17}$/.test(raw)) return raw;
-  let match = raw.match(/^STEAM_[0-5]:([01]):(\d+)$/i);
-  if (match) return (STEAM64_ACCOUNT_BASE + (BigInt(match[2]) * 2n) + BigInt(match[1])).toString();
-  match = raw.match(/^\[?U:1:(\d+)\]?$/i);
-  if (match) return (STEAM64_ACCOUNT_BASE + BigInt(match[1])).toString();
-  return '';
-}
-function playerSteamId(player) {
-  for (const key of ['steamId64','steamId','steamID64','steamID','playerSteamId','playerId']) {
-    const normalized = normalizeSteamId64(player?.[key]);
-    if (normalized) return normalized;
-  }
-  return '';
-}
-
-function playerWardogsApiId(player) {
-  for (const key of ['steamId','steamId64','steamID','steamID64','playerSteamId','playerId']) {
-    const raw = String(player?.[key] ?? '').trim();
-    if (raw) return raw;
-  }
-  return playerSteamId(player);
-}
-
-function playerFaction(player) {
-  const raw = player?.faction;
-  if (raw && typeof raw === 'object') return String(raw.name ?? raw.label ?? raw.id ?? '').trim();
-  return String(raw ?? '').trim();
-}
-export function renderManagedWelcomeMessage(template, player) {
-  const steamId = playerSteamId(player);
-  const values = {
-    player: String(player?.name || 'player').trim() || 'player',
-    name: String(player?.name || 'player').trim() || 'player',
-    steamid: steamId,
-    faction: playerFaction(player)
-  };
-  return String(template || '')
-    .replace(/\{(player|name|steamid|faction)\}/gi, (_, key) => values[String(key).toLowerCase()] ?? '')
-    .trim()
-    .slice(0, 200);
-}
-
-export function managedWelcomeTargets(state, players, joinedPlayers) {
-  if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
-  if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
-  if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
-  if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
-  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
-  const tracker = state.welcomeJoinTracker || state.joinTracker;
-  const activeIds = tracker?.active instanceof Set ? tracker.active : new Set();
-  for (const id of [...state.welcomePending]) if (!activeIds.has(id)) state.welcomePending.delete(id);
-  for (const id of [...state.welcomeDelivered]) if (!activeIds.has(id)) state.welcomeDelivered.delete(id);
-  for (const id of [...state.welcomeFailed]) if (!activeIds.has(id)) state.welcomeFailed.delete(id);
-  for (const id of [...state.welcomeAttempts.keys()]) if (!activeIds.has(id)) state.welcomeAttempts.delete(id);
-  for (const id of [...state.welcomeReadyAt.keys()]) if (!activeIds.has(id)) state.welcomeReadyAt.delete(id);
-
-  for (const player of Array.isArray(joinedPlayers) ? joinedPlayers : []) {
-    const steamId = playerSteamId(player);
-    if (!steamId) continue;
-    // managedJoinCandidates only emits a player after a confirmed new join session.
-    // Reset any delivery/failure state from the previous session here so a genuine
-    // leave + rejoin can receive exactly one fresh welcome.
-    state.welcomeDelivered.delete(steamId);
-    state.welcomeFailed.delete(steamId);
-    state.welcomeAttempts.delete(steamId);
-    state.welcomeReadyAt.set(steamId, Date.now() + WELCOME_JOIN_DELAY_MS);
-    state.welcomePending.add(steamId);
-  }
-
-  const bySteamId = new Map((Array.isArray(players) ? players : []).map((player) => [playerSteamId(player), player]).filter(([id]) => id));
-  const targets = [];
-  for (const steamId of [...state.welcomePending]) {
-    const player = bySteamId.get(steamId);
-    // A join welcome belongs to the join event itself. Do not wait for faction/team
-    // assignment: some WARDOGS builds keep faction empty/unassigned for valid players,
-    // which previously left the welcome queued forever. Player readiness is handled by
-    // the whisper endpoint/retry path below instead.
-    if (!player || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
-    const readyAt = Number(state.welcomeReadyAt.get(steamId) || 0);
-    if (readyAt > Date.now()) continue;
-    if (Number(state.welcomeAttempts.get(steamId) || 0) >= WELCOME_MAX_ATTEMPTS) continue;
-    targets.push({ ...player, steamId });
-  }
-  return targets;
-}
-
-export function managedWelcomeSucceeded(state, steamId) {
-  const id = normalizeSteamId64(steamId);
-  if (!id) return;
-  if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
-  if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
-  if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
-  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
-  state.welcomePending.delete(id);
-  state.welcomeAttempts.delete(id);
-  state.welcomeReadyAt.delete(id);
-  state.welcomeDelivered.add(id);
-}
-
-export function managedWelcomeFailed(state, steamId, { retryable = true } = {}) {
-  const id = normalizeSteamId64(steamId);
-  if (!id) return { retry: false, attempts: 0 };
-  if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
-  if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
-  if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
-  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
-  const attempts = Number(state.welcomeAttempts.get(id) || 0) + 1;
-  state.welcomeAttempts.set(id, attempts);
-  const retry = Boolean(retryable) && attempts < WELCOME_MAX_ATTEMPTS;
-  if (!retry) {
-    state.welcomePending.delete(id);
-    state.welcomeReadyAt.delete(id);
-    state.welcomeFailed.add(id);
-  }
-  return { retry, attempts };
-}
-
-export function createManagedJoinTracker() {
-  return { initialized: false, active: new Set(), missing: new Map() };
-}
-
-// Polling APIs can briefly return incomplete/empty player lists. The caller chooses
-// how many consecutive successful missing snapshots confirm a leave: risk screening
-// uses a conservative threshold, while welcome joins intentionally use one snapshot.
-export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
-  const state = tracker || createManagedJoinTracker();
-  if (!(state.active instanceof Set)) state.active = new Set();
-  if (!(state.missing instanceof Map)) state.missing = new Map();
-  const rows = Array.isArray(players) ? players : [];
-  const current = new Set(rows.map(playerSteamId).filter(Boolean));
-  if (!state.initialized) {
-    state.initialized = true;
-    state.active = new Set(current);
-    state.missing.clear();
-    return [];
-  }
-
-  const candidates = [];
-  for (const player of rows) {
-    const id = playerSteamId(player);
-    if (!id) continue;
-    if (!state.active.has(id)) candidates.push(player);
-    // Mark the join immediately, before any Steam/Discord network work starts.
-    state.active.add(id);
-    state.missing.delete(id);
-  }
-
-  const threshold = Math.max(1, Math.min(10, Number(missingThreshold) || 3));
-  for (const id of [...state.active]) {
-    if (current.has(id)) continue;
-    const misses = Number(state.missing.get(id) || 0) + 1;
-    if (misses >= threshold) {
-      state.active.delete(id);
-      state.missing.delete(id);
-    } else state.missing.set(id, misses);
-  }
-  return candidates;
 }
 function validSteamId(value) { return Boolean(normalizeSteamId64(value)); }
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
@@ -406,7 +250,7 @@ async function writeManagedServerName(bot, desiredName) {
 
 export async function testManagedWardogs(bot) {
   const [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]);
-  return { status, playerCount: Array.isArray(players?.players) ? players.players.length : Number(players?.count || 0) };
+  return { status, playerCount: wardogsPlayerRows(players).length || Number(players?.count || 0) };
 }
 
 export function normalizeManagedBanDiscordLink(value) {
@@ -539,25 +383,28 @@ function welcomeWhisperRetryable(error) {
   if (code === 'no_route' || code === 'method_not_allowed') return false;
   // Authentication/configuration errors are not spawn timing problems.
   if ([401, 403, 405].includes(status)) return false;
-  // Player/faction/pawn readiness can briefly lag behind /v1/players. Retry only
-  // clear upstream HTTP rejections; transport timeouts are ambiguous and are not
-  // retried to avoid a duplicate whisper if the server already accepted it.
+  // Player/faction/pawn readiness can briefly lag behind /v1/players.
   if ([400, 404, 409, 422, 423, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  // A transport reset/timeout previously killed the welcome permanently. In practice
+  // that made the feature fragile on the same connections that can surface as
+  // ECONNRESET/socket hang up. Retry these transient failures as well.
+  if (!status && ['econnreset','epipe','etimedout','econnrefused','enetunreach','ehostunreach'].includes(code)) return true;
+  if (!status && /socket hang up|timed out|connection reset/i.test(detail)) return true;
   return false;
 }
 
 async function sendManagedWelcomeWhisper(bot, state, player, message) {
   const steamId = playerSteamId(player);
-  const apiId = playerWardogsApiId(player);
-  if (!steamId || !apiId) return { sent: false, retry: false, attempts: 0, error: new Error('Invalid WARDOGS player/SteamID64') };
+  if (!steamId) return { sent: false, retry: false, attempts: 0, error: new Error('Invalid WARDOGS player/SteamID64') };
+  const attemptNumber = Number(state.welcomeAttempts?.get?.(steamId) || 0) + 1;
   try {
-    // Use the exact player identifier returned by /v1/players for the whisper route.
-    // Some WARDOGS builds are stricter here than the other moderation endpoints.
-    await wardogsRequest(bot, `/v1/players/${encodeURIComponent(apiId)}/message`, { method: 'POST', body: { message: String(message || '').slice(0, 200) } });
+    // WARDOGS documents this route by Steam64 ID. Use the same normalized ID as
+    // manual whispers/kicks/bans instead of a second raw-ID path just for welcomes.
+    await wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}/message`, { method: 'POST', body: { message: String(message || '').slice(0, 200) } });
     managedWelcomeSucceeded(state, steamId);
-    return { sent: true, retry: false, attempts: Number(state.welcomeAttempts?.get?.(steamId) || 0) + 1, error: null };
+    return { sent: true, retry: false, attempts: attemptNumber, error: null };
   } catch (error) {
-    const outcome = managedWelcomeFailed(state, steamId, { retryable: welcomeWhisperRetryable(error) });
+    const outcome = managedWelcomeFailed(state, steamId, { retryable: welcomeWhisperRetryable(error), maxAttempts: WELCOME_MAX_ATTEMPTS });
     return { sent: false, ...outcome, error };
   }
 }
@@ -571,9 +418,9 @@ async function processManagedWelcomeQueue(bot, state, players = null) {
     let rows = Array.isArray(players) ? players : null;
     if (!rows) {
       const data = await wardogsRequest(bot, '/v1/players');
-      rows = Array.isArray(data?.players) ? data.players : [];
+      rows = wardogsPlayerRows(data);
     }
-    for (const player of managedWelcomeTargets(state, rows, [])) {
+    for (const player of managedWelcomeTargets(state, rows, [], { joinDelayMs: WELCOME_JOIN_DELAY_MS, maxAttempts: WELCOME_MAX_ATTEMPTS })) {
       const steamId = playerSteamId(player);
       const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
       if (!steamId || !message) continue;
@@ -604,17 +451,34 @@ async function pollManagedWelcome(bot, state) {
   state.welcomePollInFlight = true;
   try {
     const data = await wardogsRequest(bot, '/v1/players');
-    const players = Array.isArray(data?.players) ? data.players : [];
+    const players = wardogsPlayerRows(data);
     if (!state.welcomeJoinTracker) state.welcomeJoinTracker = createManagedJoinTracker();
     // Welcome detection is intentionally separate from risk/detection joins. It polls
-    // faster and treats one successful missing snapshot as a leave, so every observable
-    // leave + rejoin creates a fresh welcome session. Detection/risk screening keeps its
-    // more conservative three-snapshot threshold.
-    const joined = managedJoinCandidates(state.welcomeJoinTracker, players, 1);
-    managedWelcomeTargets(state, players, joined);
+    // every 5 seconds, but requires two consecutive missing snapshots before a leave.
+    // This still catches normal reconnects while preventing a single incomplete roster
+    // response from deleting/restarting a queued 30-second welcome.
+    const joined = managedJoinCandidates(state.welcomeJoinTracker, players, WELCOME_LEAVE_CONFIRM_POLLS);
+    managedWelcomeTargets(state, players, joined, { joinDelayMs: WELCOME_JOIN_DELAY_MS, maxAttempts: WELCOME_MAX_ATTEMPTS });
+    if (joined.length) {
+      const last = joined[joined.length - 1];
+      setRuntime(bot.id, {
+        lastWelcomeJoinDetectedAt: nowIso(),
+        lastWelcomeJoinDetectedPlayer: String(last?.name || playerSteamId(last) || 'player')
+      });
+    }
     await processManagedWelcomeQueue(bot, state, players);
+    setRuntime(bot.id, {
+      welcomeWatcherLastPollAt: nowIso(),
+      welcomeWatcherPlayers: players.length,
+      welcomeWatcherActive: state.welcomeJoinTracker?.active?.size || 0,
+      welcomeWatcherPending: state.welcomePending?.size || 0,
+      welcomeWatcherLastPollError: null
+    });
   } catch (error) {
-    setRuntime(bot.id, { lastWelcomeWhisperError: String(error?.message || error).slice(0, 300) });
+    setRuntime(bot.id, {
+      welcomeWatcherLastPollAt: nowIso(),
+      welcomeWatcherLastPollError: String(error?.message || error).slice(0, 300)
+    });
   } finally {
     state.welcomePollInFlight = false;
   }
@@ -647,7 +511,7 @@ export async function whisperManagedFaction(bot, faction, message) {
   if (!cleanMessage || cleanMessage.length > 200) throw new Error('Faction whisper must be 1–200 characters long');
 
   const payload = await wardogsRequest(bot, '/v1/players');
-  const players = Array.isArray(payload?.players) ? payload.players : [];
+  const players = wardogsPlayerRows(payload);
   const targetFaction = cleanFaction.toLocaleLowerCase('en-US');
   const targets = players.filter((player) => {
     const steamId = playerSteamId(player);
@@ -921,7 +785,7 @@ async function controlPanelPayload(bot) {
   try {
     [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]);
   } catch {}
-  const playerList = Array.isArray(players?.players) ? players.players : [];
+  const playerList = wardogsPlayerRows(players);
   const scores = Array.isArray(status?.factionScores) ? status.factionScores : [];
   const scoreText = scores.length ? scores.slice(0, 6).map((x) => `${cut(x.name, 40)}: ${Number.isFinite(Number(x.score)) ? x.score : '—'}`).join(' · ') : '—';
   const embed = new EmbedBuilder()
@@ -1009,7 +873,7 @@ async function pollPlayers(bot, state, client) {
   state.pollInFlight = true;
   try {
     const data = await wardogsRequest(bot, '/v1/players');
-    const players = Array.isArray(data?.players) ? data.players : [];
+    const players = wardogsPlayerRows(data);
     const rules = parseManagedRules(bot.rulesText || '');
     const ignored = ignoredSteamIds(bot);
 
@@ -1034,6 +898,7 @@ async function pollPlayers(bot, state, client) {
       state.welcomeDelivered?.clear?.();
       state.welcomeFailed?.clear?.();
       state.welcomeAttempts?.clear?.();
+      state.welcomeReadyAt?.clear?.();
       state.welcomeJoinTracker = createManagedJoinTracker();
     }
 
@@ -1132,7 +997,7 @@ function modal(customId, title, fields) {
 
 async function playerPage(bot, page = 0) {
   const data = await wardogsRequest(bot, '/v1/players');
-  const players = Array.isArray(data?.players) ? data.players.filter((p) => Boolean(playerSteamId(p))) : [];
+  const players = wardogsPlayerRows(data).filter((p) => Boolean(playerSteamId(p)));
   const pages = Math.max(1, Math.ceil(players.length / 25));
   const safePage = Math.max(0, Math.min(pages - 1, Number(page) || 0));
   const slice = players.slice(safePage * 25, safePage * 25 + 25);
@@ -1154,7 +1019,7 @@ async function playerPage(bot, page = 0) {
 
 async function playerControl(bot, steamId) {
   const data = await wardogsRequest(bot, '/v1/players');
-  const players = Array.isArray(data?.players) ? data.players : [];
+  const players = wardogsPlayerRows(data);
   const player = players.find((p) => playerSteamId(p) === steamId);
   const name = player?.name || steamId;
   const embed = new EmbedBuilder().setTitle(cut(name, 256)).setDescription(`SteamID64: ${steamId}`)
@@ -1615,6 +1480,10 @@ async function startOne(bot) {
     client.on('shardError', (error) => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now(), lastError: String(error?.message || 'Discord shard error').slice(0, 300) }));
     client.on('invalidated', () => setRuntime(bot.id, { state: 'disconnected', needsRecovery: true, disconnectedAt: Date.now(), lastError: 'Discord session invalidated' }));
     client.on('shardResume', () => setRuntime(bot.id, { state: 'connected', needsRecovery: false, disconnectedAt: null, lastError: null }));
+    // Build the WARDOGS roster baseline BEFORE Discord login. Discord can take many
+    // seconds to become ready; previously a player joining during that window was
+    // swallowed by the first post-login snapshot and never received a welcome.
+    if (bot.welcomeWhisperEnabled === true) await pollManagedWelcome(bot, state);
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Discord login timeout')), 20000);
       client.once('clientReady', () => { clearTimeout(timeout); resolve(); });
