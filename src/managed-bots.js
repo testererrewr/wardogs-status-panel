@@ -13,7 +13,7 @@ import {
 } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { safeHttpText } from './target-safety.js';
-import { normalizeSteamId64, playerFaction, playerSteamId, wardogsPlayerRows } from './wardogs-players.js';
+import { factionMatches, normalizeSteamId64, playerFaction, playerHasFaction, playerSteamId, playerWardogsApiId, wardogsPlayerRows } from './wardogs-players.js';
 import { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
@@ -33,11 +33,23 @@ const lifecycleLocks = new Map();
 const recoveryState = new Map();
 const WELCOME_MAX_ATTEMPTS = 24;
 const WELCOME_RETRY_MS = 5000;
-// WARDOGS may expose a freshly joined player in /v1/players before its private
-// message endpoint is ready for that player. Delay the first welcome attempt so
-// the join/session can finish initializing, then keep the existing retry path.
-const WELCOME_JOIN_DELAY_MS = 30_000;
+// Wait for WARDOGS to report a faction/team, then give the pawn a short moment
+// to materialize before the first whisper. This works during seeding/Waiting for
+// Players too; it does not depend on the match having started.
+const WELCOME_SPAWN_SETTLE_MS = 2_000;
 const WELCOME_LEAVE_CONFIRM_POLLS = 2;
+
+// WARDOGS is most reliable when a single request at a time targets one game
+// server. Background polling, the web dashboard and Discord actions used to race
+// each other here. Keep one promise lane per managed bot/server.
+const wardogsLanes = new Map();
+function withWardogsLane(bot, task) {
+  const key = String(baseUrl(bot?.wardogsBaseUrl) || bot?.id || 'wardogs');
+  const previous = wardogsLanes.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  wardogsLanes.set(key, current);
+  return current.finally(() => { if (wardogsLanes.get(key) === current) wardogsLanes.delete(key); });
+}
 
 function withLifecycleLock(id, task) {
   const key = String(id || '');
@@ -119,7 +131,7 @@ export function managedSteamRuleStatus(bot) {
   return { needsSteam: managedRulesNeedSteam(rules), apiKeyAvailable: steamApiKeyAvailable(bot) };
 }
 
-async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
+async function wardogsRequestDirect(bot, pathname, { method = 'GET', body } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
   if (!root) throw new Error('WARDOGS base URL is missing');
   let secret = '';
@@ -145,8 +157,11 @@ async function wardogsRequest(bot, pathname, { method = 'GET', body } = {}) {
   return data;
 }
 
+async function wardogsRequest(bot, pathname, options = {}) {
+  return withWardogsLane(bot, () => wardogsRequestDirect(bot, pathname, options));
+}
 
-async function wardogsTextRequest(bot, pathname, { method = 'GET', textBody, headers = {} } = {}) {
+async function wardogsTextRequestDirect(bot, pathname, { method = 'GET', textBody, headers = {} } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
   if (!root) throw new Error('WARDOGS base URL is missing');
   let secret = '';
@@ -175,6 +190,10 @@ async function wardogsTextRequest(bot, pathname, { method = 'GET', textBody, hea
     throw error;
   }
   return { data, headers: response.headers || {} };
+}
+
+async function wardogsTextRequest(bot, pathname, options = {}) {
+  return withWardogsLane(bot, () => wardogsTextRequestDirect(bot, pathname, options));
 }
 
 function managedServerNameWritable(config) {
@@ -385,12 +404,57 @@ function welcomeWhisperRetryable(error) {
   if ([401, 403, 405].includes(status)) return false;
   // Player/faction/pawn readiness can briefly lag behind /v1/players.
   if ([400, 404, 409, 422, 423, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-  // A transport reset/timeout previously killed the welcome permanently. In practice
-  // that made the feature fragile on the same connections that can surface as
-  // ECONNRESET/socket hang up. Retry these transient failures as well.
+  // Transport resets/timeouts must not permanently kill a queued welcome.
   if (!status && ['econnreset','epipe','etimedout','econnrefused','enetunreach','ehostunreach'].includes(code)) return true;
   if (!status && /socket hang up|timed out|connection reset/i.test(detail)) return true;
   return false;
+}
+
+function playerIdFallbackAllowed(error) {
+  const status = Number(error?.status || 0);
+  const code = String(error?.code || '').toLowerCase();
+  const detail = String(error?.detail || error?.message || '').toLowerCase();
+  if (![400, 404, 422].includes(status)) return false;
+  return code.includes('player') || detail.includes('player') || detail.includes('steam') || detail.includes('not found') || detail.includes('invalid');
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0))); }
+
+function whisperRouteCandidates(playerOrId) {
+  const raw = typeof playerOrId === 'object' && playerOrId !== null
+    ? playerWardogsApiId(playerOrId)
+    : String(playerOrId ?? '').trim();
+  const normalized = typeof playerOrId === 'object' && playerOrId !== null
+    ? playerSteamId(playerOrId)
+    : normalizeSteamId64(playerOrId);
+  return [...new Set([raw, normalized].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+async function whisperManagedRosterPlayer(bot, playerOrId, message, { attempts = 1, retryDelayMs = 750 } = {}) {
+  const clean = String(message || '').trim();
+  if (!clean || clean.length > 200) throw new Error('Player message must be 1–200 characters long');
+  const ids = whisperRouteCandidates(playerOrId);
+  if (!ids.length) throw new Error('Invalid WARDOGS player/SteamID64');
+  const maxAttempts = Math.max(1, Math.min(10, Number(attempts) || 1));
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    for (let i = 0; i < ids.length; i += 1) {
+      try {
+        return await wardogsRequest(bot, `/v1/players/${encodeURIComponent(ids[i])}/message`, { method: 'POST', body: { message: clean } });
+      } catch (error) {
+        lastError = error;
+        // Only try an alternate identifier when the server explicitly says the
+        // player/id is invalid. A transport failure is ambiguous and retrying a
+        // second id immediately could duplicate an already-delivered whisper.
+        if (i + 1 < ids.length && playerIdFallbackAllowed(error)) continue;
+        break;
+      }
+    }
+    if (attempt >= maxAttempts || !welcomeWhisperRetryable(lastError)) break;
+    await sleep(retryDelayMs * attempt);
+  }
+  throw lastError || new Error('WARDOGS whisper failed');
 }
 
 async function sendManagedWelcomeWhisper(bot, state, player, message) {
@@ -398,9 +462,11 @@ async function sendManagedWelcomeWhisper(bot, state, player, message) {
   if (!steamId) return { sent: false, retry: false, attempts: 0, error: new Error('Invalid WARDOGS player/SteamID64') };
   const attemptNumber = Number(state.welcomeAttempts?.get?.(steamId) || 0) + 1;
   try {
-    // WARDOGS documents this route by Steam64 ID. Use the same normalized ID as
-    // manual whispers/kicks/bans instead of a second raw-ID path just for welcomes.
-    await wardogsRequest(bot, `/v1/players/${encodeURIComponent(steamId)}/message`, { method: 'POST', body: { message: String(message || '').slice(0, 200) } });
+    // Use the exact identifier returned by the current /v1/players roster first.
+    // Some WARDOGS builds are stricter on /players/{id}/message than on other
+    // moderation routes; a canonical Steam64 fallback is only used on an explicit
+    // player/id rejection.
+    await whisperManagedRosterPlayer(bot, player, message, { attempts: 1 });
     managedWelcomeSucceeded(state, steamId);
     return { sent: true, retry: false, attempts: attemptNumber, error: null };
   } catch (error) {
@@ -420,7 +486,7 @@ async function processManagedWelcomeQueue(bot, state, players = null) {
       const data = await wardogsRequest(bot, '/v1/players');
       rows = wardogsPlayerRows(data);
     }
-    for (const player of managedWelcomeTargets(state, rows, [], { joinDelayMs: WELCOME_JOIN_DELAY_MS, maxAttempts: WELCOME_MAX_ATTEMPTS })) {
+    for (const player of managedWelcomeTargets(state, rows, [], { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, maxAttempts: WELCOME_MAX_ATTEMPTS })) {
       const steamId = playerSteamId(player);
       const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
       if (!steamId || !message) continue;
@@ -429,13 +495,15 @@ async function processManagedWelcomeQueue(bot, state, players = null) {
         setRuntime(bot.id, {
           lastWelcomeWhisperAt: nowIso(),
           lastWelcomeWhisperPlayer: String(player?.name || steamId),
+          lastWelcomeWhisperAttemptAt: nowIso(),
+          lastWelcomeWhisperAttemptPlayer: String(player?.name || steamId),
           lastWelcomeWhisperError: null,
           lastWelcomeWhisperAttempts: result.attempts
         });
       } else {
         setRuntime(bot.id, {
-          lastWelcomeWhisperAt: nowIso(),
-          lastWelcomeWhisperPlayer: String(player?.name || steamId),
+          lastWelcomeWhisperAttemptAt: nowIso(),
+          lastWelcomeWhisperAttemptPlayer: String(player?.name || steamId),
           lastWelcomeWhisperError: `${result.error?.message || 'Whisper failed'}${result.retry ? ` · retry ${result.attempts}/${WELCOME_MAX_ATTEMPTS}` : ''}`,
           lastWelcomeWhisperAttempts: result.attempts
         });
@@ -453,12 +521,12 @@ async function pollManagedWelcome(bot, state) {
     const data = await wardogsRequest(bot, '/v1/players');
     const players = wardogsPlayerRows(data);
     if (!state.welcomeJoinTracker) state.welcomeJoinTracker = createManagedJoinTracker();
-    // Welcome detection is intentionally separate from risk/detection joins. It polls
-    // every 5 seconds, but requires two consecutive missing snapshots before a leave.
-    // This still catches normal reconnects while preventing a single incomplete roster
-    // response from deleting/restarting a queued 30-second welcome.
+    // Welcome detection is separate from risk/detection joins. A session stays
+    // queued while the player is in team selection. The whisper becomes eligible
+    // only after WARDOGS reports a real faction/team. This also applies during
+    // seeding / Waiting for Players; match state is deliberately irrelevant.
     const joined = managedJoinCandidates(state.welcomeJoinTracker, players, WELCOME_LEAVE_CONFIRM_POLLS);
-    managedWelcomeTargets(state, players, joined, { joinDelayMs: WELCOME_JOIN_DELAY_MS, maxAttempts: WELCOME_MAX_ATTEMPTS });
+    managedWelcomeTargets(state, players, joined, { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, maxAttempts: WELCOME_MAX_ATTEMPTS });
     if (joined.length) {
       const last = joined[joined.length - 1];
       setRuntime(bot.id, {
@@ -467,11 +535,24 @@ async function pollManagedWelcome(bot, state) {
       });
     }
     await processManagedWelcomeQueue(bot, state, players);
+
+    const bySteamId = new Map(players.map((player) => [playerSteamId(player), player]).filter(([id]) => id));
+    const pendingIds = state.welcomePending instanceof Set ? [...state.welcomePending] : [];
+    let waitingForFaction = 0;
+    let spawnReady = 0;
+    for (const id of pendingIds) {
+      const player = bySteamId.get(id);
+      if (!player) continue;
+      if (playerHasFaction(player)) spawnReady += 1;
+      else waitingForFaction += 1;
+    }
     setRuntime(bot.id, {
       welcomeWatcherLastPollAt: nowIso(),
       welcomeWatcherPlayers: players.length,
       welcomeWatcherActive: state.welcomeJoinTracker?.active?.size || 0,
       welcomeWatcherPending: state.welcomePending?.size || 0,
+      welcomeWatcherWaitingForFaction: waitingForFaction,
+      welcomeWatcherSpawnReady: spawnReady,
       welcomeWatcherLastPollError: null
     });
   } catch (error) {
@@ -502,8 +583,20 @@ export async function whisperManagedPlayer(bot, steamId, message) {
   if (!normalized) throw new Error('Invalid SteamID64');
   const clean = String(message || '').trim();
   if (!clean || clean.length > 200) throw new Error('Player message must be 1–200 characters long');
-  return wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/message`, { method: 'POST', body: { message: clean } });
+
+  // Resolve the current roster row so the per-player endpoint receives exactly
+  // the identifier WARDOGS itself returned. Fall back to Steam64 if the player
+  // disappears between dashboard render and action click.
+  let target = normalized;
+  try {
+    const payload = await wardogsRequest(bot, '/v1/players');
+    target = wardogsPlayerRows(payload).find((player) => playerSteamId(player) === normalized) || normalized;
+  } catch {
+    target = normalized;
+  }
+  return whisperManagedRosterPlayer(bot, target, clean, { attempts: 3, retryDelayMs: 600 });
 }
+
 export async function whisperManagedFaction(bot, faction, message) {
   const cleanFaction = String(faction || '').trim();
   const cleanMessage = String(message || '').trim();
@@ -512,34 +605,23 @@ export async function whisperManagedFaction(bot, faction, message) {
 
   const payload = await wardogsRequest(bot, '/v1/players');
   const players = wardogsPlayerRows(payload);
-  const targetFaction = cleanFaction.toLocaleLowerCase('en-US');
-  const targets = players.filter((player) => {
-    const steamId = playerSteamId(player);
-    const currentFaction = playerFaction(player).toLocaleLowerCase('en-US');
-    return Boolean(steamId) && currentFaction === targetFaction;
-  });
+  const targets = players.filter((player) => Boolean(playerSteamId(player)) && factionMatches(playerFaction(player), cleanFaction));
   if (!targets.length) return { faction: cleanFaction, matched: 0, sent: 0, failed: 0, failures: [] };
 
-  let cursor = 0;
+  // Send sequentially. The WARDOGS connection is deliberately single-lane, so
+  // parallel workers only created competing requests without improving latency.
   let sent = 0;
   const failures = [];
-  const workerCount = Math.min(5, targets.length);
-  const workers = Array.from({ length: workerCount }, async () => {
-    while (true) {
-      const index = cursor++;
-      if (index >= targets.length) return;
-      const player = targets[index];
-      const steamId = playerSteamId(player);
-      const rendered = renderManagedWelcomeMessage(cleanMessage, player) || cleanMessage;
-      try {
-        await whisperManagedPlayer(bot, steamId, rendered);
-        sent += 1;
-      } catch (error) {
-        failures.push({ steamId, name: String(player?.name || ''), error: String(error?.message || error || 'Whisper failed').slice(0, 180) });
-      }
+  for (const player of targets) {
+    const steamId = playerSteamId(player);
+    const rendered = renderManagedWelcomeMessage(cleanMessage, player) || cleanMessage;
+    try {
+      await whisperManagedRosterPlayer(bot, player, rendered, { attempts: 3, retryDelayMs: 600 });
+      sent += 1;
+    } catch (error) {
+      failures.push({ steamId, name: String(player?.name || ''), faction: playerFaction(player), error: String(error?.message || error || 'Whisper failed').slice(0, 180) });
     }
-  });
-  await Promise.all(workers);
+  }
   return { faction: cleanFaction, matched: targets.length, sent, failed: failures.length, failures: failures.slice(0, 10) };
 }
 export async function moveManagedPlayer(bot, steamId, faction) {
@@ -575,10 +657,49 @@ export async function broadcastManaged(bot, message) {
 }
 export async function restartManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/restart', { method: 'POST' }); }
 export async function endManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/end', { method: 'POST' }); }
+function managedLightingValue(value) {
+  if (value && typeof value === 'object') return String(value.name ?? value.id ?? value.label ?? value.value ?? '').trim();
+  return String(value ?? '').trim();
+}
+function managedLightingMatches(actual, requested) {
+  const normalize = (value) => managedLightingValue(value).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return Boolean(normalize(actual) && normalize(actual) === normalize(requested));
+}
 export async function setManagedLighting(bot, lighting) {
   const clean = String(lighting || '').trim();
   if (!clean || clean.length > 100) throw new Error('Lighting value is invalid');
-  return wardogsRequest(bot, '/v1/world/lighting', { method: 'PUT', body: { lighting: clean } });
+
+  // Lighting is an idempotent world setting. Do not report success merely because
+  // the PUT returned 2xx: read /v1/status back and retry once if the live world
+  // did not adopt the requested value. This turns previously silent no-ops into a
+  // useful panel error instead of a false "Lighting changed" message.
+  let commandResult = await wardogsRequest(bot, '/v1/world/lighting', { method: 'PUT', body: { lighting: clean } });
+  let lastStatus = null;
+  let lastReadError = null;
+  for (const delayMs of [150, 400, 800, 1400]) {
+    await sleep(delayMs);
+    try {
+      lastStatus = await wardogsRequest(bot, '/v1/status');
+      lastReadError = null;
+      const live = managedLightingValue(lastStatus?.lighting);
+      if (live && managedLightingMatches(live, clean)) return { commandResult, verified: true, requested: clean, lighting: live };
+    } catch (error) { lastReadError = error; }
+  }
+
+  // One safe retry: setting lighting to the same value twice has no cumulative
+  // side effect, unlike a kick/whisper where blind retries could duplicate work.
+  commandResult = await wardogsRequest(bot, '/v1/world/lighting', { method: 'PUT', body: { lighting: clean } });
+  await sleep(700);
+  try {
+    lastStatus = await wardogsRequest(bot, '/v1/status');
+    lastReadError = null;
+    const live = managedLightingValue(lastStatus?.lighting);
+    if (live && managedLightingMatches(live, clean)) return { commandResult, verified: true, requested: clean, lighting: live };
+  } catch (error) { lastReadError = error; }
+
+  if (lastReadError && !lastStatus) throw new Error(`Lighting command sent, but live status could not be verified: ${String(lastReadError?.message || lastReadError).slice(0, 180)}`);
+  const live = managedLightingValue(lastStatus?.lighting) || 'unknown';
+  throw new Error(`WARDOGS accepted lighting "${clean}", but live status still reports "${live}". The current server phase/build did not apply it live.`);
 }
 export async function changeManagedMap(bot, { map, experiences = [], lighting = '', zoneAlternator = '' } = {}) {
   const cleanMap = String(map || '').trim();

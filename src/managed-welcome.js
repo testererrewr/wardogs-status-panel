@@ -1,4 +1,4 @@
-import { normalizeSteamId64, playerFaction, playerSteamId } from './wardogs-players.js';
+import { normalizeSteamId64, playerFaction, playerHasFaction, playerSteamId } from './wardogs-players.js';
 
 export function renderManagedWelcomeMessage(template, player) {
   const steamId = playerSteamId(player);
@@ -56,7 +56,11 @@ export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
   return candidates;
 }
 
-export function managedWelcomeTargets(state, players, joinedPlayers, { joinDelayMs = 30_000, maxAttempts = 24, nowMs = Date.now() } = {}) {
+// Welcome delivery is tied to a join session, but intentionally waits until the
+// roster reports a real faction/team. That is the only reliable WARDOGS signal
+// available to the panel that the player left the join menu and entered the game
+// flow. It works during normal matches and Waiting-for-Players/seeding alike.
+export function managedWelcomeTargets(state, players, joinedPlayers, { spawnSettleMs = 2_000, maxAttempts = 24, nowMs = Date.now() } = {}) {
   if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
   if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
   if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
@@ -66,8 +70,6 @@ export function managedWelcomeTargets(state, players, joinedPlayers, { joinDelay
   const activeIds = tracker?.active instanceof Set ? tracker.active : new Set();
 
   // Only clear a session after the join tracker has confirmed the player absent.
-  // With a >=2 snapshot leave threshold this keeps a queued 30-second welcome
-  // alive across a single incomplete/empty /v1/players response.
   for (const id of [...state.welcomePending]) if (!activeIds.has(id)) state.welcomePending.delete(id);
   for (const id of [...state.welcomeDelivered]) if (!activeIds.has(id)) state.welcomeDelivered.delete(id);
   for (const id of [...state.welcomeFailed]) if (!activeIds.has(id)) state.welcomeFailed.delete(id);
@@ -80,7 +82,9 @@ export function managedWelcomeTargets(state, players, joinedPlayers, { joinDelay
     state.welcomeDelivered.delete(steamId);
     state.welcomeFailed.delete(steamId);
     state.welcomeAttempts.delete(steamId);
-    state.welcomeReadyAt.set(steamId, Number(nowMs) + Math.max(0, Number(joinDelayMs) || 0));
+    // Do not start a blind timer at connect. The timer starts when a faction is
+    // visible, which is the useful team/spawn readiness signal for this API.
+    state.welcomeReadyAt.delete(steamId);
     state.welcomePending.add(steamId);
   }
 
@@ -89,7 +93,17 @@ export function managedWelcomeTargets(state, players, joinedPlayers, { joinDelay
   for (const steamId of [...state.welcomePending]) {
     const player = bySteamId.get(steamId);
     if (!player || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
-    const readyAt = Number(state.welcomeReadyAt.get(steamId) || 0);
+    if (!playerHasFaction(player)) {
+      // If the player returns to the team-selection menu before delivery, require
+      // a fresh faction observation before trying the private message again.
+      state.welcomeReadyAt.delete(steamId);
+      continue;
+    }
+    let readyAt = Number(state.welcomeReadyAt.get(steamId) || 0);
+    if (!readyAt) {
+      readyAt = Number(nowMs) + Math.max(0, Number(spawnSettleMs) || 0);
+      state.welcomeReadyAt.set(steamId, readyAt);
+    }
     if (readyAt > Number(nowMs)) continue;
     if (Number(state.welcomeAttempts.get(steamId) || 0) >= Number(maxAttempts || 24)) continue;
     targets.push({ ...player, steamId });
