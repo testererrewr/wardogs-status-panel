@@ -29,6 +29,10 @@ const lifecycleLocks = new Map();
 const recoveryState = new Map();
 const WELCOME_MAX_ATTEMPTS = 24;
 const WELCOME_RETRY_MS = 5000;
+// WARDOGS may expose a freshly joined player in /v1/players before its private
+// message endpoint is ready for that player. Delay the first welcome attempt so
+// the join/session can finish initializing, then keep the existing retry path.
+const WELCOME_JOIN_DELAY_MS = 30_000;
 
 function withLifecycleLock(id, task) {
   const key = String(id || '');
@@ -114,12 +118,14 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
   if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
   if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
+  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
   const tracker = state.welcomeJoinTracker || state.joinTracker;
   const activeIds = tracker?.active instanceof Set ? tracker.active : new Set();
   for (const id of [...state.welcomePending]) if (!activeIds.has(id)) state.welcomePending.delete(id);
   for (const id of [...state.welcomeDelivered]) if (!activeIds.has(id)) state.welcomeDelivered.delete(id);
   for (const id of [...state.welcomeFailed]) if (!activeIds.has(id)) state.welcomeFailed.delete(id);
   for (const id of [...state.welcomeAttempts.keys()]) if (!activeIds.has(id)) state.welcomeAttempts.delete(id);
+  for (const id of [...state.welcomeReadyAt.keys()]) if (!activeIds.has(id)) state.welcomeReadyAt.delete(id);
 
   for (const player of Array.isArray(joinedPlayers) ? joinedPlayers : []) {
     const steamId = playerSteamId(player);
@@ -130,6 +136,7 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
     state.welcomeDelivered.delete(steamId);
     state.welcomeFailed.delete(steamId);
     state.welcomeAttempts.delete(steamId);
+    state.welcomeReadyAt.set(steamId, Date.now() + WELCOME_JOIN_DELAY_MS);
     state.welcomePending.add(steamId);
   }
 
@@ -142,6 +149,8 @@ export function managedWelcomeTargets(state, players, joinedPlayers) {
     // which previously left the welcome queued forever. Player readiness is handled by
     // the whisper endpoint/retry path below instead.
     if (!player || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
+    const readyAt = Number(state.welcomeReadyAt.get(steamId) || 0);
+    if (readyAt > Date.now()) continue;
     if (Number(state.welcomeAttempts.get(steamId) || 0) >= WELCOME_MAX_ATTEMPTS) continue;
     targets.push({ ...player, steamId });
   }
@@ -154,8 +163,10 @@ export function managedWelcomeSucceeded(state, steamId) {
   if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
   if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
+  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
   state.welcomePending.delete(id);
   state.welcomeAttempts.delete(id);
+  state.welcomeReadyAt.delete(id);
   state.welcomeDelivered.add(id);
 }
 
@@ -165,11 +176,13 @@ export function managedWelcomeFailed(state, steamId, { retryable = true } = {}) 
   if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
   if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
+  if (!(state.welcomeReadyAt instanceof Map)) state.welcomeReadyAt = new Map();
   const attempts = Number(state.welcomeAttempts.get(id) || 0) + 1;
   state.welcomeAttempts.set(id, attempts);
   const retry = Boolean(retryable) && attempts < WELCOME_MAX_ATTEMPTS;
   if (!retry) {
     state.welcomePending.delete(id);
+    state.welcomeReadyAt.delete(id);
     state.welcomeFailed.add(id);
   }
   return { retry, attempts };
@@ -1588,7 +1601,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {
