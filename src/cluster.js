@@ -3,6 +3,7 @@ import { readDb, updateDb, getStatusNode, upsertStatusNode } from './db.js';
 import { decryptSecret } from './crypto.js';
 import { effectivePlan, isServerEntitled, brandedTemplates } from './plans.js';
 import { newNodeToken, hashNodeToken, safeTokenEqual } from './status-node-auth.js';
+import { aggregateKillStatsServers } from './kill-stats.js';
 
 const deadSeconds = Math.max(20, Number(process.env.STATUS_NODE_DEAD_SECONDS || 45));
 const minFreeMb = Math.max(0, Number(process.env.STATUS_NODE_MIN_FREE_MB || 150));
@@ -47,7 +48,19 @@ export function authenticateStatusNode(id, token) {
 export function heartbeatStatusNode(node, payload = {}) {
   const runtimes = payload.runtimes && typeof payload.runtimes === 'object' ? payload.runtimes : {};
   const metrics = payload.metrics && typeof payload.metrics === 'object' ? payload.metrics : {};
-  return upsertStatusNode({ id: node.id, lastSeenAt: new Date().toISOString(), runtimes, metrics, version: String(payload.version || node.version || '').slice(0, 40) });
+  const updated = upsertStatusNode({ id: node.id, lastSeenAt: new Date().toISOString(), runtimes, metrics, version: String(payload.version || node.version || '').slice(0, 40) });
+  // Persist the fixed Discord killfeed message IDs reported by Status Nodes.
+  // That lets a bot restart without creating a second panel in the channel.
+  updateDb((db) => {
+    for (const [serverId, rt] of Object.entries(runtimes)) {
+      const server = db.servers.find((row) => row.id === serverId && row.assignedNodeId === node.id);
+      if (!server || server.gameType !== 'wardogs') continue;
+      const messageId = /^\d{17,20}$/.test(String(rt?.killFeedMessageId || '')) ? String(rt.killFeedMessageId) : '';
+      if (messageId && messageId !== String(server.killFeedMessageId || '')) server.killFeedMessageId = messageId;
+      if (rt?.killFeedLastPublishedAt) server.killFeedLastPublishedAt = String(rt.killFeedLastPublishedAt);
+    }
+  });
+  return updated;
 }
 
 export function rebalanceAssignments() {
@@ -181,6 +194,12 @@ export function materializeWorkForNode(nodeId) {
   rebalanceAssignments();
   const db = readDb();
   const serviceDomain = String(db.siteSettings?.serviceDomain || process.env.SERVICE_DOMAIN || 'status-hub.lol').replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  const ownerStatsCache = new Map();
+  const ownerStats = (ownerDiscordId) => {
+    const key = String(ownerDiscordId || '');
+    if (!ownerStatsCache.has(key)) ownerStatsCache.set(key, aggregateKillStatsServers(db.servers.filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === key)));
+    return ownerStatsCache.get(key);
+  };
   return db.servers.filter((s) => s.enabled && s.assignedNodeId === nodeId && isServerEntitled(s, db)).map((s) => {
     const owner = db.users.find((u) => u.discordId === s.ownerDiscordId);
     const plan = effectivePlan(owner);
@@ -195,6 +214,14 @@ export function materializeWorkForNode(nodeId) {
       querySecretPlain: s.querySecretEnc ? decryptSecret(s.querySecretEnc) : '',
       onlineTemplates: brandedTemplates(s, owner, serviceDomain),
       offlineTemplate: brandedOffline,
+      ...(s.gameType === 'wardogs' ? (() => {
+        const global = ownerStats(s.ownerDiscordId);
+        return {
+          killFeedRecent: (Array.isArray(s.killFeedEvents) ? s.killFeedEvents : []).slice(-15).reverse(),
+          killStatsGlobalSummary: { totalEvents: global.totalEvents, playerCount: global.players.length, top10: global.top25.slice(0, 10), lastEventAt: global.lastEventAt },
+          killStatsServerCount: db.servers.filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === String(s.ownerDiscordId || '') && (row.killStats?.totalEvents || row.killFeedConfiguredAt)).length
+        };
+      })() : {}),
       plan: plan.id
     };
   });

@@ -1,7 +1,36 @@
-# status-hub.lol v3.12.35
+# status-hub.lol v3.12.37
 
 
 
+
+
+
+## v3.12.37 – WARDOGS Status Bot: Status + per-server Killfeed + globale Stats
+
+- Der separate **WARDOGS Killfeed & Stats Bot** wurde in den bestehenden **WARDOGS Status Bot** integriert; im öffentlichen Bot-Service-Katalog wird der separate 0,99-€-Service nicht mehr angeboten.
+- Jeder WARDOGS Status Bot / Gameserver kann einen eigenen Discord-Killfeed-Channel bekommen. Pro Server bleibt genau **eine feste Killfeed-Nachricht** im Channel und zeigt die letzten 15 Kills dieses Servers.
+- Mehrere WARDOGS Server desselben Accounts werden parallel getrackt. Die **Spielerstatistiken sind accountweit global** und summieren Kills/Tode/Headshots/Kill-Ursachen usw. über alle getrackten WARDOGS Status Bots dieses Accounts.
+- Discord `Spieler suchen` und `Top Kills` verwenden die globalen Account-Stats, während der sichtbare Killfeed serverbezogen bleibt. Die Suche funktioniert nach Name, Alias und Steam64ID, auch für offline Spieler.
+- Neues Webpanel `Killfeed & Stats` pro WARDOGS Status Bot: globale Top 25 + globale Spielersuche sowie die letzten 150 Kills genau dieses Gameservers mit Killer/Victim SteamIDs, Ursache/Waffe, Distanz, Map und Kontext-Tags.
+- Der WARDOGS Server Feed wird direkt in den Status-Bot-Einstellungen konfiguriert. Nach `Kill Feed konfigurieren` ist einmal ein Gameserver-Neustart nötig.
+- Der Management Bot erhält weiterhin denselben Feed für seinen 150-Event-Moderationsverlauf, auch wenn der Feed über den Status Bot eingerichtet wurde.
+- Bereits vorhandene v3.12.36 Killfeed-&-Stats-Daten werden bei passendem Owner + WARDOGS-Serverziel automatisch in den Status Bot übernommen; der alte Service wird danach für neue Käufe ausgeblendet.
+- Feste Discord-Killfeed-Message-IDs werden vom Status Node an die Control Plane zurückgespeichert, damit ein Bot-Neustart keine zweite Killfeed-Nachricht erzeugt.
+- Database schema version 36.
+
+## v3.12.36 – WARDOGS Killfeed & Stats Bot
+
+- Neuer separater Bot-Service **WARDOGS Killfeed & Stats Bot** für **€0,99 / Monat**.
+- Nutzt den offiziellen WARDOGS `WDServerFeed` Push-Feed (`POST /api/ingest/events`) statt Kill-Daten zu erraten.
+- Discord-Killfeed bleibt als **eine feste Nachricht** im Channel und wird in-place aktualisiert; angezeigt werden die letzten 15 Kills.
+- Persistente All-Time-Statistiken über alle ab Aktivierung getrackten Matches: Kills, Tode, K/D, Headshots, längster Kill, Suicide/Environment sowie Kill-Ursachen.
+- Erfasst Distanz und Kontext-Tags wie Headshot, Penetration, Ricochet, Melee, Vehicle Explosion, Roadkill, Falling und Suicide.
+- Spieler-Suche nach Name/Steam64ID im **Webpanel** und direkt im **Discord-Panel** per Search-Button/Modal; auch offline Spieler bleiben auffindbar.
+- Management Bot erhält einen eigenen Moderations-Killfeed mit den letzten **150** Kills/Toden inkl. SteamIDs, Distanz, Ursache, Map und Tags.
+- `Server Feed konfigurieren` schreibt `Url` + Token in `[WDServerFeed]`; WARDOGS lädt diese Einstellung erst nach einem Gameserver-Neustart.
+- Mehrere Service-Bots am selben WARDOGS Ziel teilen denselben eingehenden Feed intern, sodass Management und Stats parallel tracken können.
+- Assists und Revives werden nicht erfunden: die aktuelle WARDOGS Feed/API-Dokumentation liefert dafür keine auswertbaren Events.
+- Database schema version 35.
 
 ## v3.12.35 – Ban Sync Community policy
 

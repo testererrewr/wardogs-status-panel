@@ -105,9 +105,9 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Moderations-Killfeed mit den letzten 150 Kills/Toden inkl. Distanz & Kill-Tags', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion'],
     category: 'wardogs',
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Config export / import', 'Auto recovery', 'Whisper entire faction'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Moderation killfeed with the latest 150 kills/deaths including distance & kill tags', 'Config export / import', 'Auto recovery', 'Whisper entire faction'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -142,10 +142,11 @@ function defaultBotServices() {
     visible: true,
     featured: false,
     sortOrder: 20
+
   }];
 }
 
-const emptyDb = () => ({ version: 34, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 36, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -162,7 +163,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 34;
+  parsed.version = 36;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -430,6 +431,79 @@ function migrate(parsed) {
       }
     }
   }
+  if (previousVersion < 35) {
+    // v3.12.36 adds the hosted Killfeed & Stats Bot and persistent WARDOGS kill-feed storage.
+    const defaults = defaultBotServices();
+    for (const serviceId of ['wardogs-warning-bot', 'wardogs-kill-stats']) {
+      const defaultsRow = defaults.find((x) => x.id === serviceId);
+      if (!defaultsRow) continue;
+      const serviceIndex = parsed.botServices.findIndex((x) => x.id === serviceId || x.slug === serviceId);
+      if (serviceIndex >= 0) {
+        const existing = parsed.botServices[serviceIndex];
+        parsed.botServices[serviceIndex] = {
+          ...defaultsRow, ...existing,
+          nameDe: defaultsRow.nameDe, nameEn: defaultsRow.nameEn,
+          descriptionDe: defaultsRow.descriptionDe, descriptionEn: defaultsRow.descriptionEn,
+          featuresDe: defaultsRow.featuresDe, featuresEn: defaultsRow.featuresEn,
+          priceLabel: defaultsRow.priceLabel, monthlyAmount: defaultsRow.monthlyAmount, currency: defaultsRow.currency,
+          status: 'available', category: defaultsRow.category, sortOrder: defaultsRow.sortOrder, updatedAt: migrationNow
+        };
+      } else parsed.botServices.push({ ...defaultsRow, createdAt: migrationNow, updatedAt: migrationNow });
+    }
+    for (const bot of parsed.managedBots) {
+      if (!Array.isArray(bot.killFeedEvents)) bot.killFeedEvents = [];
+      if (!bot.killStats || typeof bot.killStats !== 'object') bot.killStats = null;
+      if (typeof bot.killFeedTokenEnc !== 'string') bot.killFeedTokenEnc = '';
+      if (typeof bot.killFeedChannelId !== 'string') bot.killFeedChannelId = '';
+      if (typeof bot.killFeedMessageId !== 'string') bot.killFeedMessageId = '';
+    }
+  }
+  if (previousVersion < 36) {
+    // v3.12.37 integrates Killfeed & all-time kill statistics into WARDOGS
+    // Status Bots. The old standalone Killfeed & Stats service is hidden and,
+    // where a matching Status Bot exists, its stored data is carried over.
+    const legacyService = parsed.botServices.find((x) => x.id === 'wardogs-kill-stats' || x.slug === 'wardogs-kill-stats');
+    if (legacyService) {
+      legacyService.visible = false;
+      legacyService.featured = false;
+      legacyService.status = 'paused';
+      legacyService.nameDe = 'WARDOGS Status Bot';
+      legacyService.nameEn = 'WARDOGS Status Bot';
+      legacyService.updatedAt = migrationNow;
+    }
+    const normUrl = (value) => String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+    for (const bot of parsed.managedBots.filter((row) => row?.serviceId === 'wardogs-kill-stats')) {
+      const target = parsed.servers.find((server) => server?.gameType === 'wardogs'
+        && String(server?.ownerDiscordId || '') === String(bot?.ownerDiscordId || '')
+        && normUrl(server?.queryConfig?.baseUrl) === normUrl(bot?.wardogsBaseUrl));
+      if (!target) continue;
+      if ((!target.killStats || typeof target.killStats !== 'object') && bot.killStats && typeof bot.killStats === 'object') target.killStats = bot.killStats;
+      if ((!Array.isArray(target.killFeedEvents) || !target.killFeedEvents.length) && Array.isArray(bot.killStats?.recentEvents)) target.killFeedEvents = bot.killStats.recentEvents.slice(-500);
+      if (!target.killFeedTokenEnc && bot.killFeedTokenEnc) target.killFeedTokenEnc = bot.killFeedTokenEnc;
+      if (!target.killFeedChannelId && bot.killFeedChannelId) target.killFeedChannelId = bot.killFeedChannelId;
+      if (!target.killFeedMessageId && bot.killFeedMessageId) target.killFeedMessageId = bot.killFeedMessageId;
+      target.killFeedConfiguredAt ||= bot.killFeedConfiguredAt || null;
+      target.killFeedPublicUrl ||= bot.killFeedPublicUrl || '';
+      target.killFeedNeedsGameRestart = bot.killFeedNeedsGameRestart === true;
+      target.killFeedLastEventAt ||= bot.killFeedLastEventAt || null;
+      target.killFeedLastPublishedAt ||= bot.killFeedLastPublishedAt || null;
+      bot.enabled = false;
+      bot.migratedToStatusServerId = target.id;
+    }
+  }
+  parsed.servers = parsed.servers.map((server) => ({
+    ...server,
+    killFeedTokenEnc: String(server?.killFeedTokenEnc || ''),
+    killFeedConfiguredAt: server?.killFeedConfiguredAt || null,
+    killFeedPublicUrl: String(server?.killFeedPublicUrl || '').slice(0, 300),
+    killFeedNeedsGameRestart: server?.killFeedNeedsGameRestart === true,
+    killFeedLastEventAt: server?.killFeedLastEventAt || null,
+    killFeedChannelId: /^\d{17,20}$/.test(String(server?.killFeedChannelId || '')) ? String(server.killFeedChannelId) : '',
+    killFeedMessageId: /^\d{17,20}$/.test(String(server?.killFeedMessageId || '')) ? String(server.killFeedMessageId) : '',
+    killFeedLastPublishedAt: server?.killFeedLastPublishedAt || null,
+    killFeedEvents: (Array.isArray(server?.killFeedEvents) ? server.killFeedEvents : []).slice(-500),
+    killStats: server?.killStats && typeof server.killStats === 'object' ? server.killStats : null
+  }));
   parsed.banSyncServers = (Array.isArray(parsed.banSyncServers) ? parsed.banSyncServers : []).map((room) => ({
     id: String(room?.id || crypto.randomUUID()).slice(0, 80),
     name: String(room?.name || 'Ban Sync Server').trim().slice(0, 80) || 'Ban Sync Server',
@@ -508,6 +582,16 @@ function migrate(parsed) {
     steamWebApiKeyEnc: String(b.steamWebApiKeyEnc || ''),
     steamAppId: /^\d{1,10}$/.test(String(b.steamAppId || '')) ? String(b.steamAppId) : '1867240',
     ignoredPlayers: (Array.isArray(b.ignoredPlayers) ? b.ignoredPlayers : []).map((entry) => typeof entry === 'string' ? { steamId: entry } : entry).map((entry) => ({ steamId: String(entry?.steamId || ''), name: String(entry?.name || '').slice(0, 100), ignoredAt: entry?.ignoredAt || null, ignoredBy: String(entry?.ignoredBy || '') })).filter((entry) => /^\d{17}$/.test(entry.steamId)).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 500),
+    killFeedTokenEnc: String(b.killFeedTokenEnc || ''),
+    killFeedConfiguredAt: b.killFeedConfiguredAt || null,
+    killFeedPublicUrl: String(b.killFeedPublicUrl || '').slice(0, 300),
+    killFeedNeedsGameRestart: b.killFeedNeedsGameRestart === true,
+    killFeedLastEventAt: b.killFeedLastEventAt || null,
+    killFeedChannelId: /^\d{17,20}$/.test(String(b.killFeedChannelId || '')) ? String(b.killFeedChannelId) : '',
+    killFeedMessageId: /^\d{17,20}$/.test(String(b.killFeedMessageId || '')) ? String(b.killFeedMessageId) : '',
+    killFeedLastPublishedAt: b.killFeedLastPublishedAt || null,
+    killFeedEvents: (Array.isArray(b.killFeedEvents) ? b.killFeedEvents : []).slice(-150),
+    killStats: b.killStats && typeof b.killStats === 'object' ? b.killStats : null,
     accessSource: String(b.accessSource || ''),
     accessRecordId: String(b.accessRecordId || ''),
     accessUntil: b.accessUntil || null,
@@ -616,7 +700,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedChannelId: '', killFeedMessageId: '', killFeedLastPublishedAt: null, killFeedEvents: [], killStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

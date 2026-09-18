@@ -25,6 +25,7 @@ import { prepareCustomBot, parseEnvText, deleteCustomBotFiles, listCustomBotFile
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
 import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, temporaryBanManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, whisperManagedFaction, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64, normalizeManagedBanDiscordLink, formatManagedBanDuration, requestManagedBanSync, acceptManagedBanSync, rejectManagedBanSync, syncManagedBanSnapshot, createManagedBanSyncServer, joinManagedBanSyncServer, leaveManagedBanSyncServer, resyncManagedBanSyncServer, updateManagedBanSyncCommunitySettings, appendManagedAudit } from './managed-bots.js';
 import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, playtimeTrackerServers, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
+import { KILL_STATS_SERVICE_ID, killStatsBotRuntime, syncKillStatsBots, restartKillStatsBot, stopKillStatsBot, shutdownKillStatsBots, testKillStatsWardogs, refreshKillStatsDiscord, killStatsSnapshot, searchKillStatsPlayer, managementKillFeed, prettyCause, configureWardogsKillFeed, configureWardogsStatusKillFeed, ingestWardogsKillFeed, aggregateKillStatsServers, searchKillStatsSnapshot, statusServerKillFeed } from './kill-stats.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
@@ -103,7 +104,7 @@ const securityRateLimit = (name, windowMs, limit, extra = {}) => rateLimit({
   message: { error: 'Too many requests. Please try again later.' },
   ...extra
 });
-const skipInfrastructureLimits = (req) => req.path === '/healthz' || req.path.startsWith('/webhooks/') || req.path.startsWith('/api/status-nodes/');
+const skipInfrastructureLimits = (req) => req.path === '/healthz' || req.path === '/api/ingest/events' || req.path.startsWith('/webhooks/') || req.path.startsWith('/api/status-nodes/');
 app.use(helmet({
   contentSecurityPolicy: {
     useDefaults: true,
@@ -529,6 +530,17 @@ function ownedServer(req, id) {
   if (!server || !u) return null;
   return u.role === 'admin' || server.ownerDiscordId === u.discordId ? server : null;
 }
+
+function ownerWardogsStatusServers(server) {
+  return (readDb().servers || []).filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === String(server?.ownerDiscordId || ''));
+}
+function statusKillfeedSetupPanel(req, server) {
+  if (server?.gameType !== 'wardogs') return '';
+  const configured=Boolean(server.killFeedTokenEnc && server.killFeedConfiguredAt);
+  const lastEvent=server.killFeedLastEventAt?new Date(server.killFeedLastEventAt).toLocaleString(localeCode(langOf(req))):'—';
+  const channel=server.killFeedChannelId||l(req,'nicht gesetzt','not set');
+  return `<section class="panel"><div class="row between"><div><span class="eyebrow">WARDOGS Status Bot</span><h2>${l(req,'Killfeed & globale Stats','Killfeed & global stats')}</h2><p>${l(req,'Dieser Server hat sein eigenes festes Discord-Killfeed-Panel mit den letzten 15 Kills. Spielerstatistiken werden accountweit über alle deine WARDOGS Status Bots zusammengezählt.','This server has its own fixed Discord killfeed panel with the latest 15 kills. Player statistics are aggregated account-wide across all your WARDOGS Status Bots.')}</p></div><span class="badge ${configured?'online':'neutral'}">${configured?l(req,'Feed konfiguriert','Feed configured'):l(req,'Feed nicht konfiguriert','Feed not configured')}</span></div><div class="managed-live-grid"><article class="panel"><span class="eyebrow">Discord Channel</span><strong class="small">${esc(channel)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Letztes Event','Last event')}</span><strong class="small">${esc(lastEvent)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Getrackte Server','Tracked servers')}</span><strong>${esc(ownerWardogsStatusServers(server).length)}</strong></article></div>${server.killFeedNeedsGameRestart?`<div class="warning"><strong>${l(req,'Gameserver-Neustart erforderlich','Game server restart required')}:</strong> ${l(req,'WARDOGS liest die Server-Feed-Konfiguration beim Start ein.','WARDOGS reads the server-feed configuration at startup.')}</div>`:''}<div class="actions wrap"><form method="post" action="/servers/${esc(server.id)}/killfeed/configure" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${configured?l(req,'Kill Feed erneut konfigurieren','Reconfigure Kill Feed'):l(req,'Kill Feed konfigurieren','Configure Kill Feed')}</button></form><a class="button ghost" href="/servers/${esc(server.id)}/stats">${l(req,'Killfeed & Stats öffnen','Open killfeed & stats')}</a></div></section>`;
+}
 function ownedCustom(req, id) {
   const bot = getCustomBot(id); const u = currentUser(req);
   if (!bot || !u) return null;
@@ -551,11 +563,11 @@ function latestServiceSubscription(discordId, serviceId) { return listPaypalServ
 function pendingServiceSubscription(discordId, serviceId) { return listPaypalServiceSubscriptionsForUser(discordId, serviceId).find((x) => ['CREATING','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(String(x.status || '').toUpperCase()) && !x.cancelledAt) || null; }
 function serviceSubscriptionForBot(bot) { return bot?.accessRecordId ? getPaypalServiceSubscriptionRecord(String(bot.accessRecordId)) : null; }
 function managedManageUrl(serviceId, botId = '') { const base = `/bot-services/${encodeURIComponent(serviceId)}/manage`; return botId ? `${base}?bot=${encodeURIComponent(botId)}` : base; }
-function supportedManagedService(service) { return Boolean(service && ['wardogs-warning-bot', PLAYTIME_SERVICE_ID].includes(String(service.id))); }
-function serviceBotRuntime(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? playtimeBotRuntime(bot.id) : managedBotRuntime(bot?.id); }
-async function syncAllServiceBots() { const bots=readDb().managedBots||[]; await Promise.all([syncManagedBots(bots), syncPlaytimeBots(bots)]); }
-async function restartServiceBot(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? restartPlaytimeBot(bot) : restartManagedBot(bot); }
-async function stopServiceBot(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? stopPlaytimeBot(bot.id) : stopManagedBot(bot.id); }
+function supportedManagedService(service) { return Boolean(service && ['wardogs-warning-bot', PLAYTIME_SERVICE_ID, KILL_STATS_SERVICE_ID].includes(String(service.id))); }
+function serviceBotRuntime(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? playtimeBotRuntime(bot.id) : bot?.serviceId === KILL_STATS_SERVICE_ID ? killStatsBotRuntime(bot.id) : managedBotRuntime(bot?.id); }
+async function syncAllServiceBots() { const bots=readDb().managedBots||[]; await Promise.all([syncManagedBots(bots), syncPlaytimeBots(bots), syncKillStatsBots(bots)]); }
+async function restartServiceBot(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? restartPlaytimeBot(bot) : bot?.serviceId === KILL_STATS_SERVICE_ID ? restartKillStatsBot(bot) : restartManagedBot(bot); }
+async function stopServiceBot(bot) { return bot?.serviceId === PLAYTIME_SERVICE_ID ? stopPlaytimeBot(bot.id) : bot?.serviceId === KILL_STATS_SERVICE_ID ? stopKillStatsBot(bot.id) : stopManagedBot(bot.id); }
 
 async function discordApi(path, options = {}) {
   const response = await fetch(`https://discord.com/api/v10${path}`, options);
@@ -647,6 +659,19 @@ function buildQuery(req, old = null) {
 }
 
 app.get('/healthz', (req, res) => res.json({ ok: true, service: 'server-status-hub' }));
+
+app.post('/api/ingest/events', rateLimit({ windowMs: 10 * 60_000, limit: 1200, standardHeaders: 'draft-8', legacyHeaders: false }), async (req, res) => {
+  const auth = String(req.get('authorization') || '');
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ error: { code: 'unauthorized', message: 'Bearer token required.' } });
+  try {
+    const result = await ingestWardogsKillFeed(match[1].trim(), req.body || {});
+    return res.status(202).json({ ok: true, ...result });
+  } catch (error) {
+    const status = Number(error?.status || 0) === 401 ? 401 : 400;
+    return res.status(status).json({ error: { code: status === 401 ? 'unauthorized' : 'invalid_feed', message: String(error?.message || error).slice(0, 240) } });
+  }
+});
 app.get('/language/:lang', (req, res) => {
   const lang = normalizeLang(req.params.lang);
   req.session.lang = lang;
@@ -673,6 +698,17 @@ app.post('/api/status-nodes/heartbeat', requireStatusNode, (req, res) => {
 app.get('/api/status-nodes/work', requireStatusNode, (req, res) => {
   try { res.set('Cache-Control','no-store').json({ ok: true, leaseSeconds, servers: materializeWorkForNode(req.statusNode.id) }); }
   catch (error) { res.status(500).json({ error: error.message }); }
+});
+app.get('/api/status-nodes/stats/:serverId', requireStatusNode, (req, res) => {
+  try {
+    const server=getServer(String(req.params.serverId||''));
+    if(!server||server.assignedNodeId!==req.statusNode.id)return res.status(404).json({error:'Status server not assigned to this node'});
+    const ownerServers=(readDb().servers||[]).filter((row)=>row.gameType==='wardogs'&&String(row.ownerDiscordId||'')===String(server.ownerDiscordId||''));
+    const snapshot=aggregateKillStatsServers(ownerServers);
+    const q=String(req.query.q||'').trim();
+    const matches=q?searchKillStatsSnapshot(snapshot,q):[];
+    res.set('Cache-Control','no-store').json({ok:true,totalEvents:snapshot.totalEvents,playerCount:snapshot.players.length,top10:snapshot.top25.slice(0,10),matches:matches.slice(0,25),serverCount:ownerServers.length,lastEventAt:snapshot.lastEventAt});
+  } catch(error){res.status(500).json({error:String(error?.message||error).slice(0,240)});}
 });
 
 app.get('/login', (req, res) => {
@@ -1110,6 +1146,46 @@ function playtimeStatsPanel(req,bot) {
 }
 
 
+function killFlagText(event){return [event.headshot?'HS':'',event.penetration?'PEN':'',event.ricochet?'RICO':'',event.melee?'MELEE':'',event.vehicleExplosion?'VEH':'',event.roadKill?'ROAD':'',event.falling?'FALL':'',event.suicide?'SUICIDE':''].filter(Boolean).join(' · ')||'—';}
+function killStatsForm(req,service,bot){
+  const lang=langOf(req),u=currentUser(req),rt=killStatsBotRuntime(bot.id);
+  return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid">
+    <input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="botId" value="${esc(bot.id)}">
+    <label>${tr(lang,'Bot-Name','Bot name')}<input name="name" maxlength="80" required value="${esc(bot.name||service.nameDe||service.nameEn||'WARDOGS Killfeed & Stats Bot')}"></label>
+    <label>Discord Bot Token (${tr(lang,'optional','optional')})<input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Nur für Discord Killfeed nötig','Only needed for Discord killfeed')}"></label>
+    <label class="span2">WARDOGS API / RCON URL<input name="wardogsBaseUrl" required value="${esc(bot.wardogsBaseUrl||'')}" placeholder="http://server.example.com:7776"></label>
+    <label class="span2">WARDOGS RCON / Bearer Password<input name="wardogsSecret" type="password" autocomplete="new-password" placeholder="${bot.wardogsSecretEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflichtfeld','Required')}"></label>
+    <label class="span2">Discord Killfeed Channel ID (${tr(lang,'optional','optional')})<input name="killFeedChannelId" inputmode="numeric" value="${esc(bot.killFeedChannelId||'')}" placeholder="123456789012345678"><span class="muted small">${tr(lang,'Eine feste Nachricht wird immer wieder editiert und zeigt die letzten 15 Kills.','One fixed message is edited in place and always shows the latest 15 kills.')}</span></label>
+    <label class="check"><input type="checkbox" name="enabled" value="1" ${bot.enabled?'checked':''}> ${tr(lang,'Stats Bot aktiv / gehostet','Stats bot enabled / hosted')}</label>
+    <label class="check"><input type="checkbox" name="autoRecoveryEnabled" value="1" ${bot.autoRecoveryEnabled!==false?'checked':''}> ${tr(lang,'Auto-Recovery','Auto recovery')}</label>
+    ${u.role==='admin'?`<label class="check span2"><input type="checkbox" name="allowPrivateTarget" value="1" ${bot.allowPrivateTarget?'checked':''}> ${tr(lang,'Private/LAN WARDOGS-Ziele erlauben (Admin)','Allow private/LAN WARDOGS targets (admin)')}</label>`:''}
+    <div class="span2 actions wrap"><button class="button primary" type="submit">${tr(lang,'Speichern','Save')}</button><button class="button ghost" type="submit" formaction="/bot-services/${encodeURIComponent(service.id)}/test">${tr(lang,'Verbindung testen','Test connection')}</button>${bot.enabled?`<button class="button ghost" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Neu starten','Restart')}</button><button class="button danger" type="submit" formaction="/managed-bots/${esc(bot.id)}/stop">Stop</button>`:`<button class="button success" type="submit" formaction="/managed-bots/${esc(bot.id)}/restart">${tr(lang,'Starten','Start')}</button>`}<span class="badge ${rt.state==='online'?'online':rt.state==='error'?'error':'neutral'}">${esc(rt.state||'stopped')}</span></div>
+    ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastPublishError?`<div class="span2 warning"><strong>Discord Killfeed:</strong> ${esc(rt.lastPublishError)}</div>`:''}
+  </form>${killFeedSetupPanel(req,bot)}<section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>`;
+}
+function killFeedSetupPanel(req,bot){
+  const configured=Boolean(bot.killFeedConfiguredAt),live=Boolean(bot.killFeedLastEventAt);
+  return `<section class="panel"><div class="row between"><div><span class="eyebrow">WARDOGS Server Feed</span><h2>${l(req,'Killfeed-Empfang','Killfeed ingest')}</h2></div><span class="badge ${live?'online':configured?'neutral':'error'}">${live?l(req,'Events kommen an','receiving events'):configured?l(req,'konfiguriert','configured'):l(req,'nicht konfiguriert','not configured')}</span></div><p class="muted small">${l(req,'Für Distanz, Headshots und Kill-Tags muss WARDOGS seinen Server Feed an dieses Panel senden. Das Setup schreibt Url + Token in [WDServerFeed]. Diese WARDOGS-Einstellung wird erst nach einem Neustart des Gameservers aktiv.','For distance, headshots and kill tags WARDOGS must push its Server Feed to this panel. Setup writes Url + Token into [WDServerFeed]. This WARDOGS setting only becomes active after a game-server restart.')}</p><form method="post" action="/managed-bots/${esc(bot.id)}/killfeed/setup"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${configured?l(req,'Server Feed erneut konfigurieren','Configure Server Feed again'):l(req,'Server Feed konfigurieren','Configure Server Feed')}</button></form>${bot.killFeedNeedsGameRestart?`<div class="warning"><strong>${l(req,'Gameserver-Neustart nötig','Game-server restart required')}</strong> · ${l(req,'WARDOGS liest WDServerFeed erst beim Serverstart ein.','WARDOGS reads WDServerFeed only at game-server startup.')}</div>`:''}${bot.killFeedLastEventAt?`<p class="muted small">${l(req,'Letztes Event','Last event')}: ${esc(new Date(bot.killFeedLastEventAt).toLocaleString(localeCode(langOf(req))))}</p>`:''}</section>`;
+}
+function killStatsPanel(req,bot){
+  const snap=killStatsSnapshot(bot),query=String(req.query.playerq||'').trim().slice(0,100),matches=query?searchKillStatsPlayer(bot,query):[];
+  const top=snap.top25.map((p,i)=>`<tr><td>${i+1}</td><td><strong>${esc(p.name)}</strong><div class="muted small"><a target="_blank" rel="noopener" href="https://steamcommunity.com/profiles/${esc(p.steamId)}">${esc(p.steamId)}</a></div></td><td><strong>${esc(p.kills)}</strong></td><td>${esc(p.deaths)}</td><td>${esc((p.deaths?p.kills/p.deaths:p.kills).toFixed(2))}</td><td>${esc(p.headshots)}</td><td>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</td></tr>`).join('');
+  const search=matches.map((p)=>`<tr><td><strong>${esc(p.name)}</strong><div class="muted small">${esc(p.steamId)}${p.aliases?.length?` · ${l(req,'früher','aliases')}: ${esc(p.aliases.join(', '))}`:''}</div></td><td>${esc(p.kills)}</td><td>${esc(p.deaths)}</td><td>${esc((p.deaths?p.kills/p.deaths:p.kills).toFixed(2))}</td><td>${esc(p.headshots)}</td><td>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</td><td>${(p.topCauses||[]).slice(0,3).map(([c,n])=>`${esc(prettyCause(c))}: ${esc(n)}`).join('<br>')||'—'}</td></tr>`).join('');
+  const feed=snap.recentEvents.slice(0,50).map((e)=>`<tr><td>${esc(new Date(e.receivedAt).toLocaleString(localeCode(langOf(req))))}</td><td>${e.killerSteamId?`<strong>${esc(e.killerName||e.killerSteamId)}</strong><div class="muted small">${esc(e.killerSteamId)}</div>`:esc(e.suicide?'Suicide':'Environment')}</td><td><strong>${esc(e.victimName||e.victimSteamId)}</strong><div class="muted small">${esc(e.victimSteamId)}</div></td><td>${esc(prettyCause(e.cause))}</td><td>${e.distanceMeters?`${esc(Number(e.distanceMeters).toFixed(1))} m`:'—'}</td><td>${esc(killFlagText(e))}</td><td>${esc(e.mapName||'—')}</td></tr>`).join('');
+  return `<section class="playtime-dashboard"><div class="pagehead compact"><div><span class="eyebrow">WARDOGS Kill Stats</span><h2>${l(req,'All-Time Statistiken','All-time statistics')}</h2></div>${bot.killFeedChannelId?`<form method="post" action="/managed-bots/${esc(bot.id)}/killstats/refresh"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${l(req,'Discord Killfeed aktualisieren','Refresh Discord killfeed')}</button></form>`:''}</div>
+    <section class="admin-stats"><article class="panel"><span class="eyebrow">${l(req,'Kills/Tode-Events','Kill/death events')}</span><strong>${esc(snap.totalEvents)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Spieler','Players')}</span><strong>${esc(snap.players.length)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Top Killer','Top killer')}</span><strong>${esc(snap.top25[0]?.name||'—')}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Letztes Event','Last event')}</span><strong class="small">${snap.lastEventAt?esc(new Date(snap.lastEventAt).toLocaleString(localeCode(langOf(req)))):'—'}</strong></article></section>
+    <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">${l(req,'Spielersuche','Player search')}</span><h2>${l(req,'Spielerstatistik suchen','Search player stats')}</h2></div></div><form method="get" action="/bot-services/${encodeURIComponent(bot.serviceId)}/manage" class="managed-add-row"><input type="hidden" name="bot" value="${esc(bot.id)}"><input name="playerq" maxlength="100" value="${esc(query)}" placeholder="${l(req,'Name oder Steam64ID','Name or Steam64ID')}"><button class="button primary smallbtn">${l(req,'Suchen','Search')}</button></form>${query?`<table><thead><tr><th>${l(req,'Spieler','Player')}</th><th>Kills</th><th>${l(req,'Tode','Deaths')}</th><th>K/D</th><th>Headshots</th><th>${l(req,'Längster Kill','Longest kill')}</th><th>${l(req,'Top Ursachen','Top causes')}</th></tr></thead><tbody>${search||`<tr><td colspan="7">${l(req,'Kein Spieler gefunden.','No player found.')}</td></tr>`}</tbody></table>`:''}</div>
+    <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">Leaderboard</span><h2>Top 25 · ${l(req,'alle Matches','all matches')}</h2></div></div><table><thead><tr><th>#</th><th>${l(req,'Spieler','Player')}</th><th>Kills</th><th>${l(req,'Tode','Deaths')}</th><th>K/D</th><th>Headshots</th><th>${l(req,'Längster Kill','Longest kill')}</th></tr></thead><tbody>${top||`<tr><td colspan="7">${l(req,'Noch keine Kill-Events empfangen.','No kill events received yet.')}</td></tr>`}</tbody></table></div>
+    <div class="panel tablewrap"><div class="managed-heading padded"><div><span class="eyebrow">Live Killfeed</span><h2>${l(req,'Letzte 50 Events','Latest 50 events')}</h2></div></div><table><thead><tr><th>${l(req,'Zeit','Time')}</th><th>Killer</th><th>${l(req,'Opfer','Victim')}</th><th>${l(req,'Waffe/Ursache','Weapon/cause')}</th><th>${l(req,'Distanz','Distance')}</th><th>Tags</th><th>Map</th></tr></thead><tbody>${feed||`<tr><td colspan="7">${l(req,'Noch keine Kill-Events empfangen.','No kill events received yet.')}</td></tr>`}</tbody></table></div>
+    <div class="panel muted small">${l(req,'Hinweis: Die aktuelle WARDOGS API/der Kill-Feed liefert Kills, Tode, Distanz und Kill-Kontext-Tags. Assists und Revives werden derzeit nicht als auswertbare Events bereitgestellt und deshalb nicht erfunden.','Note: the current WARDOGS API/kill feed exposes kills, deaths, distance and kill-context tags. Assists and revives are not currently exposed as usable events, so they are not fabricated.')}</div>
+  </section>`;
+}
+function managedKillFeedPanel(req,bot){
+  const events=managementKillFeed(bot),rows=events.map((e)=>`<tr><td>${esc(new Date(e.receivedAt).toLocaleString(localeCode(langOf(req))))}</td><td>${e.killerSteamId?`<strong>${esc(e.killerName||e.killerSteamId)}</strong><div class="muted small">${esc(e.killerSteamId)}</div>`:esc(e.suicide?'Suicide':'Environment')}</td><td><strong>${esc(e.victimName||e.victimSteamId)}</strong><div class="muted small">${esc(e.victimSteamId)}</div></td><td>${esc(prettyCause(e.cause))}</td><td>${e.distanceMeters?`${esc(Number(e.distanceMeters).toFixed(1))} m`:'—'}</td><td>${esc(killFlagText(e))}</td><td>${esc(e.mapName||'—')}</td></tr>`).join('');
+  return `<section class="panel tablewrap managed-section"><div class="managed-heading padded"><div><span class="eyebrow">Moderation Killfeed</span><h2>${l(req,'Letzte 150 Kills/Tode','Latest 150 kills/deaths')}</h2><p>${l(req,'Persistenter Moderationsverlauf mit SteamIDs, Ursache/Waffe, Distanz und WARDOGS-Kill-Tags.','Persistent moderation history with SteamIDs, cause/weapon, distance and WARDOGS kill tags.')}</p></div></div><div class="padded">${killFeedSetupPanel(req,bot)}</div><table><thead><tr><th>${l(req,'Zeit','Time')}</th><th>Killer</th><th>${l(req,'Opfer','Victim')}</th><th>${l(req,'Waffe/Ursache','Weapon/cause')}</th><th>${l(req,'Distanz','Distance')}</th><th>Tags</th><th>Map</th></tr></thead><tbody>${rows||`<tr><td colspan="7">${l(req,'Noch keine Kill-Events empfangen.','No kill events received yet.')}</td></tr>`}</tbody></table></section>`;
+}
+
+
 function managedIgnoredPlayersPanel(req, bot) {
   const rows=(Array.isArray(bot.ignoredPlayers)?bot.ignoredPlayers:[]).filter((entry)=>/^\d{17}$/.test(String(entry?.steamId||''))).slice().sort((a,b)=>String(b.ignoredAt||'').localeCompare(String(a.ignoredAt||'')));
   const token=esc(csrf(req));
@@ -1287,9 +1363,13 @@ app.get('/bot-services/:id/manage', requireLogin, async(req,res)=>{
     const rt=playtimeBotRuntime(selected.id);
     return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Tracker</span><h2>${esc(rt.state||'stopped')}</h2></article></section>${playtimeTrackerForm(req,service,selected)}${playtimeStatsPanel(req,selected)}${deleteHtml}`);
   }
+  if(service.id===KILL_STATS_SERVICE_ID){
+    const rt=killStatsBotRuntime(selected.id);
+    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Killfeed & Stats</span><h2>${esc(rt.state||'stopped')}</h2><p>${l(req,'All-Time Killstatistiken und ein Discord-Killfeed, der als feste Nachricht im Channel bleibt.','All-time kill statistics and a Discord killfeed that stays in place as one fixed message.')}</p></article></section>${killStatsForm(req,service,selected)}${killStatsPanel(req,selected)}${deleteHtml}`);
+  }
   let live=null;
   if(selected.wardogsBaseUrl&&selected.wardogsSecretEnc){try{live=await managedDashboard(selected);}catch(error){live={errors:{dashboard:error.message}};}}
-  render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Auto-Ban</span><h2>${selected.autoBanEnabled?l(req,'AKTIV','ENABLED'):l(req,'AUS','OFF')}</h2><p>${l(req,'Auto-Ban ist standardmäßig AUS und muss ausdrücklich aktiviert werden.','Auto-ban is OFF by default and must be explicitly enabled.')}</p></article></section>${managedBotForm(req,service,selected)}${managedBanSyncPanel(req,selected)}${managedIgnoredPlayersPanel(req,selected)}${managedOperationsPanel(req,selected,live)}${managedAuditLogPanel(req,getManagedBot(selected.id)||selected)}${deleteHtml}`);
+  render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Auto-Ban</span><h2>${selected.autoBanEnabled?l(req,'AKTIV','ENABLED'):l(req,'AUS','OFF')}</h2><p>${l(req,'Auto-Ban ist standardmäßig AUS und muss ausdrücklich aktiviert werden.','Auto-ban is OFF by default and must be explicitly enabled.')}</p></article></section>${managedBotForm(req,service,selected)}${managedBanSyncPanel(req,selected)}${managedIgnoredPlayersPanel(req,selected)}${managedOperationsPanel(req,selected,live)}${managedKillFeedPanel(req,getManagedBot(selected.id)||selected)}${managedAuditLogPanel(req,getManagedBot(selected.id)||selected)}${deleteHtml}`);
 });
 
 app.post('/bot-services/:id/instances/:botId/delete', requireLogin, checkCsrf, rateLimit({windowMs:60_000,limit:5}), async(req,res)=>{
@@ -1353,6 +1433,19 @@ app.post('/bot-services/:id/manage', requireLogin, checkCsrf, async(req,res)=>{
     }catch(error){flash(req,'err',error.message);}
     return res.redirect(managedManageUrl(service.id,bot.id));
   }
+  if(service.id===KILL_STATS_SERVICE_ID){
+    try{
+      const name=String(req.body.name||'').trim().slice(0,80); if(!name)throw new Error(l(req,'Bot-Name fehlt.','Bot name is required.'));
+      const wardogsBaseUrl=String(req.body.wardogsBaseUrl||'').trim().replace(/\/+$/,''); if(!/^https?:\/\//i.test(wardogsBaseUrl))throw new Error(l(req,'WARDOGS URL muss mit http:// oder https:// beginnen.','WARDOGS URL must start with http:// or https://.'));
+      const killFeedChannelId=String(req.body.killFeedChannelId||'').trim(); if(killFeedChannelId&&!validSnowflake(killFeedChannelId))throw new Error(l(req,'Discord Killfeed Channel ID ist ungültig.','Discord killfeed channel ID is invalid.'));
+      const patch={id:bot.id,name,wardogsBaseUrl,killFeedChannelId,autoRecoveryEnabled:req.body.autoRecoveryEnabled==='1',enabled:req.body.enabled==='1',allowPrivateTarget:user.role==='admin'?req.body.allowPrivateTarget==='1':Boolean(bot.allowPrivateTarget),restartNonce:Date.now()};
+      const token=String(req.body.botToken||'').trim(); if(token){const discordBot=await validateBotToken(token);if(readDb().servers.some((x)=>x.botId===discordBot.id)||readDb().managedBots.some((x)=>x.id!==bot.id&&x.botId===discordBot.id))throw new Error(l(req,'Dieser Discord Bot Token wird bereits von einem anderen Bot verwendet.','This Discord bot token is already used by another bot.'));patch.botTokenEnc=encryptSecret(token);patch.botId=discordBot.id;} else if(killFeedChannelId&&!bot.botTokenEnc)throw new Error(l(req,'Für den Discord Killfeed ist ein Discord Bot Token erforderlich.','A Discord bot token is required for the Discord killfeed.'));
+      const secret=String(req.body.wardogsSecret||'').trim(); if(secret)patch.wardogsSecretEnc=encryptSecret(secret); else if(!bot.wardogsSecretEnc)throw new Error(l(req,'WARDOGS RCON/API Passwort fehlt.','WARDOGS RCON/API password is required.'));
+      bot=upsertManagedBot(patch); rebalanceAssignments(); await syncAllServiceBots();
+      flash(req,'ok',l(req,'Killfeed & Stats Bot gespeichert. Konfiguriere danach einmal den WARDOGS Server Feed.','Killfeed & Stats bot saved. Configure the WARDOGS Server Feed once afterwards.'));
+    }catch(error){flash(req,'err',error.message);}
+    return res.redirect(managedManageUrl(service.id,bot.id));
+  }
   try{
     const name=String(req.body.name||'').trim().slice(0,80); if(!name)throw new Error(l(req,'Bot-Name fehlt.','Bot name is required.'));
     const alertChannelId=String(req.body.alertChannelId||'').trim(); if(!validSnowflake(alertChannelId))throw new Error(l(req,'Discord Alert Channel ID ist ungültig.','Discord alert channel ID is invalid.'));
@@ -1412,8 +1505,8 @@ app.post('/bot-services/:id/test', requireLogin, checkCsrf, async(req,res)=>{
       test.wardogsBaseUrl=String(req.body.wardogsBaseUrl||old.wardogsBaseUrl||'').trim().replace(/\/+$/,'');
       const secret=String(req.body.wardogsSecret||'').trim(); if(secret)test.wardogsSecretEnc=encryptSecret(secret);
     }
-    const token=String(req.body.botToken||'').trim(); if(token)await validateBotToken(token); else if(service.id!==PLAYTIME_SERVICE_ID&&!old.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.'));
-    const result=service.id===PLAYTIME_SERVICE_ID?await testPlaytimeWardogs(test):await testManagedWardogs(test); flash(req,'ok',service.id===PLAYTIME_SERVICE_ID?l(req,`WARDOGS Verbindung OK · ${result.serverCount} Server · ${result.playerCount} Spieler.`,`WARDOGS connection OK · ${result.serverCount} servers · ${result.playerCount} players.`):l(req,`WARDOGS Verbindung OK · ${result.playerCount} Spieler über /v1/players.`,`WARDOGS connection OK · ${result.playerCount} players via /v1/players.`));
+    const token=String(req.body.botToken||'').trim(); if(token)await validateBotToken(token); else if(service.id==='wardogs-warning-bot'&&!old.botTokenEnc)throw new Error(l(req,'Discord Bot Token fehlt.','Discord bot token is required.')); else if(service.id===KILL_STATS_SERVICE_ID&&String(req.body.killFeedChannelId||old.killFeedChannelId||'').trim()&&!old.botTokenEnc)throw new Error(l(req,'Für den Discord Killfeed ist ein Discord Bot Token erforderlich.','A Discord bot token is required for the Discord killfeed.'));
+    const result=service.id===PLAYTIME_SERVICE_ID?await testPlaytimeWardogs(test):service.id===KILL_STATS_SERVICE_ID?await testKillStatsWardogs(test):await testManagedWardogs(test); flash(req,'ok',service.id===PLAYTIME_SERVICE_ID?l(req,`WARDOGS Verbindung OK · ${result.serverCount} Server · ${result.playerCount} Spieler.`,`WARDOGS connection OK · ${result.serverCount} servers · ${result.playerCount} players.`):l(req,`WARDOGS Verbindung OK · ${result.playerCount} Spieler über /v1/players.`,`WARDOGS connection OK · ${result.playerCount} players via /v1/players.`));
   }catch(error){flash(req,'err',`${l(req,'Test fehlgeschlagen','Test failed')}: ${error.message}`);}res.redirect(managedManageUrl(service.id,old.id));
 });
 
@@ -1421,6 +1514,16 @@ app.post('/managed-bots/:id/playtime/refresh', requireLogin, checkCsrf, async(re
   const bot=ownedManaged(req,req.params.id); if(!bot||bot.serviceId!==PLAYTIME_SERVICE_ID)return res.status(404).send('Not found'); if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');
   try{await refreshPlaytimeTracker(bot,{publish:req.body.publish==='1'});flash(req,'ok',req.body.publish==='1'?l(req,'Statistiken und Discord Top 25 wurden aktualisiert.','Statistics and Discord Top 25 were refreshed.'):l(req,'Statistiken wurden aktualisiert.','Statistics refreshed.'));}
   catch(error){flash(req,'err',error.message);}res.redirect(managedManageUrl(bot.serviceId,bot.id));
+});
+
+app.post('/managed-bots/:id/killfeed/setup', requireLogin, checkCsrf, async(req,res)=>{
+  const bot=ownedManaged(req,req.params.id);if(!bot||!['wardogs-warning-bot',KILL_STATS_SERVICE_ID].includes(String(bot.serviceId||'')))return res.status(404).send('Not found');if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');
+  try{await configureWardogsKillFeed(bot,baseUrl);appendManagedAudit(bot.id,{actor:`web:${currentUser(req)?.discordId||'unknown'}`,action:'killfeed-configured',detail:'WDServerFeed Url + Token written; game-server restart required'});flash(req,'ok',l(req,'WARDOGS Server Feed konfiguriert. Starte jetzt den GAMESERVER einmal neu, damit WDServerFeed aktiv wird.','WARDOGS Server Feed configured. Restart the GAME SERVER once so WDServerFeed becomes active.'));}
+  catch(error){flash(req,'err',error.message);}res.redirect(managedManageUrl(bot.serviceId,bot.id));
+});
+app.post('/managed-bots/:id/killstats/refresh', requireLogin, checkCsrf, async(req,res)=>{
+  const bot=ownedManaged(req,req.params.id);if(!bot||bot.serviceId!==KILL_STATS_SERVICE_ID)return res.status(404).send('Not found');if(!managedAccessActive(bot)&&!isAdmin(req))return res.status(403).send('Access expired');
+  try{await refreshKillStatsDiscord(bot);flash(req,'ok',l(req,'Discord Killfeed aktualisiert.','Discord killfeed refreshed.'));}catch(error){flash(req,'err',error.message);}res.redirect(managedManageUrl(bot.serviceId,bot.id));
 });
 
 app.post('/managed-bots/:id/ignore/add', requireLogin, checkCsrf, async(req,res)=>{
@@ -1445,6 +1548,7 @@ app.post('/managed-bots/:id/stop', requireLogin, checkCsrf, async(req,res)=>{con
 function managedConfigPayload(bot){
   const base={format:'status-hub-managed-bot-config',version:1,serviceId:String(bot.serviceId||''),name:String(bot.name||''),pollSeconds:Number(bot.pollSeconds||20),autoRecoveryEnabled:bot.autoRecoveryEnabled!==false,wardogsBaseUrl:String(bot.wardogsBaseUrl||'')};
   if(bot.serviceId===PLAYTIME_SERVICE_ID)return {...base,playtimeServers:playtimeTrackerServers(bot).map((row)=>({id:row.id,label:row.label,baseUrl:row.baseUrl})),leaderboardChannelId:String(bot.leaderboardChannelId||''),statsTimezone:String(bot.statsTimezone||'Europe/Vienna')};
+  if(bot.serviceId===KILL_STATS_SERVICE_ID)return {...base,killFeedChannelId:String(bot.killFeedChannelId||'')};
   return {...base,alertChannelId:String(bot.alertChannelId||''),mentionRoleId:String(bot.mentionRoleId||''),controlPanelEnabled:bot.controlPanelEnabled===true,controlPanelChannelId:String(bot.controlPanelChannelId||''),discordGrants:managedGrantRows(bot),banTemplates:managedBanTemplates(bot),banDiscordLink:String(bot.banDiscordLink||''),dynamicBanEnabled:bot.dynamicBanEnabled===true,dynamicBanEscalateJoins:Number(bot.dynamicBanEscalateJoins||3),dynamicBanEscalateWindowMinutes:Number(bot.dynamicBanEscalateWindowMinutes||5),rulesText:String(bot.rulesText||''),autoBanEnabled:bot.autoBanEnabled===true,announcementEnabled:bot.announcementEnabled===true,announcementIntervalMinutes:Number(bot.announcementIntervalMinutes||15),announcementMessages:String(bot.announcementMessages||''),welcomeWhisperEnabled:bot.welcomeWhisperEnabled===true,welcomeWhisperMessage:String(bot.welcomeWhisperMessage||'')};
 }
 app.get('/managed-bots/:id/config/export',requireLogin,(req,res)=>{
@@ -1477,6 +1581,8 @@ app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkC
         const primary=patch.playtimeServers[0];patch.wardogsBaseUrl=primary.baseUrl;if(primary.secretEnc)patch.wardogsSecretEnc=primary.secretEnc;
         if(patch.playtimeServers.some((row)=>!row.secretEnc))patch.enabled=false;
       }
+    }else if(bot.serviceId===KILL_STATS_SERVICE_ID){
+      const channel=String(data.killFeedChannelId||'').trim();if(channel&&!validSnowflake(channel))throw new Error(l(req,'Discord Killfeed Channel ID in der Config ist ungültig.','Discord killfeed channel ID in config is invalid.'));patch.killFeedChannelId=channel;
     }else{
       const alert=String(data.alertChannelId||'').trim();if(alert&&!validSnowflake(alert))throw new Error(l(req,'Alert Channel ID in der Config ist ungültig.','Alert channel ID in config is invalid.'));if(alert)patch.alertChannelId=alert;
       const mention=String(data.mentionRoleId||'').trim();if(mention&&!validSnowflake(mention))throw new Error(l(req,'Rollen-ID in der Config ist ungültig.','Role ID in config is invalid.'));patch.mentionRoleId=mention;
@@ -1498,7 +1604,7 @@ app.post('/managed-bots/:id/config/import',requireLogin,managedConfigFile,checkC
       patch.welcomeWhisperEnabled=data.welcomeWhisperEnabled===true;patch.welcomeWhisperMessage=String(data.welcomeWhisperMessage||'').trim().slice(0,200);
     }
     const imported=upsertManagedBot(patch);
-    if(bot.serviceId!==PLAYTIME_SERVICE_ID){
+    if(bot.serviceId==='wardogs-warning-bot'){
       const room=imported.banSyncServerId?getBanSyncServer(String(imported.banSyncServerId)):null;
       if(room&&String(room.ownerBotId||'')===String(imported.id)) await updateManagedBanSyncCommunitySettings(imported,{dynamicBanEnabled:imported.dynamicBanEnabled===true,dynamicBanEscalateJoins:imported.dynamicBanEscalateJoins,dynamicBanEscalateWindowMinutes:imported.dynamicBanEscalateWindowMinutes},`web:${currentUser(req)?.discordId||'unknown'}`);
     }
@@ -2088,7 +2194,7 @@ app.get('/', requireLogin, (req, res) => {
   const stateLabel = (state, r, server) => state === 'online' ? (server?.gameType === 'text_only' ? tr(lang,'Text-Rotation aktiv','Text rotation active') : `${r.players}/${r.maxPlayers} ${tr(lang,'Spieler','players')}`) : state === 'offline' ? tr(lang,'Gameserver offline','Game server offline') : state === 'error' ? tr(lang,'Bot-Fehler','Bot error') : state === 'waiting-node' ? tr(lang,'Wartet auf freien Node','Waiting for free node') : state === 'node-offline' ? tr(lang,'Status-Node offline','Status node offline') : state === 'plan-paused' ? tr(lang,'Durch Limit pausiert','Paused by limit') : state === 'assigned' ? tr(lang,'Node zugewiesen','Node assigned') : state;
   const cards = servers.map((s) => {
     const r = clusterRuntime(s.id); const state = r.state || 'stopped'; const invite = (r.botId || s.botId) ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(r.botId || s.botId)}&scope=bot&permissions=0` : null; const owner = s.ownerDiscordId ? findUser(s.ownerDiscordId) : null;
-    return `<article class="servercard panel"><div class="row between"><div><h2>${esc(s.name)}</h2><div class="chips"><span class="badge ${esc(state)}">${esc(stateLabel(state,r,s))}</span><span class="badge neutral">${esc(s.gameType === 'gamedig' ? (gameDigMeta(s.queryConfig?.gameId)?.name || `GameDig: ${s.queryConfig?.gameId || '?'}`) : gameTypeLabel(s.gameType))}</span></div></div><div class="dot ${esc(state)}"></div></div>${u.role === 'admin' ? `<p class="muted small">Owner: ${esc(owner?.globalName || owner?.username || s.ownerDiscordId || 'Legacy')} · Node: ${esc(r.nodeName || s.assignedNodeId || tr(lang,'nicht zugewiesen','unassigned'))}</p>` : ''}<dl><div><dt>Bot</dt><dd>${esc(r.botTag || tr(lang,'noch nicht verbunden','not connected yet'))}</dd></div><div><dt>Presence</dt><dd>${esc(r.presence || '—')}</dd></div>${s.gameType === 'text_only' ? '' : `<div><dt>Map</dt><dd>${esc(r.map || '—')}</dd></div><div><dt>Ping</dt><dd>${esc(r.ping == null ? '—' : `${r.ping} ms`)}</dd></div>`}</dl>${r.lastError ? `<div class="errorbox">${esc(r.lastError)}</div>` : ''}<div class="actions wrap">${invite ? `<a class="button ghost" href="${invite}" target="_blank" rel="noopener">${tr(lang,'Bot einladen','Invite bot')}</a>` : ''}<a class="button ghost" href="/servers/${esc(s.id)}/edit">${tr(lang,'Bearbeiten','Edit')}</a><form method="post" action="/servers/${esc(s.id)}/test" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Status testen','Test status')}</button></form>${s.enabled?`<form method="post" action="/servers/${esc(s.id)}/stop" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Offline schalten','Take offline')}</button></form><form method="post" action="/servers/${esc(s.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Neu starten','Restart')}</button></form>`:`<form method="post" action="/servers/${esc(s.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button success">${tr(lang,'Bot starten','Start bot')}</button></form>`}<form method="post" action="/servers/${esc(s.id)}/delete" class="inline" onsubmit="return confirm('${tr(lang,'Status Bot wirklich löschen?','Delete this status bot?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger">${tr(lang,'Löschen','Delete')}</button></form></div></article>`;
+    return `<article class="servercard panel"><div class="row between"><div><h2>${esc(s.name)}</h2><div class="chips"><span class="badge ${esc(state)}">${esc(stateLabel(state,r,s))}</span><span class="badge neutral">${esc(s.gameType === 'wardogs' ? 'WARDOGS Status Bot' : s.gameType === 'gamedig' ? (gameDigMeta(s.queryConfig?.gameId)?.name || `GameDig: ${s.queryConfig?.gameId || '?'}`) : gameTypeLabel(s.gameType))}</span></div></div><div class="dot ${esc(state)}"></div></div>${u.role === 'admin' ? `<p class="muted small">Owner: ${esc(owner?.globalName || owner?.username || s.ownerDiscordId || 'Legacy')} · Node: ${esc(r.nodeName || s.assignedNodeId || tr(lang,'nicht zugewiesen','unassigned'))}</p>` : ''}<dl><div><dt>Bot</dt><dd>${esc(r.botTag || tr(lang,'noch nicht verbunden','not connected yet'))}</dd></div><div><dt>Presence</dt><dd>${esc(r.presence || '—')}</dd></div>${s.gameType === 'text_only' ? '' : `<div><dt>Map</dt><dd>${esc(r.map || '—')}</dd></div><div><dt>Ping</dt><dd>${esc(r.ping == null ? '—' : `${r.ping} ms`)}</dd></div>`}</dl>${r.lastError ? `<div class="errorbox">${esc(r.lastError)}</div>` : ''}<div class="actions wrap">${invite ? `<a class="button ghost" href="${invite}" target="_blank" rel="noopener">${tr(lang,'Bot einladen','Invite bot')}</a>` : ''}<a class="button ghost" href="/servers/${esc(s.id)}/edit">${tr(lang,'Bearbeiten','Edit')}</a>${s.gameType==='wardogs'?`<a class="button ghost" href="/servers/${esc(s.id)}/stats">Killfeed & Stats</a>`:''}<form method="post" action="/servers/${esc(s.id)}/test" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Status testen','Test status')}</button></form>${s.enabled?`<form method="post" action="/servers/${esc(s.id)}/stop" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Offline schalten','Take offline')}</button></form><form method="post" action="/servers/${esc(s.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button ghost">${tr(lang,'Neu starten','Restart')}</button></form>`:`<form method="post" action="/servers/${esc(s.id)}/restart" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button success">${tr(lang,'Bot starten','Start bot')}</button></form>`}<form method="post" action="/servers/${esc(s.id)}/delete" class="inline" onsubmit="return confirm('${tr(lang,'Status Bot wirklich löschen?','Delete this status bot?')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button danger">${tr(lang,'Löschen','Delete')}</button></form></div></article>`;
   }).join('');
   const canAdd = ownCount < limit;
   const expiry = plan.expiresAt && !plan.expired ? ` · ${tr(lang,'bis','until')} ${new Date(plan.expiresAt).toLocaleString(localeCode(lang))}` : '';
@@ -2105,7 +2211,8 @@ app.get('/servers/new', requireLogin, (req, res) => {
   const requestedType = ['wardogs','fivem','gamedig','generic_json','text_only'].includes(String(req.query.type || '')) ? String(req.query.type) : 'fivem';
   const requestedGame = gameDigMeta(String(req.query.game || '')) ? String(req.query.game) : '';
   const initial = { gameType: requestedType, queryConfig: requestedType === 'gamedig' && requestedGame ? { gameId: requestedGame, port: gameDigMeta(requestedGame)?.defaultPort || null, extraOptions: {} } : {} };
-  render(req, res, l(req,'Status Bot erstellen','Create status bot'), `<div class="pagehead"><div><h1>${l(req,'Status Bot erstellen','Create status bot')}</h1><p>${l(req,'Serverstatus oder reine Text-Rotation. Beides zählt als ein Status-Bot.','Server status or text-only rotation. Both count as one status bot.')}</p></div><a class="button ghost" href="/games">Games & FAQ</a></div>${serverForm({ server: initial, csrf: csrf(req), isAdmin: u.role === 'admin', lang: langOf(req) })}`);
+  const createTitle=requestedType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot erstellen','Create status bot');
+  render(req, res, createTitle, `<div class="pagehead"><div><span class="eyebrow">${requestedType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${requestedType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot erstellen','Create status bot')}</h1><p>${requestedType==='wardogs'?l(req,'Serverstatus, fester Killfeed pro Gameserver und globale Kill-Stats in einem Bot.','Server status, a fixed killfeed per game server and global kill stats in one bot.'):l(req,'Serverstatus oder reine Text-Rotation. Beides zählt als ein Status-Bot.','Server status or text-only rotation. Both count as one status bot.')}</p></div><a class="button ghost" href="/games">Games & FAQ</a></div>${serverForm({ server: initial, csrf: csrf(req), isAdmin: u.role === 'admin', lang: langOf(req) })}`);
 });
 
 app.post('/servers/new', requireLogin, checkCsrf, async (req, res) => {
@@ -2117,20 +2224,25 @@ app.post('/servers/new', requireLogin, checkCsrf, async (req, res) => {
     const bot = await validateBotToken(token);
     if (readDb().servers.some((x) => x.botId === bot.id)) throw new Error('Dieser Discord Bot wird bereits von einem anderen Status-Eintrag verwendet');
     const q = buildQuery(req);
+    const killFeedChannelId=q.gameType==='wardogs'?String(req.body.killFeedChannelId||'').trim():'';
+    if(killFeedChannelId&&!validSnowflake(killFeedChannelId))throw new Error(l(req,'Discord Killfeed Channel ID ist ungültig.','Discord killfeed channel ID is invalid.'));
     const entry = upsertServer({
       ownerDiscordId: u.discordId, name, botTokenEnc: encryptSecret(token), botId: bot.id,
       gameType: q.gameType, queryConfig: q.queryConfig, querySecretEnc: q.newSecret ? encryptSecret(q.newSecret) : null,
       allowPrivateTarget: u.role === 'admin' && req.body.allowPrivateTarget === '1',
       intervalSeconds: Math.min(3600, Math.max(10, Number(req.body.intervalSeconds) || 30)), switchSeconds: Math.min(3600, Math.max(5, Number(req.body.switchSeconds) || 15)),
-      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1', enabled: req.body.enabled === '1', restartNonce: Date.now()
+      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1',
+      killFeedChannelId, killFeedTokenEnc:'', killFeedConfiguredAt:null, killFeedPublicUrl:'', killFeedNeedsGameRestart:false, killFeedLastEventAt:null, killFeedMessageId:'', killFeedLastPublishedAt:null, killFeedEvents:[], killStats:null,
+      enabled: req.body.enabled === '1', restartNonce: Date.now()
     });
-    rebalanceAssignments(); flash(req, 'ok', `Status Bot „${entry.name}“ wurde erstellt und einem freien Status-Node zugewiesen.`); res.redirect('/');
+    rebalanceAssignments(); flash(req, 'ok', q.gameType==='wardogs'?l(req,`WARDOGS Status Bot „${entry.name}“ wurde erstellt. Konfiguriere jetzt einmal den Kill Feed, wenn du Killfeed/Stats nutzen willst.`,`WARDOGS Status Bot “${entry.name}” was created. Configure the Kill Feed once if you want killfeed/stats.`):`Status Bot „${entry.name}“ wurde erstellt und einem freien Status-Node zugewiesen.`); res.redirect(q.gameType==='wardogs'?`/servers/${encodeURIComponent(entry.id)}/edit`:'/');
   } catch (error) { flash(req, /limit/i.test(String(error.message)) ? 'status-limit' : 'err', error.message); res.redirect('/servers/new'); }
 });
 
 app.get('/servers/:id/edit', requireLogin, (req, res) => {
   const server = ownedServer(req, req.params.id); if (!server) return res.status(404).send('Server nicht gefunden');
-  render(req, res, l(req,'Status Bot bearbeiten','Edit status bot'), `<div class="pagehead"><div><h1>${esc(server.name)}</h1><p>${l(req,'Leere Secret-Felder behalten vorhandene Werte.','Empty secret fields keep their current values.')}</p></div></div>${serverForm({ server, csrf: csrf(req), isEdit: true, isAdmin: isAdmin(req), lang: langOf(req) })}`);
+  const title=server.gameType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot bearbeiten','Edit status bot');
+  render(req, res, title, `<div class="pagehead"><div><span class="eyebrow">${server.gameType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${esc(server.name)}</h1><p>${l(req,'Leere Secret-Felder behalten vorhandene Werte.','Empty secret fields keep their current values.')}</p></div></div>${serverForm({ server, csrf: csrf(req), isEdit: true, isAdmin: isAdmin(req), lang: langOf(req) })}${statusKillfeedSetupPanel(req,server)}`);
 });
 
 app.post('/servers/:id/edit', requireLogin, checkCsrf, async (req, res) => {
@@ -2138,17 +2250,39 @@ app.post('/servers/:id/edit', requireLogin, checkCsrf, async (req, res) => {
     const old = ownedServer(req, req.params.id); if (!old) return res.status(404).send('Server nicht gefunden');
     const name = String(req.body.name || '').trim(); if (!name) throw new Error('Name fehlt');
     const q = buildQuery(req, old);
+    const killFeedChannelId=q.gameType==='wardogs'?String(req.body.killFeedChannelId||'').trim():'';
+    if(killFeedChannelId&&!validSnowflake(killFeedChannelId))throw new Error(l(req,'Discord Killfeed Channel ID ist ungültig.','Discord killfeed channel ID is invalid.'));
     const patch = {
       id: old.id, name, gameType: q.gameType, queryConfig: q.queryConfig,
       allowPrivateTarget: isAdmin(req) ? req.body.allowPrivateTarget === '1' : Boolean(old.allowPrivateTarget),
       intervalSeconds: Math.min(3600, Math.max(10, Number(req.body.intervalSeconds) || 30)), switchSeconds: Math.min(3600, Math.max(5, Number(req.body.switchSeconds) || 15)),
-      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1', enabled: req.body.enabled === '1'
+      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1', killFeedChannelId, enabled: req.body.enabled === '1'
     };
     if (req.body.botToken) { const bot = await validateBotToken(String(req.body.botToken).trim()); if (readDb().servers.some((x) => x.id !== old.id && x.botId === bot.id)) throw new Error('Dieser Discord Bot wird bereits von einem anderen Status-Eintrag verwendet'); patch.botTokenEnc = encryptSecret(String(req.body.botToken).trim()); patch.botId = bot.id; }
     if (q.newSecret) patch.querySecretEnc = encryptSecret(q.newSecret);
     else if (q.clearSecret) patch.querySecretEnc = null;
-    const entry = upsertServer({ ...patch, restartNonce: Date.now() }); rebalanceAssignments(); flash(req, 'ok', l(req,'Gespeichert und Neustart ausgelöst. Der Status-Node übernimmt die Änderung.','Saved and restart triggered. The status node will apply the change.')); res.redirect('/');
+    const entry = upsertServer({ ...patch, restartNonce: Date.now() }); rebalanceAssignments(); flash(req, 'ok', l(req,'Gespeichert und Neustart ausgelöst. Der Status-Node übernimmt die Änderung.','Saved and restart triggered. The status node will apply the change.')); res.redirect(entry.gameType==='wardogs'?`/servers/${encodeURIComponent(entry.id)}/edit`:'/');
   } catch (error) { flash(req, 'err', error.message); res.redirect(`/servers/${encodeURIComponent(req.params.id)}/edit`); }
+});
+
+app.post('/servers/:id/killfeed/configure', requireLogin, checkCsrf, async (req,res)=>{
+  const server=ownedServer(req,req.params.id); if(!server)return res.status(404).send('Nicht gefunden');
+  try{
+    if(server.gameType!=='wardogs')throw new Error(l(req,'Killfeed ist nur für WARDOGS Status Bots verfügbar.','Killfeed is only available for WARDOGS Status Bots.'));
+    await configureWardogsStatusKillFeed(server,baseUrl);
+    flash(req,'ok',l(req,'WARDOGS Kill Feed wurde konfiguriert. Starte den Gameserver jetzt einmal neu; danach werden Kills dauerhaft erfasst.','WARDOGS Kill Feed was configured. Restart the game server once; kills will then be tracked persistently.'));
+  }catch(error){flash(req,'err',error.message);}
+  res.redirect(`/servers/${encodeURIComponent(server.id)}/edit`);
+});
+app.get('/servers/:id/stats', requireLogin, (req,res)=>{
+  const server=ownedServer(req,req.params.id); if(!server)return res.status(404).send('Nicht gefunden');
+  if(server.gameType!=='wardogs')return res.status(400).send('WARDOGS only');
+  const servers=ownerWardogsStatusServers(server); const snapshot=aggregateKillStatsServers(servers); const q=String(req.query.q||'').trim(); const matches=q?searchKillStatsSnapshot(snapshot,q):[]; const recent=statusServerKillFeed(server);
+  const topRows=snapshot.top25.map((p,i)=>`<tr><td>${i+1}</td><td><strong>${esc(p.name||p.steamId)}</strong><div class="muted small">${esc(p.steamId)}</div></td><td>${esc(p.kills)}</td><td>${esc(p.deaths)}</td><td>${esc(Number(p.kd||0).toFixed(2))}</td><td>${esc(p.headshots)}</td><td>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</td></tr>`).join('');
+  const searchCards=matches.map((p)=>{const causes=(p.topCauses||[]).slice(0,5).map(([cause,count])=>`${prettyCause(cause)}: ${count}`).join(' · ')||'—';return `<article class="panel"><div class="row between"><div><h2>${esc(p.name||p.steamId)}</h2><div class="muted small">${esc(p.steamId)}</div></div><span class="badge neutral">K/D ${esc(Number(p.kd||0).toFixed(2))}</span></div><dl><div><dt>Kills</dt><dd>${esc(p.kills)}</dd></div><div><dt>${l(req,'Tode','Deaths')}</dt><dd>${esc(p.deaths)}</dd></div><div><dt>Headshots</dt><dd>${esc(p.headshots)}</dd></div><div><dt>${l(req,'Längster Kill','Longest kill')}</dt><dd>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</dd></div></dl><p class="muted small">${esc(causes)}</p></article>`;}).join('');
+  const recentRows=recent.map((e)=>{const flags=[e.headshot?'Headshot':'',e.penetration?'Penetration':'',e.ricochet?'Ricochet':'',e.melee?'Melee':'',e.roadKill?'Roadkill':'',e.vehicleExplosion?'Vehicle':'',e.suicide?'Suicide':''].filter(Boolean).join(', ')||'—';return `<tr><td>${e.receivedAt?esc(new Date(e.receivedAt).toLocaleString(localeCode(langOf(req)))):'—'}</td><td><strong>${esc(e.killerName||e.killerSteamId||'Environment')}</strong><div class="muted small">${esc(e.killerSteamId||'')}</div></td><td><strong>${esc(e.victimName||e.victimSteamId)}</strong><div class="muted small">${esc(e.victimSteamId)}</div></td><td>${esc(prettyCause(e.cause))}</td><td>${e.distanceMeters?`${esc(Number(e.distanceMeters).toFixed(1))} m`:'—'}</td><td>${esc(flags)}</td><td>${esc(e.mapName||'—')}</td></tr>`;}).join('');
+  const body=`<div class="pagehead"><div><span class="eyebrow">WARDOGS Status Bot</span><h1>${l(req,'Killfeed & globale Spieler-Stats','Killfeed & global player stats')}</h1><p>${l(req,`Stats werden über ${servers.length} WARDOGS Server dieses Accounts zusammengezählt. Der Killfeed unten gehört nur zu „${server.name}“.`,`Stats are aggregated across ${servers.length} WARDOGS servers on this account. The killfeed below belongs only to “${server.name}”.`)}</p></div><div class="actions wrap"><a class="button ghost" href="/servers/${esc(server.id)}/edit">${l(req,'Einstellungen','Settings')}</a><a class="button ghost" href="/">${l(req,'Zurück','Back')}</a></div></div><section class="managed-live-grid"><article class="panel"><span class="eyebrow">Events</span><strong>${esc(snapshot.totalEvents)}</strong></article><article class="panel"><span class="eyebrow">Players</span><strong>${esc(snapshot.players.length)}</strong></article><article class="panel"><span class="eyebrow">Servers</span><strong>${esc(servers.length)}</strong></article><article class="panel"><span class="eyebrow">Global #1</span><strong class="small">${snapshot.top25[0]?esc(`${snapshot.top25[0].name} · ${snapshot.top25[0].kills}`):'—'}</strong></article></section><section class="panel"><h2>${l(req,'Spieler suchen','Search player')}</h2><form method="get" action="/servers/${esc(server.id)}/stats" class="managed-add-row"><input name="q" value="${esc(q)}" maxlength="100" placeholder="${l(req,'Name oder SteamID64','Name or SteamID64')}"><button class="button primary">${l(req,'Suchen','Search')}</button></form></section>${q?`<section class="grid">${searchCards||`<div class="empty panel">${l(req,'Kein Spieler gefunden.','No player found.')}</div>`}</section>`:''}<section class="panel tablewrap"><h2>${l(req,'Globales Top-25 Kill Leaderboard','Global Top-25 kill leaderboard')}</h2><table><thead><tr><th>#</th><th>Player</th><th>Kills</th><th>${l(req,'Tode','Deaths')}</th><th>K/D</th><th>Headshots</th><th>${l(req,'Längster Kill','Longest kill')}</th></tr></thead><tbody>${topRows||`<tr><td colspan="7">${l(req,'Noch keine Kill-Stats erfasst.','No kill stats tracked yet.')}</td></tr>`}</tbody></table></section><section class="panel tablewrap"><h2>${l(req,'Letzte 150 Kills dieses Servers','Latest 150 kills on this server')}</h2><table><thead><tr><th>${l(req,'Zeit','Time')}</th><th>Killer</th><th>Victim</th><th>${l(req,'Waffe/Ursache','Weapon/cause')}</th><th>${l(req,'Distanz','Distance')}</th><th>Tags</th><th>Map</th></tr></thead><tbody>${recentRows||`<tr><td colspan="7">${l(req,'Noch keine Kills erfasst.','No kills tracked yet.')}</td></tr>`}</tbody></table></section>`;
+  render(req,res,'WARDOGS Status Bot · Stats',body);
 });
 
 app.post('/servers/:id/test', requireLogin, checkCsrf, async (req, res) => {
@@ -2609,5 +2743,5 @@ httpServer.requestTimeout = 5 * 60_000;
 httpServer.keepAliveTimeout = 5_000;
 httpServer.maxRequestsPerSocket = 1000;
 httpServer.maxHeadersCount = 100;
-async function shutdown(signal){console.log(`\n${signal}: fahre herunter...`);try{await Promise.all([shutdownManagedBots(),shutdownPlaytimeBots()]);}catch(error){console.error('Managed bot shutdown:',error.message);}httpServer.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();}
+async function shutdown(signal){console.log(`\n${signal}: fahre herunter...`);try{await Promise.all([shutdownManagedBots(),shutdownPlaytimeBots(),shutdownKillStatsBots()]);}catch(error){console.error('Managed bot shutdown:',error.message);}httpServer.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();}
 process.on('SIGINT',()=>shutdown('SIGINT')); process.on('SIGTERM',()=>shutdown('SIGTERM'));

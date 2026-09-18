@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { syncBots, shutdownBots, runtimeSnapshot, runningBotCount } from './bot-manager.js';
 
-const version = '3.10.0';
+const version = '3.12.37';
 const controlUrl = String(process.env.CONTROL_PLANE_URL || '').replace(/\/+$/, '');
 const joinSecret = String(process.env.STATUS_NODE_JOIN_SECRET || '');
 const nodeId = String(process.env.STATUS_NODE_ID || os.hostname()).trim().slice(0, 80);
@@ -102,7 +102,12 @@ async function syncWork() {
   const work = await api('/api/status-nodes/work');
   lastLeaseAt = Date.now();
   if (work.leaseSeconds) leaseSeconds = Number(work.leaseSeconds) || leaseSeconds;
-  const servers = Array.isArray(work.servers) ? work.servers.slice(0, capacity) : [];
+  const servers = (Array.isArray(work.servers) ? work.servers.slice(0, capacity) : []).map((server) => ({
+    ...server,
+    _controlPlaneUrl: controlUrl,
+    _statusNodeId: nodeId,
+    _statusNodeToken: nodeToken
+  }));
   await syncBots(servers);
 }
 
