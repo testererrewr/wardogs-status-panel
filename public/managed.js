@@ -14,6 +14,7 @@
     user: lang === 'en' ? 'Discord user' : 'Discord Benutzer',
     reason: lang === 'en' ? 'Alert / action reason (optional)' : 'Warn-/Aktionsgrund (optional)',
     count: lang === 'en' ? 'count' : 'Anzahl',
+    minutes: lang === 'en' ? 'minutes' : 'Minuten',
     hours: lang === 'en' ? 'hours' : 'Stunden',
     days: lang === 'en' ? 'days' : 'Tage',
     active: lang === 'en' ? 'active' : 'aktiv',
@@ -45,7 +46,7 @@
     const selectedUnit = unit || (temporaryOnly ? 'days' : 'permanent');
     const permanent = temporaryOnly ? '' : `<option value="permanent" ${selectedUnit === 'permanent' ? 'selected' : ''}>${t.permanent}</option>`;
     const hidden = selectedUnit === 'permanent' && !temporaryOnly;
-    return `<span class="managed-duration" data-ban-duration><select name="${baseName}Unit" data-duration-unit>${permanent}<option value="hours" ${selectedUnit === 'hours' ? 'selected' : ''}>${t.hours}</option><option value="days" ${selectedUnit === 'days' ? 'selected' : ''}>${t.days}</option></select><input name="${baseName}Value" data-duration-value type="number" min="0.1" max="8760" step="0.1" value="${value}" ${hidden ? 'hidden disabled' : ''}></span>`;
+    return `<span class="managed-duration" data-ban-duration><select name="${baseName}Unit" data-duration-unit>${permanent}<option value="minutes" ${selectedUnit === 'minutes' ? 'selected' : ''}>${t.minutes}</option><option value="hours" ${selectedUnit === 'hours' ? 'selected' : ''}>${t.hours}</option><option value="days" ${selectedUnit === 'days' ? 'selected' : ''}>${t.days}</option></select><input name="${baseName}Value" data-duration-value type="number" min="1" max="525600" step="1" value="${value}" ${hidden ? 'hidden disabled' : ''}></span>`;
   }
 
   function syncDuration(container) {
@@ -55,7 +56,12 @@
     const permanent = unit.value === 'permanent';
     value.hidden = permanent;
     value.disabled = permanent;
-    if (!permanent && (!Number(value.value) || Number(value.value) <= 0)) value.value = '1';
+    if (!permanent) {
+      value.min = '1';
+      value.step = '1';
+      value.max = unit.value === 'days' ? '365' : unit.value === 'hours' ? '8760' : '525600';
+      if (!Number(value.value) || Number(value.value) <= 0) value.value = '1';
+    }
   }
 
   function ruleOptions(selected = 'vac_bans') {
@@ -250,7 +256,12 @@
     const permanent = durationUnit.value === 'permanent';
     durationValue.hidden = permanent;
     durationValue.disabled = permanent;
-    if (!permanent && (!Number(durationValue.value) || Number(durationValue.value) <= 0)) durationValue.value = '1';
+    if (!permanent) {
+      durationValue.min = '1';
+      durationValue.step = '1';
+      durationValue.max = durationUnit.value === 'days' ? '365' : durationUnit.value === 'hours' ? '8760' : '525600';
+      if (!Number(durationValue.value) || Number(durationValue.value) <= 0) durationValue.value = '1';
+    }
   };
   const syncCount = () => { if (reasonCount) reasonCount.textContent = String(reason?.value?.length || 0); };
   const resetForm = () => {

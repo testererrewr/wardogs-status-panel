@@ -1289,6 +1289,7 @@ function banDurationPicker(bot, target = 'manual') {
     .setPlaceholder('Choose ban duration')
     .addOptions([
       { label: 'Permanent', value: 'permanent', description: 'Permanent ban' },
+      { label: 'Minutes', value: 'minutes', description: 'Temporary ban in minutes' },
       { label: 'Hours', value: 'hours', description: 'Temporary ban in hours' },
       { label: 'Days', value: 'days', description: 'Temporary ban in days' }
     ]);
@@ -1298,10 +1299,10 @@ function banDurationPicker(bot, target = 'manual') {
 function discordBanDurationMinutes(interaction, mode) {
   const normalized = String(mode || 'permanent').toLowerCase();
   if (normalized === 'permanent') return 0;
-  if (!['hours', 'days'].includes(normalized)) throw new Error('Invalid ban duration mode');
+  if (!['minutes', 'hours', 'days'].includes(normalized)) throw new Error('Invalid ban duration mode');
   const value = Number(String(interaction.fields.getTextInputValue('durationValue') || '').replace(',', '.'));
   if (!Number.isFinite(value) || value <= 0) throw new Error('Ban duration must be greater than 0');
-  const minutes = Math.round(value * (normalized === 'days' ? 1440 : 60));
+  const minutes = Math.round(value * (normalized === 'days' ? 1440 : normalized === 'hours' ? 60 : 1));
   if (minutes < 1 || minutes > 525600) throw new Error('Ban duration is invalid or too long');
   return minutes;
 }
@@ -1447,8 +1448,8 @@ async function handleSelect(interaction) {
       const bot = interactionBot(interaction, botId, 'ban'); if (!bot) return true;
       const target = String(parts[3] || 'manual');
       const mode = String(interaction.values?.[0] || 'permanent');
-      if (!['permanent','hours','days'].includes(mode)) throw new Error('Invalid ban duration mode');
-      const durationField = mode === 'permanent' ? [] : [{ id: 'durationValue', label: mode === 'days' ? 'Duration in days' : 'Duration in hours', maxLength: 7, placeholder: mode === 'days' ? '7' : '24' }];
+      if (!['permanent','minutes','hours','days'].includes(mode)) throw new Error('Invalid ban duration mode');
+      const durationField = mode === 'permanent' ? [] : [{ id: 'durationValue', label: mode === 'days' ? 'Duration in days' : mode === 'hours' ? 'Duration in hours' : 'Duration in minutes', maxLength: 7, placeholder: mode === 'days' ? '7' : mode === 'hours' ? '24' : '5' }];
       if (target === 'manual') {
         await interaction.showModal(modal(`wd:mmanualban:${bot.id}:manual:${mode}`, 'Ban SteamID', [
           { id: 'steamId', label: 'SteamID64', maxLength: 17, placeholder: '7656119…' },

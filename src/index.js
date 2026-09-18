@@ -903,24 +903,26 @@ function managedDurationParts(durationMinutes, temporaryOnly=false){
   if(!minutes&&!temporaryOnly)return {unit:'permanent',value:1};
   const safe=minutes||1440;
   if(safe%1440===0)return {unit:'days',value:safe/1440};
-  return {unit:'hours',value:Math.round((safe/60)*100)/100};
+  if(safe%60===0)return {unit:'hours',value:safe/60};
+  return {unit:'minutes',value:safe};
 }
 function managedDurationMinutesFromBody(req,valueName,unitName,fallbackMinutes=0,temporaryOnly=false){
   const fallback=managedDurationParts(fallbackMinutes,temporaryOnly);
   const rawUnit=String(req.body[unitName]||fallback.unit||'permanent').trim().toLowerCase();
-  const unit=rawUnit==='days'?'days':rawUnit==='hours'?'hours':temporaryOnly?'hours':'permanent';
+  const unit=rawUnit==='days'?'days':rawUnit==='hours'?'hours':rawUnit==='minutes'?'minutes':temporaryOnly?'minutes':'permanent';
   if(unit==='permanent'&&!temporaryOnly)return 0;
   const raw=String(req.body[valueName]??fallback.value??'').trim().replace(',','.');
   const value=Number(raw);
   if(!Number.isFinite(value)||value<=0)throw new Error(l(req,'Die Ban-Dauer muss größer als 0 sein.','Ban duration must be greater than 0.'));
-  const minutes=Math.round(value*(unit==='days'?1440:60));
+  const multiplier=unit==='days'?1440:unit==='hours'?60:1;
+  const minutes=Math.round(value*multiplier);
   if(minutes<1||minutes>525600)throw new Error(l(req,'Die Ban-Dauer ist ungültig oder zu lang.','Ban duration is invalid or too long.'));
   return minutes;
 }
 function managedDurationControlsHtml(req,baseName,durationMinutes,{temporaryOnly=false}={}){
   const parts=managedDurationParts(durationMinutes,temporaryOnly);
   const permanentOption=temporaryOnly?'':`<option value="permanent" ${parts.unit==='permanent'?'selected':''}>${l(req,'Permanent','Permanent')}</option>`;
-  return `<span class="managed-duration" data-ban-duration><select name="${baseName}Unit" data-duration-unit>${permanentOption}<option value="hours" ${parts.unit==='hours'?'selected':''}>${l(req,'Stunden','Hours')}</option><option value="days" ${parts.unit==='days'?'selected':''}>${l(req,'Tage','Days')}</option></select><input name="${baseName}Value" data-duration-value type="number" min="0.1" max="8760" step="0.1" value="${esc(parts.value)}" ${parts.unit==='permanent'&&!temporaryOnly?'hidden disabled':''}></span>`;
+  return `<span class="managed-duration" data-ban-duration><select name="${baseName}Unit" data-duration-unit>${permanentOption}<option value="minutes" ${parts.unit==='minutes'?'selected':''}>${l(req,'Minuten','Minutes')}</option><option value="hours" ${parts.unit==='hours'?'selected':''}>${l(req,'Stunden','Hours')}</option><option value="days" ${parts.unit==='days'?'selected':''}>${l(req,'Tage','Days')}</option></select><input name="${baseName}Value" data-duration-value type="number" min="1" max="525600" step="1" value="${esc(parts.value)}" ${parts.unit==='permanent'&&!temporaryOnly?'hidden disabled':''}></span>`;
 }
 
 function managedBanTemplatesFromBody(req){
@@ -993,7 +995,7 @@ function managedBotForm(req, service, bot) {
     ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.welcomeWatcherLastPollError?`<div class="span2 warning"><strong>Welcome Watcher:</strong> ${esc(rt.welcomeWatcherLastPollError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
   </form>
   <section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
-  <script src="/managed.js?v=3.12.20" defer></script>`;
+  <script src="/managed.js?v=3.12.29" defer></script>`;
 }
 
 

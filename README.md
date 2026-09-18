@@ -1,4 +1,11 @@
-# status-hub.lol v3.12.28
+# status-hub.lol v3.12.29
+
+## v3.12.29 – Minute-based temporary bans
+
+- Temporary bans can now be entered directly in **minutes**, e.g. 5, 30 or 90 minutes.
+- Minute selection is available in the web BAN dialog, ban templates, temporary-ban detection rules and the Discord management panel.
+- Existing hour/day/permanent durations remain supported. Stored durations are still persisted internally as exact minutes, so automatic unban timing stays precise.
+- Non-whole-hour durations such as 90 minutes are now shown/editable as minutes instead of a decimal hour value.
 
 ## v3.12.28 – Welcome only after real team selection / spawn
 
@@ -51,7 +58,7 @@
 - WARDOGS Management Bot has a dedicated **Ban messages** settings block with an optional Discord server/invite link.
 - The invite is appended automatically to permanent and temporary bans, including manual bans, ban templates and detection-rule bans.
 - Temporary bans keep the duration at the front, for example: `Ban duration: 1 day | Teamkilling | Discord: https://discord.gg/example`.
-- Ban durations are selected as **Permanent**, **Hours** or **Days** instead of entering raw minutes. This applies to the web panel, ban templates, detection-rule temporary bans and the Discord management panel ban flow.
+- Ban durations can be selected as **Permanent**, **Minutes**, **Hours** or **Days**. This applies to the web panel, ban templates, detection-rule temporary bans and the Discord management panel ban flow.
 - Config export/import includes the non-secret invite setting.
 - Database schema version 26.
 
