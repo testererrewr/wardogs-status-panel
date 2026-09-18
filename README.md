@@ -1,4 +1,16 @@
-# status-hub.lol v3.12.29
+# status-hub.lol v3.12.30
+
+
+## v3.12.30 – Ban Sync, Dynamic Bans, Audit Log & Custom Bot Files
+
+- **Ban Sync:** a WARDOGS Management Bot can be configured with the target BOT ID that should receive its bans. The target owner gets an incoming request in the panel and must explicitly accept it before existing/new bans are mirrored. Disconnecting or changing the target removes the tracked mirrored bans from the old target.
+- **Dynamic Ban:** optional temporary-ban mode that avoids a game ban at first. A blocked player is kicked again on every new join for the configured duration. After a configurable number of joins inside a configurable time window, it escalates to a normal WARDOGS ban, but that escalation is still removed at the original Dynamic Ban expiry and never extends the selected duration.
+- Dynamic Ban expiry cleanup also runs while the Discord management bot is stopped, so an escalated game ban is not intentionally left behind beyond its configured timer.
+- **Audit Log:** per-management-bot audit history for bans/unbans, Dynamic Ban enforcement, Ban Sync, whispers, broadcasts, team/map/lighting/match actions, detection ignore changes and bot/config actions. The latest 500 entries are retained.
+- **Explicit Discord panel permissions:** bot ownership and ordinary Discord Kick/Ban permissions no longer grant management-panel access automatically. Non-administrators must be explicitly added as a Discord user or role grant in the bot settings; Discord guild Administrators keep their admin bypass.
+- **Custom Bot file browser:** every Custom Bot now has a Files view with individual-file downloads plus loose-file and ZIP overlay uploads. Matching project paths are overwritten, new files are added, and unrelated existing files remain untouched. `source.zip` and the generated runtime files are rebuilt after changes.
+- Custom Bot file uploads reject path traversal, secret files, dependency/cache folders and oversized projects. Source changes by a non-admin stop the bot and reset approval to pending so an approved bot cannot bypass the review process by changing code afterward.
+- Database schema version 32.
 
 ## v3.12.29 – Minute-based temporary bans
 

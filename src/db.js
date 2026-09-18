@@ -145,7 +145,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 31, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 32, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -162,7 +162,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 31;
+  parsed.version = 32;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -369,6 +369,22 @@ function migrate(parsed) {
       if (typeof bot.legacyJoinSeedingCleanupDone !== 'boolean') bot.legacyJoinSeedingCleanupDone = false;
     }
   }
+  if (previousVersion < 32) {
+    // v3.12.30 adds opt-in cross-bot ban sync, dynamic bans and a local audit log.
+    // Discord panel rights are now explicit; bot ownership is no longer a permission grant.
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || '') !== 'wardogs-warning-bot') continue;
+      if (typeof bot.dynamicBanEnabled !== 'boolean') bot.dynamicBanEnabled = false;
+      if (!Number.isFinite(Number(bot.dynamicBanEscalateJoins))) bot.dynamicBanEscalateJoins = 3;
+      if (!Number.isFinite(Number(bot.dynamicBanEscalateWindowMinutes))) bot.dynamicBanEscalateWindowMinutes = 5;
+      if (!Array.isArray(bot.dynamicBans)) bot.dynamicBans = [];
+      if (typeof bot.banSyncTargetBotId !== 'string') bot.banSyncTargetBotId = '';
+      if (!Array.isArray(bot.banSyncRequests)) bot.banSyncRequests = [];
+      if (!Array.isArray(bot.banSyncAcceptedSources)) bot.banSyncAcceptedSources = [];
+      if (!Array.isArray(bot.banSyncMirrors)) bot.banSyncMirrors = [];
+      if (!Array.isArray(bot.auditLog)) bot.auditLog = [];
+    }
+  }
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -407,6 +423,20 @@ function migrate(parsed) {
       createdBy: String(entry?.createdBy || '').slice(0, 100),
       templateId: String(entry?.templateId || '').slice(0, 64)
     })).filter((entry) => /^\d{17}$/.test(entry.steamId) && Number.isFinite(Date.parse(entry.expiresAt || ''))).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 1000),
+    dynamicBanEnabled: b.dynamicBanEnabled === true,
+    dynamicBanEscalateJoins: Math.max(2, Math.min(20, Math.floor(Number(b.dynamicBanEscalateJoins) || 3))),
+    dynamicBanEscalateWindowMinutes: Math.max(1, Math.min(1440, Math.floor(Number(b.dynamicBanEscalateWindowMinutes) || 5))),
+    dynamicBans: (Array.isArray(b.dynamicBans) ? b.dynamicBans : []).map((entry) => ({
+      steamId: String(entry?.steamId || ''), reason: String(entry?.reason || '').slice(0, 180), expiresAt: entry?.expiresAt || null,
+      createdAt: entry?.createdAt || null, createdBy: String(entry?.createdBy || '').slice(0, 100), templateId: String(entry?.templateId || '').slice(0, 64),
+      escalated: entry?.escalated === true, escalatedAt: entry?.escalatedAt || null,
+      joinAttempts: (Array.isArray(entry?.joinAttempts) ? entry.joinAttempts : []).map(String).filter((x) => Number.isFinite(Date.parse(x))).slice(-50)
+    })).filter((entry) => /^\d{17}$/.test(entry.steamId) && Number.isFinite(Date.parse(entry.expiresAt || ''))).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 1000),
+    banSyncTargetBotId: String(b.banSyncTargetBotId || '').slice(0, 80),
+    banSyncRequests: (Array.isArray(b.banSyncRequests) ? b.banSyncRequests : []).map((row) => ({ sourceBotId: String(row?.sourceBotId || '').slice(0, 80), sourceOwnerDiscordId: String(row?.sourceOwnerDiscordId || '').slice(0, 20), requestedAt: row?.requestedAt || null })).filter((row) => row.sourceBotId).filter((row, index, rows) => rows.findIndex((x) => x.sourceBotId === row.sourceBotId) === index).slice(0, 50),
+    banSyncAcceptedSources: [...new Set((Array.isArray(b.banSyncAcceptedSources) ? b.banSyncAcceptedSources : []).map((x) => String(x || '').slice(0, 80)).filter(Boolean))].slice(0, 50),
+    banSyncMirrors: (Array.isArray(b.banSyncMirrors) ? b.banSyncMirrors : []).map((row) => ({ sourceBotId: String(row?.sourceBotId || '').slice(0, 80), steamId: String(row?.steamId || ''), mode: ['permanent','temporary','dynamic'].includes(String(row?.mode || '')) ? String(row.mode) : 'permanent', expiresAt: row?.expiresAt || null, reason: String(row?.reason || '').slice(0,180), createdAt: row?.createdAt || null })).filter((row) => row.sourceBotId && /^\d{17}$/.test(row.steamId)).slice(-2000),
+    auditLog: (Array.isArray(b.auditLog) ? b.auditLog : []).map((row) => ({ id: String(row?.id || ''), at: row?.at || null, actor: String(row?.actor || '').slice(0,100), action: String(row?.action || '').slice(0,80), target: String(row?.target || '').slice(0,100), detail: String(row?.detail || '').slice(0,500), status: String(row?.status || 'ok').slice(0,20) })).filter((row) => row.action && Number.isFinite(Date.parse(row.at || ''))).slice(-500),
     rulesText: String(b.rulesText || ''),
     steamWebApiKeyEnc: String(b.steamWebApiKeyEnc || ''),
     steamAppId: /^\d{1,10}$/.test(String(b.steamAppId || '')) ? String(b.steamAppId) : '1867240',
@@ -519,7 +549,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

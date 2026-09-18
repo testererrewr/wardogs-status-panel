@@ -39,6 +39,8 @@ const WELCOME_RETRY_MS = 2000;
 const WELCOME_SPAWN_SETTLE_MS = 5_000;
 const WELCOME_TEAM_STABLE_POLLS = 2;
 const WELCOME_LEAVE_CONFIRM_POLLS = 2;
+const DYNAMIC_BAN_POLL_MS = 2_000;
+const DYNAMIC_BAN_LEAVE_CONFIRM_POLLS = 2;
 
 // WARDOGS is most reliable when a single request at a time targets one game
 // server. Background polling, the web dashboard and Discord actions used to race
@@ -111,6 +113,54 @@ function temporaryBans(bot) {
     createdBy: String(entry?.createdBy || '').slice(0, 100),
     templateId: String(entry?.templateId || '').slice(0, 64)
   })).filter((entry) => entry.steamId && Number.isFinite(Date.parse(entry.expiresAt || '')));
+}
+
+function dynamicBans(bot) {
+  return (Array.isArray(bot?.dynamicBans) ? bot.dynamicBans : []).map((entry) => ({
+    steamId: normalizeSteamId64(entry?.steamId),
+    reason: String(entry?.reason || '').slice(0, 180),
+    expiresAt: entry?.expiresAt || null,
+    createdAt: entry?.createdAt || null,
+    createdBy: String(entry?.createdBy || '').slice(0, 100),
+    templateId: String(entry?.templateId || '').slice(0, 64),
+    escalated: entry?.escalated === true,
+    escalatedAt: entry?.escalatedAt || null,
+    joinAttempts: (Array.isArray(entry?.joinAttempts) ? entry.joinAttempts : []).map(String).filter((x) => Number.isFinite(Date.parse(x))).slice(-50)
+  })).filter((entry) => entry.steamId && Number.isFinite(Date.parse(entry.expiresAt || '')));
+}
+
+function banSyncRequests(bot) {
+  return (Array.isArray(bot?.banSyncRequests) ? bot.banSyncRequests : []).map((row) => ({
+    sourceBotId: String(row?.sourceBotId || '').trim().slice(0, 80),
+    sourceOwnerDiscordId: String(row?.sourceOwnerDiscordId || '').trim().slice(0, 20),
+    requestedAt: row?.requestedAt || null
+  })).filter((row) => row.sourceBotId);
+}
+function banSyncAcceptedSources(bot) { return [...new Set((Array.isArray(bot?.banSyncAcceptedSources) ? bot.banSyncAcceptedSources : []).map((x) => String(x || '').trim()).filter(Boolean))]; }
+function banSyncMirrors(bot) {
+  return (Array.isArray(bot?.banSyncMirrors) ? bot.banSyncMirrors : []).map((row) => ({
+    sourceBotId: String(row?.sourceBotId || '').trim().slice(0, 80), steamId: normalizeSteamId64(row?.steamId),
+    mode: ['permanent','temporary','dynamic'].includes(String(row?.mode || '')) ? String(row.mode) : 'permanent',
+    expiresAt: row?.expiresAt || null, reason: String(row?.reason || '').slice(0, 180), createdAt: row?.createdAt || null
+  })).filter((row) => row.sourceBotId && row.steamId);
+}
+
+export function managedAuditEntries(bot) {
+  return (Array.isArray(bot?.auditLog) ? bot.auditLog : []).map((row) => ({
+    id: String(row?.id || ''), at: row?.at || null, actor: String(row?.actor || '').slice(0, 100), action: String(row?.action || '').slice(0, 80), target: String(row?.target || '').slice(0, 100), detail: String(row?.detail || '').slice(0, 500), status: String(row?.status || 'ok').slice(0, 20)
+  })).filter((row) => row.action && Number.isFinite(Date.parse(row.at || '')));
+}
+export function appendManagedAudit(botOrId, event = {}) {
+  const id = typeof botOrId === 'object' ? String(botOrId?.id || '') : String(botOrId || '');
+  if (!id) return null;
+  const fresh = getManagedBot(id); if (!fresh) return null;
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    at: nowIso(), actor: String(event?.actor || 'system').slice(0, 100), action: String(event?.action || 'event').slice(0, 80),
+    target: String(event?.target || '').slice(0, 100), detail: String(event?.detail || '').slice(0, 500), status: String(event?.status || 'ok').slice(0, 20)
+  };
+  upsertManagedBot({ id, auditLog: [...managedAuditEntries(fresh), entry].slice(-500) });
+  return entry;
 }
 function setRuntime(id, patch) { runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: nowIso() }); }
 function cut(value, max = 100) { return String(value ?? '').slice(0, max); }
@@ -318,40 +368,229 @@ export function formatManagedBanReason(bot, reason, durationMinutes = 0) {
   return `${prefix}${cleanReason.slice(0, available)}${suffix}`.slice(0, 180);
 }
 
+function managedSyncTarget(sourceBot) {
+  const targetId = String(sourceBot?.banSyncTargetBotId || '').trim();
+  if (!targetId || targetId === String(sourceBot?.id || '')) return null;
+  const target = getManagedBot(targetId);
+  if (!target || String(target.serviceId || '') !== 'wardogs-warning-bot') return null;
+  if (!banSyncAcceptedSources(target).includes(String(sourceBot?.id || ''))) return null;
+  return target;
+}
+
+function upsertBanSyncMirror(targetBot, mirror) {
+  const fresh = getManagedBot(targetBot?.id) || targetBot;
+  const rows = banSyncMirrors(fresh).filter((row) => !(row.sourceBotId === mirror.sourceBotId && row.steamId === mirror.steamId));
+  upsertManagedBot({ id: fresh.id, banSyncMirrors: [...rows, mirror].slice(-2000) });
+}
+function removeBanSyncMirror(targetBot, sourceBotId, steamId) {
+  const fresh = getManagedBot(targetBot?.id) || targetBot;
+  upsertManagedBot({ id: fresh.id, banSyncMirrors: banSyncMirrors(fresh).filter((row) => !(row.sourceBotId === String(sourceBotId) && row.steamId === String(steamId))) });
+}
+
+async function disconnectManagedBanSyncSource(sourceBot, targetBotId, actor = 'system') {
+  const source = getManagedBot(sourceBot?.id) || sourceBot;
+  const target = getManagedBot(String(targetBotId || ''));
+  if (!source?.id || !target?.id) return { removed: 0 };
+  const mirrors = banSyncMirrors(target).filter((row) => row.sourceBotId === source.id);
+  let removed = 0;
+  for (const row of mirrors) {
+    try {
+      await unbanManagedPlayer(getManagedBot(target.id) || target, row.steamId, { skipSync: true, tolerateMissing: true, actor: `ban-sync-disconnect:${source.id}` });
+      removed += 1;
+    } catch (error) {
+      appendManagedAudit(target.id, { actor, action: 'ban-sync-disconnect-unban-failed', target: row.steamId, detail: String(error?.message || error).slice(0, 300), status: 'error' });
+    }
+  }
+  const freshTarget = getManagedBot(target.id) || target;
+  upsertManagedBot({
+    id: freshTarget.id,
+    banSyncRequests: banSyncRequests(freshTarget).filter((row) => row.sourceBotId !== source.id),
+    banSyncAcceptedSources: banSyncAcceptedSources(freshTarget).filter((id) => id !== source.id),
+    banSyncMirrors: banSyncMirrors(freshTarget).filter((row) => row.sourceBotId !== source.id)
+  });
+  appendManagedAudit(target.id, { actor, action: 'ban-sync-disconnected', target: source.id, detail: `${removed}/${mirrors.length} mirrored bans removed.` });
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-disconnected', target: target.id, detail: `${removed}/${mirrors.length} mirrored bans removed from old target.` });
+  return { removed };
+}
+
+async function syncBanToAcceptedTarget(sourceBot, payload) {
+  if (payload?.skipSync) return null;
+  const target = managedSyncTarget(sourceBot);
+  if (!target) return null;
+  const sourceBotId = String(sourceBot.id);
+  const normalized = normalizeSteamId64(payload?.steamId);
+  if (!normalized) return null;
+  const reason = String(payload?.reason || 'Synced ban').slice(0, 180);
+  const mode = ['permanent','temporary','dynamic'].includes(payload?.mode) ? payload.mode : 'permanent';
+  const actor = `ban-sync:${sourceBotId}`;
+  try {
+    if (mode === 'dynamic') {
+      const expiresAtMs = Date.parse(payload?.expiresAt || '');
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
+      const minutes = Math.max(1, Math.ceil((expiresAtMs - Date.now()) / 60_000));
+      await dynamicBanManagedPlayer(target, normalized, reason, minutes, { createdBy: actor, templateId: payload?.templateId, forcedExpiresAt: new Date(expiresAtMs).toISOString(), skipSync: true });
+    } else if (mode === 'temporary') {
+      const expiresAtMs = Date.parse(payload?.expiresAt || '');
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
+      const minutes = Math.max(1, Math.ceil((expiresAtMs - Date.now()) / 60_000));
+      await temporaryBanManagedPlayer(target, normalized, reason, minutes, { createdBy: actor, templateId: payload?.templateId, forcedExpiresAt: new Date(expiresAtMs).toISOString(), forceNormal: true, skipSync: true });
+    } else {
+      await banManagedPlayer(target, normalized, reason, { skipSync: true, actor });
+    }
+    upsertBanSyncMirror(target, { sourceBotId, steamId: normalized, mode, expiresAt: payload?.expiresAt || null, reason, createdAt: nowIso() });
+    appendManagedAudit(target.id, { actor, action: 'ban-sync-applied', target: normalized, detail: `${mode} ban mirrored from ${sourceBotId}${payload?.expiresAt ? ` until ${payload.expiresAt}` : ''}` });
+    appendManagedAudit(sourceBot.id, { actor: payload?.actor || 'system', action: 'ban-sync-sent', target: normalized, detail: `${mode} ban mirrored to ${target.id}` });
+    return target;
+  } catch (error) {
+    appendManagedAudit(sourceBot.id, { actor: payload?.actor || 'system', action: 'ban-sync-failed', target: normalized, detail: `${target.id}: ${String(error?.message || error).slice(0, 300)}`, status: 'error' });
+    setRuntime(sourceBot.id, { lastBanSyncError: String(error?.message || error).slice(0, 300), lastBanSyncAt: nowIso() });
+    return null;
+  }
+}
+
+async function syncUnbanToAcceptedTarget(sourceBot, steamId, meta = {}) {
+  if (meta?.skipSync) return null;
+  const target = managedSyncTarget(sourceBot);
+  if (!target) return null;
+  const normalized = normalizeSteamId64(steamId); if (!normalized) return null;
+  const mirrored = banSyncMirrors(target).some((row) => row.sourceBotId === String(sourceBot.id) && row.steamId === normalized);
+  if (!mirrored) return null;
+  try {
+    await unbanManagedPlayer(target, normalized, { skipSync: true, actor: `ban-sync:${sourceBot.id}`, tolerateMissing: true });
+    removeBanSyncMirror(target, sourceBot.id, normalized);
+    appendManagedAudit(target.id, { actor: `ban-sync:${sourceBot.id}`, action: 'ban-sync-unban', target: normalized, detail: `Mirrored ban removed because source ${sourceBot.id} removed/expired it.` });
+  } catch (error) {
+    appendManagedAudit(sourceBot.id, { actor: meta?.actor || 'system', action: 'ban-sync-unban-failed', target: normalized, detail: `${target.id}: ${String(error?.message || error).slice(0, 300)}`, status: 'error' });
+  }
+  return target;
+}
+
+export async function requestManagedBanSync(sourceBot, targetBotId, actor = 'web') {
+  const source = getManagedBot(sourceBot?.id) || sourceBot;
+  const targetId = String(targetBotId || '').trim();
+  if (!source?.id) throw new Error('Source bot not found');
+  const oldTargetId = String(source.banSyncTargetBotId || '').trim();
+  if (oldTargetId && oldTargetId !== targetId) await disconnectManagedBanSyncSource(source, oldTargetId, actor);
+  if (!targetId) {
+    upsertManagedBot({ id: source.id, banSyncTargetBotId: '' });
+    appendManagedAudit(source.id, { actor, action: 'ban-sync-disabled', detail: 'Outgoing ban sync target cleared.' });
+    return { status: 'disabled' };
+  }
+  if (targetId === source.id) throw new Error('A bot cannot sync bans to itself');
+  const target = getManagedBot(targetId);
+  if (!target || String(target.serviceId || '') !== 'wardogs-warning-bot') throw new Error('Target Bot ID is not a WARDOGS management bot');
+  upsertManagedBot({ id: source.id, banSyncTargetBotId: targetId });
+  if (banSyncAcceptedSources(target).includes(source.id)) return { status: 'accepted', target };
+  const pending = banSyncRequests(target).filter((row) => row.sourceBotId !== source.id);
+  pending.push({ sourceBotId: source.id, sourceOwnerDiscordId: String(source.ownerDiscordId || ''), requestedAt: nowIso() });
+  upsertManagedBot({ id: target.id, banSyncRequests: pending.slice(-50) });
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-requested', target: target.id, detail: 'Ban sync request sent.' });
+  appendManagedAudit(target.id, { actor: `bot:${source.id}`, action: 'ban-sync-request-received', target: source.id, detail: `Owner ${source.ownerDiscordId || 'unknown'} requested ban sync.` });
+  return { status: 'pending', target };
+}
+
+export async function acceptManagedBanSync(targetBot, sourceBotId, actor = 'web') {
+  const target = getManagedBot(targetBot?.id) || targetBot;
+  const source = getManagedBot(String(sourceBotId || ''));
+  if (!target?.id || !source || String(source.serviceId || '') !== 'wardogs-warning-bot') throw new Error('Source bot not found');
+  const requests = banSyncRequests(target);
+  if (!requests.some((row) => row.sourceBotId === source.id)) throw new Error('No pending sync request from this bot');
+  upsertManagedBot({ id: target.id, banSyncRequests: requests.filter((row) => row.sourceBotId !== source.id), banSyncAcceptedSources: [...new Set([...banSyncAcceptedSources(target), source.id])].slice(0, 50) });
+  upsertManagedBot({ id: source.id, banSyncTargetBotId: target.id });
+  appendManagedAudit(target.id, { actor, action: 'ban-sync-accepted', target: source.id, detail: 'Incoming ban sync accepted.' });
+  appendManagedAudit(source.id, { actor: `bot:${target.id}`, action: 'ban-sync-accepted', target: target.id, detail: 'Target accepted ban sync.' });
+  await syncManagedBanSnapshot(source, getManagedBot(target.id) || target, { actor });
+  return { source, target: getManagedBot(target.id) || target };
+}
+
+export async function rejectManagedBanSync(targetBot, sourceBotId, actor = 'web') {
+  const target = getManagedBot(targetBot?.id) || targetBot;
+  if (!target?.id) throw new Error('Target bot not found');
+  const source = getManagedBot(String(sourceBotId || ''));
+  if (source) await disconnectManagedBanSyncSource(source, target.id, actor);
+  else upsertManagedBot({ id: target.id, banSyncRequests: banSyncRequests(target).filter((row) => row.sourceBotId !== String(sourceBotId)), banSyncAcceptedSources: banSyncAcceptedSources(target).filter((id) => id !== String(sourceBotId)), banSyncMirrors: banSyncMirrors(target).filter((row) => row.sourceBotId !== String(sourceBotId)) });
+  if (source && String(source.banSyncTargetBotId || '') === target.id) upsertManagedBot({ id: source.id, banSyncTargetBotId: '' });
+  appendManagedAudit(target.id, { actor, action: 'ban-sync-rejected', target: String(sourceBotId || ''), detail: 'Incoming ban sync rejected/disconnected.' });
+  return true;
+}
+
+export async function syncManagedBanSnapshot(sourceBot, explicitTarget = null, meta = {}) {
+  const source = getManagedBot(sourceBot?.id) || sourceBot;
+  const target = explicitTarget || managedSyncTarget(source);
+  if (!source?.id || !target) return { synced: 0, removed: 0 };
+  if (!banSyncAcceptedSources(target).includes(source.id)) return { synced: 0, removed: 0 };
+  const [banData] = await Promise.all([wardogsRequest(source, '/v1/bans')]);
+  const liveBans = Array.isArray(banData?.bans) ? banData.bans : [];
+  const temps = new Map(temporaryBans(source).map((entry) => [entry.steamId, entry]));
+  const dynamics = new Map(dynamicBans(source).map((entry) => [entry.steamId, entry]));
+  const desired = new Map();
+  for (const b of liveBans) {
+    const id = normalizeSteamId64(b?.steamId); if (!id) continue;
+    const d = dynamics.get(id), t = temps.get(id);
+    if (d) desired.set(id, { mode: 'dynamic', steamId: id, reason: d.reason || b.reason, expiresAt: d.expiresAt, templateId: d.templateId });
+    else if (t) desired.set(id, { mode: 'temporary', steamId: id, reason: t.reason || b.reason, expiresAt: t.expiresAt, templateId: t.templateId });
+    else desired.set(id, { mode: 'permanent', steamId: id, reason: String(b?.reason || 'Synced ban') });
+  }
+  for (const d of dynamics.values()) if (Date.parse(d.expiresAt) > Date.now()) desired.set(d.steamId, { mode: 'dynamic', steamId: d.steamId, reason: d.reason, expiresAt: d.expiresAt, templateId: d.templateId });
+  let synced = 0, removed = 0;
+  for (const row of desired.values()) { await syncBanToAcceptedTarget(source, { ...row, actor: meta.actor }); synced += 1; }
+  const stale = banSyncMirrors(target).filter((row) => row.sourceBotId === source.id && !desired.has(row.steamId));
+  for (const row of stale) { await unbanManagedPlayer(target, row.steamId, { skipSync: true, actor: `ban-sync:${source.id}`, tolerateMissing: true }); removeBanSyncMirror(target, source.id, row.steamId); removed += 1; }
+  setRuntime(source.id, { lastBanSyncAt: nowIso(), lastBanSyncError: null });
+  return { synced, removed };
+}
+
 export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation', options = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
   const result = await wardogsRequest(bot, '/v1/bans', { method: 'POST', body: { steamId: normalized, reason: formatManagedBanReason(bot, reason, options?.durationMinutes) } });
   const fresh = getManagedBot(bot?.id);
-  if (fresh) {
+  if (fresh && options?.keepLocalTemporary !== true) {
     const next = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
     if (next.length !== temporaryBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: next });
   }
+  appendManagedAudit(bot.id, { actor: options?.actor || 'system', action: 'ban', target: normalized, detail: String(reason || '').slice(0, 300) });
+  if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(bot.id) || bot, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });
   return result;
 }
 
+export async function dynamicBanManagedPlayer(bot, steamId, reason = 'Dynamic ban', durationMinutes = 1440, meta = {}) {
+  const normalized = normalizeSteamId64(steamId);
+  if (!normalized) throw new Error('Invalid SteamID64');
+  const minutes = Math.max(1, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
+  if (!minutes) throw new Error('Dynamic ban duration is invalid');
+  const forced = Date.parse(meta?.forcedExpiresAt || '');
+  const expiresAt = Number.isFinite(forced) && forced > Date.now() ? new Date(forced).toISOString() : new Date(Date.now() + minutes * 60_000).toISOString();
+  const fresh = getManagedBot(bot?.id) || bot;
+  const existing = dynamicBans(fresh).filter((entry) => entry.steamId !== normalized);
+  const entry = { steamId: normalized, reason: String(reason || '').slice(0,180), expiresAt, createdAt: nowIso(), createdBy: String(meta?.createdBy || 'panel').slice(0,100), templateId: String(meta?.templateId || '').slice(0,64), escalated: false, escalatedAt: null, joinAttempts: [] };
+  upsertManagedBot({ id: fresh.id, dynamicBans: [...existing, entry].slice(-1000), temporaryBans: temporaryBans(fresh).filter((x) => x.steamId !== normalized) });
+  try { await kickManagedPlayer(fresh, normalized, `Dynamic Ban active until ${expiresAt}: ${String(reason || '').slice(0, 120)}`, { actor: meta?.createdBy || 'dynamic-ban', skipAudit: true }); }
+  catch (error) { if (![400,404,409,422].includes(Number(error?.status || 0))) appendManagedAudit(fresh.id, { actor: meta?.createdBy || 'system', action: 'dynamic-ban-initial-kick-failed', target: normalized, detail: String(error?.message || error).slice(0,300), status: 'error' }); }
+  appendManagedAudit(fresh.id, { actor: meta?.createdBy || 'system', action: 'dynamic-ban-created', target: normalized, detail: `${reason} · until ${expiresAt}` });
+  if (!meta?.skipSync) await syncBanToAcceptedTarget(getManagedBot(fresh.id) || fresh, { mode: 'dynamic', steamId: normalized, reason, expiresAt, templateId: meta?.templateId, actor: meta?.createdBy });
+  return { ...entry, dynamic: true };
+}
+
 export async function temporaryBanManagedPlayer(bot, steamId, reason = 'Temporary WARDOGS ban', durationMinutes = 1440, meta = {}) {
+  if (bot?.dynamicBanEnabled === true && meta?.forceNormal !== true) return dynamicBanManagedPlayer(bot, steamId, reason, durationMinutes, meta);
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
   const minutes = Math.max(1, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
   if (!minutes) throw new Error('Temporary ban duration is invalid');
-  // WARDOGS only supports persistent bans itself. The panel therefore applies a
-  // normal ban and persists the expiry locally, then removes it when the time is due.
-  // Put the temporary duration into the actual WARDOGS ban reason so the player-facing
-  // ban message also states how long the ban lasts.
-  await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes });
+  await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes, skipSync: true, actor: meta?.createdBy || 'system', keepLocalTemporary: true });
   const fresh = getManagedBot(bot?.id) || bot;
   const existing = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
+  const forced = Date.parse(meta?.forcedExpiresAt || '');
+  const expiresAt = Number.isFinite(forced) && forced > Date.now() ? new Date(forced).toISOString() : new Date(Date.now() + minutes * 60_000).toISOString();
   const entry = {
-    steamId: normalized,
-    reason: String(reason || '').slice(0, 180),
-    expiresAt: new Date(Date.now() + minutes * 60_000).toISOString(),
-    createdAt: nowIso(),
-    createdBy: String(meta?.createdBy || 'panel').slice(0, 100),
-    templateId: String(meta?.templateId || '').slice(0, 64)
+    steamId: normalized, reason: String(reason || '').slice(0, 180), expiresAt,
+    createdAt: nowIso(), createdBy: String(meta?.createdBy || 'panel').slice(0, 100), templateId: String(meta?.templateId || '').slice(0, 64)
   };
-  upsertManagedBot({ id: fresh.id, temporaryBans: [...existing, entry].slice(-1000) });
-  return entry;
+  upsertManagedBot({ id: fresh.id, temporaryBans: [...existing, entry].slice(-1000), dynamicBans: dynamicBans(fresh).filter((x) => x.steamId !== normalized) });
+  appendManagedAudit(fresh.id, { actor: meta?.createdBy || 'system', action: 'temporary-ban-created', target: normalized, detail: `${reason} · until ${expiresAt}` });
+  if (!meta?.skipSync) await syncBanToAcceptedTarget(getManagedBot(fresh.id) || fresh, { mode: 'temporary', steamId: normalized, reason, expiresAt, templateId: meta?.templateId, actor: meta?.createdBy });
+  return { ...entry, dynamic: false };
 }
 
 export async function expireManagedTemporaryBans(bot) {
@@ -369,13 +608,16 @@ export async function expireManagedTemporaryBans(bot) {
       const index = keep.findIndex((x) => x.steamId === entry.steamId);
       if (index >= 0) keep.splice(index, 1);
       expired += 1;
+      appendManagedAudit(fresh.id, { actor: 'system', action: 'temporary-ban-expired', target: entry.steamId, detail: `Expired at ${entry.expiresAt}` });
+      await syncUnbanToAcceptedTarget(fresh, entry.steamId, { actor: 'system' });
     } catch (error) {
       const code = String(error?.code || '').toLowerCase();
       const detail = String(error?.detail || error?.message || '').toLowerCase();
-      if (Number(error?.status || 0) === 404 && (code === 'ban_not_found' || detail.includes('not currently banned'))) {
+      if (Number(error?.status || 0) === 404 && (code === 'ban_not_found' || detail.includes('not currently banned') || detail.includes('not found'))) {
         const index = keep.findIndex((x) => x.steamId === entry.steamId);
         if (index >= 0) keep.splice(index, 1);
         expired += 1;
+        await syncUnbanToAcceptedTarget(fresh, entry.steamId, { actor: 'system' });
       } else lastError = String(error?.message || error).slice(0, 300);
     }
   }
@@ -384,15 +626,73 @@ export async function expireManagedTemporaryBans(bot) {
   else if (expired) setRuntime(fresh.id, { lastTemporaryBanError: null, lastTemporaryBanSweepAt: nowIso() });
   return { expired, pending: keep.length, error: lastError };
 }
-export async function kickManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation') {
-  const normalized = normalizeSteamId64(steamId);
-  if (!normalized) throw new Error('Invalid SteamID64');
-  return wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/kick`, { method: 'POST', body: { reason: String(reason || '').slice(0, 180) } });
+
+async function expireManagedDynamicBans(bot) {
+  const fresh = getManagedBot(bot?.id) || bot;
+  const rows = dynamicBans(fresh);
+  const due = rows.filter((entry) => Date.parse(entry.expiresAt) <= Date.now());
+  if (!due.length) return { expired: 0, pending: rows.length };
+  const keep = [...rows]; let expired = 0;
+  for (const entry of due) {
+    if (entry.escalated) {
+      try { await wardogsRequest(fresh, `/v1/bans/${encodeURIComponent(entry.steamId)}`, { method: 'DELETE' }); }
+      catch (error) { if (![404].includes(Number(error?.status || 0))) continue; }
+    }
+    const index = keep.findIndex((x) => x.steamId === entry.steamId); if (index >= 0) keep.splice(index, 1);
+    expired += 1;
+    appendManagedAudit(fresh.id, { actor: 'system', action: 'dynamic-ban-expired', target: entry.steamId, detail: `Expired at ${entry.expiresAt}` });
+    await syncUnbanToAcceptedTarget(fresh, entry.steamId, { actor: 'system' });
+  }
+  if (expired) upsertManagedBot({ id: fresh.id, dynamicBans: keep });
+  return { expired, pending: keep.length };
 }
-export async function killManagedPlayer(bot, steamId) {
+
+async function processManagedDynamicBans(bot, joinedPlayers = []) {
+  await expireManagedDynamicBans(bot);
+  let fresh = getManagedBot(bot?.id) || bot;
+  const rows = dynamicBans(fresh); if (!rows.length || !joinedPlayers.length) return;
+  const byId = new Map(rows.map((entry) => [entry.steamId, entry]));
+  const threshold = Math.max(2, Math.min(20, Math.floor(Number(fresh.dynamicBanEscalateJoins) || 3)));
+  const windowMinutes = Math.max(1, Math.min(1440, Math.floor(Number(fresh.dynamicBanEscalateWindowMinutes) || 5)));
+  const cutoff = Date.now() - windowMinutes * 60_000;
+  let changed = false;
+  for (const player of joinedPlayers) {
+    const steamId = playerSteamId(player); const entry = byId.get(steamId);
+    if (!entry || Date.parse(entry.expiresAt) <= Date.now()) continue;
+    try {
+      await kickManagedPlayer(fresh, steamId, `Dynamic Ban active until ${entry.expiresAt}: ${entry.reason}`, { actor: 'dynamic-ban', skipAudit: true });
+      appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-kick', target: steamId, detail: `Join blocked; expires ${entry.expiresAt}` });
+    } catch (error) {
+      appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-kick-failed', target: steamId, detail: String(error?.message || error).slice(0,300), status: 'error' });
+    }
+    const attempts = [...entry.joinAttempts.filter((stamp) => Date.parse(stamp) >= cutoff), nowIso()].slice(-50);
+    entry.joinAttempts = attempts; changed = true;
+    if (!entry.escalated && attempts.length >= threshold) {
+      const remainingMinutes = Math.max(1, Math.ceil((Date.parse(entry.expiresAt) - Date.now()) / 60_000));
+      try {
+        await banManagedPlayer(fresh, steamId, entry.reason, { durationMinutes: remainingMinutes, skipSync: true, actor: 'dynamic-ban-escalation', keepLocalTemporary: true });
+        entry.escalated = true; entry.escalatedAt = nowIso();
+        appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-escalated', target: steamId, detail: `${attempts.length} joins in ${windowMinutes} min; normal WARDOGS ban only until original expiry ${entry.expiresAt}` });
+      } catch (error) {
+        appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-escalation-failed', target: steamId, detail: String(error?.message || error).slice(0,300), status: 'error' });
+      }
+    }
+  }
+  if (changed) upsertManagedBot({ id: fresh.id, dynamicBans: rows });
+}
+export async function kickManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation', meta = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
-  return wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/kill`, { method: 'POST' });
+  const result = await wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/kick`, { method: 'POST', body: { reason: String(reason || '').slice(0, 180) } });
+  if (!meta?.skipAudit) appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'kick', target: normalized, detail: String(reason || '').slice(0, 300) });
+  return result;
+}
+export async function killManagedPlayer(bot, steamId, meta = {}) {
+  const normalized = normalizeSteamId64(steamId);
+  if (!normalized) throw new Error('Invalid SteamID64');
+  const result = await wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}/kill`, { method: 'POST' });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'kill-respawn', target: normalized });
+  return result;
 }
 function welcomeWhisperRetryable(error) {
   const status = Number(error?.status || 0);
@@ -592,7 +892,7 @@ async function cleanupLegacyJoinSeedingServerName(bot) {
   }
 }
 
-export async function whisperManagedPlayer(bot, steamId, message) {
+export async function whisperManagedPlayer(bot, steamId, message, meta = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
   const clean = String(message || '').trim();
@@ -608,10 +908,12 @@ export async function whisperManagedPlayer(bot, steamId, message) {
   } catch {
     target = normalized;
   }
-  return whisperManagedRosterPlayer(bot, target, clean, { attempts: 3, retryDelayMs: 600 });
+  const result = await whisperManagedRosterPlayer(bot, target, clean, { attempts: 3, retryDelayMs: 600 });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'whisper', target: normalized, detail: clean });
+  return result;
 }
 
-export async function whisperManagedFaction(bot, faction, message) {
+export async function whisperManagedFaction(bot, faction, message, meta = {}) {
   const cleanFaction = String(faction || '').trim();
   const cleanMessage = String(message || '').trim();
   if (!cleanFaction || cleanFaction.length > 80) throw new Error('Faction is invalid');
@@ -636,9 +938,10 @@ export async function whisperManagedFaction(bot, faction, message) {
       failures.push({ steamId, name: String(player?.name || ''), faction: playerFaction(player), error: String(error?.message || error || 'Whisper failed').slice(0, 180) });
     }
   }
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'faction-whisper', target: cleanFaction, detail: `${sent}/${targets.length} reached · ${cleanMessage}` });
   return { faction: cleanFaction, matched: targets.length, sent, failed: failures.length, failures: failures.slice(0, 10) };
 }
-export async function moveManagedPlayer(bot, steamId, faction) {
+export async function moveManagedPlayer(bot, steamId, faction, meta = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
   const clean = String(faction || '').trim();
@@ -646,31 +949,46 @@ export async function moveManagedPlayer(bot, steamId, faction) {
   const moved = await wardogsRequest(bot, `/v1/players/${encodeURIComponent(normalized)}`, { method: 'PATCH', body: { faction: clean } });
   let respawn = null;
   try { respawn = await killManagedPlayer(bot, normalized); } catch {}
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'set-team', target: normalized, detail: clean });
   return { moved, respawn };
 }
-export async function unbanManagedPlayer(bot, steamId) {
+export async function unbanManagedPlayer(bot, steamId, meta = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
-  const result = await wardogsRequest(bot, `/v1/bans/${encodeURIComponent(normalized)}`, { method: 'DELETE' });
+  const freshBefore = getManagedBot(bot?.id) || bot;
+  const dynamic = dynamicBans(freshBefore).find((entry) => entry.steamId === normalized);
+  let result = { localOnly: Boolean(dynamic && !dynamic.escalated) };
+  if (!dynamic || dynamic.escalated) {
+    try { result = await wardogsRequest(bot, `/v1/bans/${encodeURIComponent(normalized)}`, { method: 'DELETE' }); }
+    catch (error) { if (!(meta?.tolerateMissing && Number(error?.status || 0) === 404)) throw error; }
+  }
   const fresh = getManagedBot(bot?.id);
-  if (fresh) upsertManagedBot({ id: fresh.id, temporaryBans: temporaryBans(fresh).filter((entry) => entry.steamId !== normalized) });
+  if (fresh) upsertManagedBot({ id: fresh.id, temporaryBans: temporaryBans(fresh).filter((entry) => entry.steamId !== normalized), dynamicBans: dynamicBans(fresh).filter((entry) => entry.steamId !== normalized) });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'unban', target: normalized, detail: dynamic && !dynamic.escalated ? 'Dynamic ban removed locally.' : 'WARDOGS ban removed.' });
+  if (!meta?.skipSync) await syncUnbanToAcceptedTarget(getManagedBot(bot.id) || bot, normalized, meta);
   return result;
 }
-export async function addManagedReservedSlot(bot, steamId) {
+export async function addManagedReservedSlot(bot, steamId, meta = {}) {
   if (!validSteamId(steamId)) throw new Error('Invalid SteamID64');
-  return wardogsRequest(bot, '/v1/reserved-slots', { method: 'POST', body: { steamId: String(steamId) } });
+  const result = await wardogsRequest(bot, '/v1/reserved-slots', { method: 'POST', body: { steamId: String(steamId) } });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'reserved-slot-add', target: String(steamId) });
+  return result;
 }
-export async function removeManagedReservedSlot(bot, steamId) {
+export async function removeManagedReservedSlot(bot, steamId, meta = {}) {
   if (!validSteamId(steamId)) throw new Error('Invalid SteamID64');
-  return wardogsRequest(bot, `/v1/reserved-slots/${encodeURIComponent(steamId)}`, { method: 'DELETE' });
+  const result = await wardogsRequest(bot, `/v1/reserved-slots/${encodeURIComponent(steamId)}`, { method: 'DELETE' });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'reserved-slot-remove', target: String(steamId) });
+  return result;
 }
-export async function broadcastManaged(bot, message) {
+export async function broadcastManaged(bot, message, meta = {}) {
   const clean = String(message || '').trim();
   if (!clean || clean.length > 200) throw new Error('Announcement must be 1–200 characters long');
-  return wardogsRequest(bot, '/v1/broadcast', { method: 'POST', body: { message: clean } });
+  const result = await wardogsRequest(bot, '/v1/broadcast', { method: 'POST', body: { message: clean } });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'broadcast', detail: clean });
+  return result;
 }
-export async function restartManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/restart', { method: 'POST' }); }
-export async function endManagedMatch(bot) { return wardogsRequest(bot, '/v1/match/end', { method: 'POST' }); }
+export async function restartManagedMatch(bot, meta = {}) { const result = await wardogsRequest(bot, '/v1/match/restart', { method: 'POST' }); appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'match-restart' }); return result; }
+export async function endManagedMatch(bot, meta = {}) { const result = await wardogsRequest(bot, '/v1/match/end', { method: 'POST' }); appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'match-end' }); return result; }
 function managedLightingValue(value) {
   if (value && typeof value === 'object') return String(value.name ?? value.id ?? value.label ?? value.value ?? '').trim();
   return String(value ?? '').trim();
@@ -679,7 +997,7 @@ function managedLightingMatches(actual, requested) {
   const normalize = (value) => managedLightingValue(value).toLowerCase().replace(/[^a-z0-9]+/g, '');
   return Boolean(normalize(actual) && normalize(actual) === normalize(requested));
 }
-export async function setManagedLighting(bot, lighting) {
+export async function setManagedLighting(bot, lighting, meta = {}) {
   const clean = String(lighting || '').trim();
   if (!clean || clean.length > 100) throw new Error('Lighting value is invalid');
 
@@ -696,7 +1014,7 @@ export async function setManagedLighting(bot, lighting) {
       lastStatus = await wardogsRequest(bot, '/v1/status');
       lastReadError = null;
       const live = managedLightingValue(lastStatus?.lighting);
-      if (live && managedLightingMatches(live, clean)) return { commandResult, verified: true, requested: clean, lighting: live };
+      if (live && managedLightingMatches(live, clean)) { appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'lighting', detail: clean }); return { commandResult, verified: true, requested: clean, lighting: live }; }
     } catch (error) { lastReadError = error; }
   }
 
@@ -708,14 +1026,14 @@ export async function setManagedLighting(bot, lighting) {
     lastStatus = await wardogsRequest(bot, '/v1/status');
     lastReadError = null;
     const live = managedLightingValue(lastStatus?.lighting);
-    if (live && managedLightingMatches(live, clean)) return { commandResult, verified: true, requested: clean, lighting: live };
+    if (live && managedLightingMatches(live, clean)) { appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'lighting', detail: clean }); return { commandResult, verified: true, requested: clean, lighting: live }; }
   } catch (error) { lastReadError = error; }
 
   if (lastReadError && !lastStatus) throw new Error(`Lighting command sent, but live status could not be verified: ${String(lastReadError?.message || lastReadError).slice(0, 180)}`);
   const live = managedLightingValue(lastStatus?.lighting) || 'unknown';
   throw new Error(`WARDOGS accepted lighting "${clean}", but live status still reports "${live}". The current server phase/build did not apply it live.`);
 }
-export async function changeManagedMap(bot, { map, experiences = [], lighting = '', zoneAlternator = '' } = {}) {
+export async function changeManagedMap(bot, { map, experiences = [], lighting = '', zoneAlternator = '' } = {}, meta = {}) {
   const cleanMap = String(map || '').trim();
   if (!cleanMap || cleanMap.length > 100) throw new Error('Map is invalid');
   const body = { map: cleanMap };
@@ -727,7 +1045,9 @@ export async function changeManagedMap(bot, { map, experiences = [], lighting = 
   const cleanAlternator = String(zoneAlternator || '').trim();
   if (cleanLighting) body.lighting = cleanLighting.slice(0, 100);
   if (cleanAlternator) body.zoneAlternator = cleanAlternator.slice(0, 160);
-  return wardogsRequest(bot, '/v1/match/map', { method: 'POST', body });
+  const result = await wardogsRequest(bot, '/v1/match/map', { method: 'POST', body });
+  appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'map-change', target: cleanMap, detail: JSON.stringify(body).slice(0, 500) });
+  return result;
 }
 
 export async function managedMapOptions(bot, map) {
@@ -798,7 +1118,7 @@ async function executeDetectionAction(bot, player, reasons, matchedRules) {
   if (!steamId || chosen.action === 'alert') return { action: 'alert', ok: true, label: 'Alert only' };
   const reason = reasons.join('; ').slice(0, 180) || 'WARDOGS detection rule';
   if (chosen.action === 'kick') {
-    await kickManagedPlayer(bot, steamId, reason);
+    await kickManagedPlayer(bot, steamId, reason, { actor: 'detection-rule' });
     return { action: 'kick', ok: true, label: 'Kick executed' };
   }
   if (chosen.action === 'tempban') {
@@ -806,7 +1126,7 @@ async function executeDetectionAction(bot, player, reasons, matchedRules) {
     const entry = await temporaryBanManagedPlayer(bot, steamId, reason, minutes, { createdBy: 'detection-rule' });
     return { action: 'tempban', ok: true, label: `Temporary ban · ${formatManagedBanDuration(minutes)}`, expiresAt: entry.expiresAt };
   }
-  await banManagedPlayer(bot, steamId, reason);
+  await banManagedPlayer(bot, steamId, reason, { actor: 'detection-rule' });
   return { action: 'ban', ok: true, label: 'Permanent ban executed' };
 }
 
@@ -833,14 +1153,13 @@ function interactionRoleIds(interaction) {
 function discordPermission(bot, interaction, key) {
   if (!MANAGED_DISCORD_PERMISSION_KEYS.includes(key)) return false;
   const userId = String(interaction?.user?.id || '');
-  if (userId && userId === String(bot?.ownerDiscordId || '')) return true;
   if (interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.Administrator)) return true;
   const grants = normalizeDiscordGrants(bot);
-  if (!grants.length) {
-    if (key === 'ban' || key === 'ignore') return Boolean(interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.BanMembers));
-    if (key === 'kick') return Boolean(interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.KickMembers));
-    return false;
-  }
+  // v3.12.30: management-panel access is explicit. Bot ownership and ordinary
+  // Discord Kick/Ban permissions do not grant access automatically. Only guild
+  // Administrators keep the normal Discord admin bypass above; everyone else
+  // must be present in the configured user/role grant list.
+  if (!grants.length) return false;
   const roleIds = new Set(interactionRoleIds(interaction));
   return grants.some((grant) => {
     const subject = grant.type === 'user' ? grant.id === userId : roleIds.has(grant.id);
@@ -857,7 +1176,7 @@ function signature(bot) {
     steamWebApiKeyEnc: bot.steamWebApiKeyEnc || '', steamAppId: bot.steamAppId || '',
     announcementEnabled: bot.announcementEnabled === true, announcementIntervalMinutes: Number(bot.announcementIntervalMinutes || 15),
     announcementMessages: bot.announcementMessages || '', welcomeWhisperEnabled: bot.welcomeWhisperEnabled === true,
-    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
+    welcomeWhisperMessage: bot.welcomeWhisperMessage || '', banDiscordLink: normalizeManagedBanDiscordLink(bot.banDiscordLink), dynamicBanEnabled: bot.dynamicBanEnabled === true, dynamicBanEscalateJoins: Number(bot.dynamicBanEscalateJoins || 3), dynamicBanEscalateWindowMinutes: Number(bot.dynamicBanEscalateWindowMinutes || 5), banSyncTargetBotId: bot.banSyncTargetBotId || '', banSyncAcceptedSources: banSyncAcceptedSources(bot), accessUntil: bot.accessUntil || null, adminGrant: Boolean(bot.adminGrant), restartNonce: bot.restartNonce || 0
   });
 }
 
@@ -1001,6 +1320,52 @@ function scheduleControlPanelBottom(botId, client, state) {
   state.panelRepostTimer.unref?.();
 }
 
+async function pollManagedDynamicBans(bot, state) {
+  if (state.dynamicPollInFlight) return;
+  state.dynamicPollInFlight = true;
+  try {
+    // Expiry is enforced even when nobody is online. If a Dynamic Ban was
+    // escalated to a real WARDOGS ban, this is also where that real ban is
+    // removed at the ORIGINAL expiry time.
+    await processManagedDynamicBans(bot, []);
+    const fresh = getManagedBot(bot?.id) || bot;
+    const activeBans = dynamicBans(fresh).filter((entry) => Date.parse(entry.expiresAt) > Date.now());
+    if (!activeBans.length) {
+      state.dynamicJoinTracker = createManagedJoinTracker();
+      setRuntime(fresh.id, { dynamicBanWatcherActive: false, dynamicBanWatcherPlayers: 0 });
+      return;
+    }
+
+    const data = await wardogsRequest(fresh, '/v1/players');
+    const players = wardogsPlayerRows(data);
+    const tracker = state.dynamicJoinTracker || (state.dynamicJoinTracker = createManagedJoinTracker());
+    const wasInitialized = tracker.initialized === true;
+    const joined = managedJoinCandidates(tracker, players, DYNAMIC_BAN_LEAVE_CONFIRM_POLLS);
+    const bannedIds = new Set(activeBans.map((entry) => entry.steamId));
+
+    // On a service restart an already connected dynamically-banned player must
+    // not get a free pass just because the first roster snapshot is normally
+    // baseline-only. Treat matching players in that first snapshot as blocked
+    // sessions and enforce the kick immediately.
+    const enforce = wasInitialized
+      ? joined.filter((player) => bannedIds.has(playerSteamId(player)))
+      : players.filter((player) => bannedIds.has(playerSteamId(player)));
+
+    if (enforce.length) await processManagedDynamicBans(fresh, enforce);
+    setRuntime(fresh.id, {
+      dynamicBanWatcherActive: true,
+      dynamicBanWatcherPlayers: activeBans.length,
+      lastDynamicBanWatcherAt: nowIso(),
+      lastDynamicBanWatcherError: null
+    });
+  } catch (error) {
+    setRuntime(bot.id, { lastDynamicBanWatcherAt: nowIso(), lastDynamicBanWatcherError: String(error?.message || error).slice(0, 300) });
+    throw error;
+  } finally {
+    state.dynamicPollInFlight = false;
+  }
+}
+
 async function pollPlayers(bot, state, client) {
   // Never allow overlapping poll cycles. Slow Steam/RCON requests must not create
   // a second concurrent detection pass for the same join.
@@ -1017,9 +1382,12 @@ async function pollPlayers(bot, state, client) {
     // Three consecutive successful snapshots must miss a player before a later return
     // is treated as another join. This absorbs temporary empty/incomplete API results.
     const joinedPlayers = managedJoinCandidates(state.joinTracker, players, 3);
+    // Dynamic Ban enforcement has its own fast 2-second watcher. Detection rules
+    // keep the slower, conservative tracker to avoid false join events.
+    const dynamicBlocked = new Set(dynamicBans(getManagedBot(bot.id) || bot).map((entry) => entry.steamId));
     const candidates = joinedPlayers.filter((player) => {
       const id = playerSteamId(player);
-      return id && !ignored.has(id);
+      return id && !ignored.has(id) && !dynamicBlocked.has(id);
     });
 
     if (!state.baselineReady && state.joinTracker?.initialized) {
@@ -1077,7 +1445,7 @@ async function pollPlayers(bot, state, client) {
       if (messages.length && Date.now() - Number(state.lastAnnouncementAt || 0) >= intervalMs) {
         const message = messages[state.announcementIndex % messages.length];
         try {
-          await broadcastManaged(bot, message);
+          await broadcastManaged(bot, message, { actor: 'scheduled-announcement' });
           state.announcementIndex = (state.announcementIndex + 1) % messages.length;
           state.lastAnnouncementAt = Date.now();
           setRuntime(bot.id, { lastAnnouncementAt: nowIso(), lastAnnouncement: message });
@@ -1335,13 +1703,14 @@ async function handleLegacyAlertButton(interaction) {
         const playerName = interaction.message?.embeds?.[0]?.fields?.find?.((field) => field.name === 'Player')?.value || '';
         upsertManagedBot({ id: bot.id, ignoredPlayers: [...existing, { steamId, name: cut(playerName, 100), ignoredAt: nowIso(), ignoredBy: String(interaction.user?.id || '') }].slice(-500) });
       }
+      appendManagedAudit(bot.id, { actor: `discord:${interaction.user?.id || ''}`, action: 'detection-ignore-add', target: steamId });
       await interaction.update({ components: alertComponents(bot, { steamId }, true) }).catch(() => {});
       await interaction.followUp({ content: `SteamID64 ${steamId} is now ignored. No further detection alerts or auto-bans will be generated for this player until the ignore is removed in the web panel.`, ephemeral: true }).catch(() => {});
       return true;
     }
     await interaction.deferReply({ ephemeral: true }).catch(() => {});
-    if (action === 'wdban') await banManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
-    else await kickManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`);
+    if (action === 'wdban') await banManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`, { actor: `discord:${interaction.user?.id || ''}` });
+    else await kickManagedPlayer(bot, steamId, `Discord action by ${interaction.user?.tag || interaction.user?.id || 'admin'}`, { actor: `discord:${interaction.user?.id || ''}` });
     await interaction.editReply(`${action === 'wdban' ? 'Ban' : 'Kick'} for ${steamId} was sent to the WARDOGS server.`).catch(() => {});
   } catch (error) {
     const message = `Action failed: ${cut(error.message || error, 300)}`;
@@ -1392,7 +1761,7 @@ async function handleButton(interaction, client, state) {
       if (action === 'pkick') await interaction.showModal(modal(`wd:mkick:${bot.id}:${steamId}`, 'Kick player', [{ id: 'reason', label: 'Reason', maxLength: 180, required: false, placeholder: 'Rule violation' }]));
       else if (action === 'pban') await interaction.reply(banDurationPicker(bot, steamId));
       else if (action === 'pwhisper') await interaction.showModal(modal(`wd:mwhisper:${bot.id}:${steamId}`, 'Whisper', [{ id: 'message', label: 'Message', style: TextInputStyle.Paragraph, maxLength: 200 }]));
-      else if (action === 'pkill') { await killManagedPlayer(bot, steamId); await interaction.reply({ content: `Kill/respawn sent for ${steamId}.`, ephemeral: true }); }
+      else if (action === 'pkill') { await killManagedPlayer(bot, steamId, { actor: `discord:${interaction.user?.id || ''}` }); await interaction.reply({ content: `Kill/respawn sent for ${steamId}.`, ephemeral: true }); }
       else await interaction.reply(await teamPicker(bot, steamId));
       return true;
     }
@@ -1402,7 +1771,7 @@ async function handleButton(interaction, client, state) {
     }
     if (action === 'restartmatch' || action === 'endmatch') {
       const bot = interactionBot(interaction, botId, 'match'); if (!bot) return true;
-      if (action === 'restartmatch') await restartManagedMatch(bot); else await endManagedMatch(bot);
+      if (action === 'restartmatch') await restartManagedMatch(bot, { actor: `discord:${interaction.user?.id || ''}` }); else await endManagedMatch(bot, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.reply({ content: action === 'restartmatch' ? 'Match restart sent.' : 'Match end sent.', ephemeral: true }); return true;
     }
     if (action === 'map') {
@@ -1416,7 +1785,7 @@ async function handleButton(interaction, client, state) {
     if (action === 'mapapply') {
       const bot = interactionBot(interaction, botId, 'map'); if (!bot) return true;
       const saved = getUiState(bot.id, interaction.user.id); if (!saved.map) throw new Error('No map selected');
-      await changeManagedMap(bot, { map: saved.map, experiences: saved.experiences || [], lighting: saved.lighting || '', zoneAlternator: saved.zoneAlternator || '' });
+      await changeManagedMap(bot, { map: saved.map, experiences: saved.experiences || [], lighting: saved.lighting || '', zoneAlternator: saved.zoneAlternator || '' }, { actor: `discord:${interaction.user?.id || ''}` });
       discordUiState.delete(uiKey(bot.id, interaction.user.id));
       await interaction.update({ content: `Map change to **${cut(saved.map, 90)}** sent.`, components: [] }); return true;
     }
@@ -1467,12 +1836,12 @@ async function handleSelect(interaction) {
     }
     if (action === 'unban') {
       const bot = interactionBot(interaction, botId, 'unban'); if (!bot) return true;
-      const steamId = String(interaction.values?.[0] || ''); await unbanManagedPlayer(bot, steamId);
+      const steamId = String(interaction.values?.[0] || ''); await unbanManagedPlayer(bot, steamId, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.update({ content: `Ban for ${steamId} removed.`, components: [] }); return true;
     }
     if (action === 'teamset') {
       const steamId = parts[3]; const bot = interactionBot(interaction, botId, 'setteam'); if (!bot) return true;
-      const faction = String(interaction.values?.[0] || ''); await moveManagedPlayer(bot, steamId, faction);
+      const faction = String(interaction.values?.[0] || ''); await moveManagedPlayer(bot, steamId, faction, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.update({ content: `${steamId} was moved to **${cut(faction, 80)}** and respawned.`, components: [] }); return true;
     }
     if (action === 'mapsel') {
@@ -1490,7 +1859,7 @@ async function handleSelect(interaction) {
     }
     if (action === 'lightset') {
       const bot = interactionBot(interaction, botId, 'lighting'); if (!bot) return true;
-      const lighting = String(interaction.values?.[0] || ''); await setManagedLighting(bot, lighting);
+      const lighting = String(interaction.values?.[0] || ''); await setManagedLighting(bot, lighting, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.update({ content: `Lighting **${cut(lighting, 90)}** applied.`, components: [] }); return true;
     }
   } catch (error) {
@@ -1509,12 +1878,12 @@ async function handleModal(interaction) {
   try {
     if (action === 'mannounce') {
       const bot = interactionBot(interaction, botId, 'announce'); if (!bot) return true;
-      const message = interaction.fields.getTextInputValue('message'); await broadcastManaged(bot, message);
+      const message = interaction.fields.getTextInputValue('message'); await broadcastManaged(bot, message, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.reply({ content: 'Server announcement sent.', ephemeral: true }); return true;
     }
     if (action === 'mkick') {
       const bot = interactionBot(interaction, botId, 'kick'); if (!bot) return true;
-      const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel kick'; await kickManagedPlayer(bot, steamId, reason);
+      const reason = interaction.fields.getTextInputValue('reason') || 'Discord panel kick'; await kickManagedPlayer(bot, steamId, reason, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.reply({ content: `Kick for ${steamId} sent.`, ephemeral: true }); return true;
     }
     if (action === 'mbanplayer') {
@@ -1523,16 +1892,16 @@ async function handleModal(interaction) {
       const duration = discordBanDurationMinutes(interaction, durationMode);
       if (duration > 0) {
         const entry = await temporaryBanManagedPlayer(bot, steamId, reason, duration, { createdBy: `discord:${interaction.user?.id || ''}` });
-        await interaction.reply({ content: `${steamId} was temporarily banned for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });
+        await interaction.reply({ content: `${entry.dynamic ? 'Dynamic Ban' : 'Temporary ban'} for ${steamId} is active for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });
       } else {
-        await banManagedPlayer(bot, steamId, reason);
+        await banManagedPlayer(bot, steamId, reason, { actor: `discord:${interaction.user?.id || ''}` });
         await interaction.reply({ content: `${steamId} was permanently banned.`, ephemeral: true });
       }
       return true;
     }
     if (action === 'mwhisper') {
       const bot = interactionBot(interaction, botId, 'whisper'); if (!bot) return true;
-      const message = interaction.fields.getTextInputValue('message'); await whisperManagedPlayer(bot, steamId, message);
+      const message = interaction.fields.getTextInputValue('message'); await whisperManagedPlayer(bot, steamId, message, { actor: `discord:${interaction.user?.id || ''}` });
       await interaction.reply({ content: `Whisper sent to ${steamId}.`, ephemeral: true }); return true;
     }
     if (action === 'mmanualban') {
@@ -1542,9 +1911,9 @@ async function handleModal(interaction) {
       const duration = discordBanDurationMinutes(interaction, durationMode);
       if (duration > 0) {
         const entry = await temporaryBanManagedPlayer(bot, id, reason, duration, { createdBy: `discord:${interaction.user?.id || ''}` });
-        await interaction.reply({ content: `${id} was temporarily banned for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });
+        await interaction.reply({ content: `${entry.dynamic ? 'Dynamic Ban' : 'Temporary ban'} for ${id} is active for ${formatManagedBanDuration(duration)} (until ${entry.expiresAt}).`, ephemeral: true });
       } else {
-        await banManagedPlayer(bot, id, reason);
+        await banManagedPlayer(bot, id, reason, { actor: `discord:${interaction.user?.id || ''}` });
         await interaction.reply({ content: `${id} was permanently banned.`, ephemeral: true });
       }
       return true;
@@ -1585,6 +1954,7 @@ async function stopOne(id, keepRuntime = true) {
     clearInterval(active.timer);
     clearTimeout(active.state?.panelRepostTimer);
     clearInterval(active.state?.welcomeTimer);
+    clearInterval(active.state?.dynamicTimer);
     const stored = getManagedBot(id) || { id };
     try { await deleteStoredControlPanel(stored, active.client, active.state); } catch {}
     try { await active.client.destroy(); } catch {}
@@ -1602,7 +1972,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInitialFactionKey: new Map(), welcomeSawPreTeam: new Set(), welcomeTeamChoiceConfirmed: new Set(), welcomeFactionStableKey: new Map(), welcomeFactionStablePolls: new Map(), welcomeValidFactions: [], welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, dynamicPollInFlight: false, dynamicJoinTracker: createManagedJoinTracker(), dynamicTimer: null, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInitialFactionKey: new Map(), welcomeSawPreTeam: new Set(), welcomeTeamChoiceConfirmed: new Set(), welcomeFactionStableKey: new Map(), welcomeFactionStablePolls: new Map(), welcomeValidFactions: [], welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {
@@ -1619,6 +1989,7 @@ async function startOne(bot) {
     // Build the WARDOGS roster baseline BEFORE Discord login. Discord can take many
     // seconds to become ready; previously a player joining during that window was
     // swallowed by the first post-login snapshot and never received a welcome.
+    await pollManagedDynamicBans(bot, state);
     if (bot.welcomeWhisperEnabled === true) await pollManagedWelcome(bot, state);
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Discord login timeout')), 20000);
@@ -1640,6 +2011,13 @@ async function startOne(bot) {
     await cleanupLegacyJoinSeedingServerName(freshBeforeRun);
     setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', lastError: null });
     await pollPlayers(freshBeforeRun, state, client);
+    await pollManagedDynamicBans(freshBeforeRun, state);
+    state.dynamicTimer = setInterval(() => {
+      const fresh = getManagedBot(bot.id);
+      if (!fresh?.enabled || !accessActive(fresh)) return;
+      pollManagedDynamicBans(fresh, state).catch(() => {});
+    }, DYNAMIC_BAN_POLL_MS);
+    state.dynamicTimer.unref?.();
     if (freshBeforeRun.welcomeWhisperEnabled === true) await pollManagedWelcome(freshBeforeRun, state);
     state.welcomeTimer = setInterval(() => {
       const fresh = getManagedBot(bot.id);
@@ -1672,6 +2050,10 @@ export async function syncManagedBots(bots) {
       // while a bot is stopped so an expired local timer cannot leave a player banned.
       if (fresh && temporaryBans(fresh).length) {
         try { await expireManagedTemporaryBans(fresh); } catch (error) { setRuntime(id, { lastTemporaryBanError: String(error?.message || error).slice(0, 300) }); }
+        fresh = getManagedBot(id) || fresh;
+      }
+      if (fresh && dynamicBans(fresh).length) {
+        try { await expireManagedDynamicBans(fresh); } catch (error) { setRuntime(id, { lastDynamicBanWatcherError: String(error?.message || error).slice(0, 300) }); }
         fresh = getManagedBot(id) || fresh;
       }
       if (!fresh || !fresh.enabled || !accessActive(fresh)) {
