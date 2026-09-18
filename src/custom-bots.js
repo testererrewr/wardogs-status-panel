@@ -10,8 +10,8 @@ const MAX_RAW_ENTRIES = 20000;
 const MAX_UNPACKED_BYTES = 100 * 1024 * 1024;
 const MAX_LOOSE_FILES = 20;
 const IGNORED_PARTS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__']);
-const SENSITIVE_UPLOAD_NAMES = new Set(['.env', '.env.local', '.env.production', '.npmrc', '.pypirc', '.netrc', 'id_rsa', 'id_ed25519', 'credentials.json']);
-function sensitiveUploadEntry(name) { const parts = String(name || '').split('/').filter(Boolean); const base = String(parts.at(-1) || '').toLowerCase(); return SENSITIVE_UPLOAD_NAMES.has(base) || base.startsWith('.env.') || ['id_ecdsa','id_dsa'].includes(base); }
+const SENSITIVE_UPLOAD_NAMES = new Set(['.npmrc', '.pypirc', '.netrc', 'id_rsa', 'id_ed25519', 'credentials.json']);
+function sensitiveUploadEntry(name) { const parts = String(name || '').split('/').filter(Boolean); const base = String(parts.at(-1) || '').toLowerCase(); return SENSITIVE_UPLOAD_NAMES.has(base) || ['id_ecdsa','id_dsa'].includes(base); }
 
 function validBotId(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(id || ''));
@@ -160,7 +160,7 @@ function buildDockerfile(runtime, entrypoint) {
 function writeGeneratedRuntimeFiles(id, runtime, entrypoint) {
   const dest = botDir(id);
   fs.writeFileSync(path.join(dest, 'Dockerfile.generated'), buildDockerfile(runtime, entrypoint), { mode: 0o600 });
-  fs.writeFileSync(path.join(dest, '.dockerignore'), '.git\n.env\nnode_modules\n__pycache__\nsource.zip\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(dest, '.dockerignore'), '.git\nnode_modules\n__pycache__\nsource.zip\n', { mode: 0o600 });
 }
 
 function projectStats(id) {

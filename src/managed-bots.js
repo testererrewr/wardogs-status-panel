@@ -565,7 +565,7 @@ export async function dynamicBanManagedPlayer(bot, steamId, reason = 'Dynamic ba
   const existing = dynamicBans(fresh).filter((entry) => entry.steamId !== normalized);
   const entry = { steamId: normalized, reason: String(reason || '').slice(0,180), expiresAt, createdAt: nowIso(), createdBy: String(meta?.createdBy || 'panel').slice(0,100), templateId: String(meta?.templateId || '').slice(0,64), escalated: false, escalatedAt: null, joinAttempts: [] };
   upsertManagedBot({ id: fresh.id, dynamicBans: [...existing, entry].slice(-1000), temporaryBans: temporaryBans(fresh).filter((x) => x.steamId !== normalized) });
-  try { await kickManagedPlayer(fresh, normalized, `Dynamic Ban active until ${expiresAt}: ${String(reason || '').slice(0, 120)}`, { actor: meta?.createdBy || 'dynamic-ban', skipAudit: true }); }
+  try { await kickManagedPlayer(fresh, normalized, formatManagedBanReason(fresh, reason, minutes), { actor: meta?.createdBy || 'dynamic-ban', skipAudit: true }); }
   catch (error) { if (![400,404,409,422].includes(Number(error?.status || 0))) appendManagedAudit(fresh.id, { actor: meta?.createdBy || 'system', action: 'dynamic-ban-initial-kick-failed', target: normalized, detail: String(error?.message || error).slice(0,300), status: 'error' }); }
   appendManagedAudit(fresh.id, { actor: meta?.createdBy || 'system', action: 'dynamic-ban-created', target: normalized, detail: `${reason} · until ${expiresAt}` });
   if (!meta?.skipSync) await syncBanToAcceptedTarget(getManagedBot(fresh.id) || fresh, { mode: 'dynamic', steamId: normalized, reason, expiresAt, templateId: meta?.templateId, actor: meta?.createdBy });
@@ -660,7 +660,8 @@ async function processManagedDynamicBans(bot, joinedPlayers = []) {
     const steamId = playerSteamId(player); const entry = byId.get(steamId);
     if (!entry || Date.parse(entry.expiresAt) <= Date.now()) continue;
     try {
-      await kickManagedPlayer(fresh, steamId, `Dynamic Ban active until ${entry.expiresAt}: ${entry.reason}`, { actor: 'dynamic-ban', skipAudit: true });
+      const remainingMinutes = Math.max(1, Math.ceil((Date.parse(entry.expiresAt) - Date.now()) / 60_000));
+      await kickManagedPlayer(fresh, steamId, formatManagedBanReason(fresh, entry.reason, remainingMinutes), { actor: 'dynamic-ban', skipAudit: true });
       appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-kick', target: steamId, detail: `Join blocked; expires ${entry.expiresAt}` });
     } catch (error) {
       appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-kick-failed', target: steamId, detail: String(error?.message || error).slice(0,300), status: 'error' });

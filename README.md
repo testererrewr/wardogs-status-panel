@@ -1,4 +1,25 @@
-# status-hub.lol v3.12.30
+# status-hub.lol v3.12.33
+
+
+
+
+## v3.12.33 – Custom Bot `.env` file uploads
+
+- Custom Bot file-browser uploads now allow `.env` and `.env.*` files, both as loose files and inside ZIP overlays. Existing files with the same path are overwritten like any other project file.
+- Generated Custom Bot Docker build contexts no longer exclude `.env`, so bots that explicitly load a local `.env` file receive it after **Start/rebuild**.
+- `.env` files are included in the bot source/file browser just like other project files. Only the bot owner and panel administrators can manage/download that bot source.
+- Other sensitive credential files such as SSH private keys, `.npmrc`, `.pypirc`, `.netrc` and `credentials.json` remain blocked, as do path traversal, dependency/cache folders and oversized uploads.
+
+## v3.12.32 – Dynamic Ban player message
+
+- Dynamic Ban remains an internal enforcement mode and is no longer exposed to players in the kick reason.
+- The initial Dynamic Ban kick now uses the same formatted temporary-ban message as a normal ban: remaining duration, configured reason, and optional Discord invite.
+- Every later rejoin kick also uses that normal ban format with the current remaining time. The original Dynamic Ban expiry and escalation logic are unchanged.
+
+## v3.12.31 – Ban Sync BOT ID visibility
+
+- The current management bot's own **BOT ID** is now shown directly above the Ban Sync target field.
+- The field is read-only and can be clicked to select the full ID for easy copying into another bot's Ban Sync target.
 
 
 ## v3.12.30 – Ban Sync, Dynamic Bans, Audit Log & Custom Bot Files
