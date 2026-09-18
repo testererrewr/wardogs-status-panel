@@ -62,7 +62,23 @@ export function playerHasFaction(player) {
   const faction = playerFaction(player);
   const key = normalizeFactionKey(faction);
   if (!key) return false;
-  return !new Set(['none','null','undefined','unassigned','nofaction','noteam','spectator','spectate','neutral']).has(key);
+  return !new Set([
+    'none','null','undefined','unassigned','nofaction','noteam','spectator','spectate','spectating','neutral',
+    'invalid','invalidfaction','unknown','unset','pending','lobby','prematch','waiting','waitingforteam','teamselect','teamselection','faction'
+  ]).has(key);
+}
+
+// For welcome delivery, a merely non-empty faction string is not sufficient.
+// Some WARDOGS builds briefly expose placeholder/stale faction values while the
+// player is still in the team-selection UI. When the server status exposes the
+// real faction catalog, only a value matching one of those factions counts as a
+// playable team.
+export function playerHasPlayableFaction(player, validFactions = []) {
+  if (!playerHasFaction(player)) return false;
+  const names = Array.isArray(validFactions) ? validFactions.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  if (!names.length) return false;
+  const faction = playerFaction(player);
+  return names.some((name) => factionMatches(faction, name));
 }
 
 // Current WARDOGS builds return { players:[...] }, while a few wrappers/mocks

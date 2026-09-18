@@ -8,9 +8,12 @@ import {
   renderManagedWelcomeMessage
 } from '../src/managed-welcome.js';
 
+const FACTIONS = ['Valkyra', 'Lonestar', 'Manticore'];
 const A = { name: 'Alpha', steamId: '76561198000000001', faction: 'Valkyra' };
-const B_SELECTING = { name: 'Bravo', steamId: '76561198000000002', faction: '' };
+const B_SELECTING = { name: 'Bravo', steamId: '76561198000000002', faction: 'Faction.Invalid' };
 const B_SPAWNED = { ...B_SELECTING, faction: 'Valkyra' };
+const B_PREASSIGNED = { ...B_SELECTING, faction: 'Valkyra' };
+const B_OTHER_TEAM = { ...B_SELECTING, faction: 'Lonestar' };
 
 function state() {
   return {
@@ -19,78 +22,110 @@ function state() {
   };
 }
 
+function targets(s, players, joined, nowMs, extra = {}) {
+  return managedWelcomeTargets(s, players, joined, {
+    nowMs, spawnSettleMs: 5_000, teamStablePolls: 2, validFactions: FACTIONS, ...extra
+  });
+}
+
 test('startup roster is baseline and does not receive a welcome', () => {
   const s = state();
   assert.deepEqual(managedJoinCandidates(s.welcomeJoinTracker, [A], 2), []);
-  assert.deepEqual(managedWelcomeTargets(s, [A], [], { nowMs: 0, spawnSettleMs: 2_000 }), []);
+  assert.deepEqual(targets(s, [A], [], 0), []);
   assert.equal(s.welcomePending.size, 0);
 });
 
-test('new join stays queued until a faction/team appears, then becomes eligible after settle delay', () => {
+test('placeholder faction is not considered a playable selected team', () => {
   const s = state();
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
   const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SELECTING], 2);
   assert.equal(joined.length, 1);
+  assert.deepEqual(targets(s, [A, B_SELECTING], joined, 1_000), []);
+  assert.equal(s.welcomeSawPreTeam.has(B_SELECTING.steamId), true);
+  assert.equal(s.welcomeTeamChoiceConfirmed.has(B_SELECTING.steamId), false);
+});
 
-  let targets = managedWelcomeTargets(s, [A, B_SELECTING], joined, { nowMs: 1_000, spawnSettleMs: 2_000 });
-  assert.equal(targets.length, 0);
-  assert.equal(s.welcomePending.has(B_SELECTING.steamId), true);
-  assert.equal(s.welcomeReadyAt.has(B_SELECTING.steamId), false);
+test('welcome waits for observed team selection, stable polls, then spawn settle', () => {
+  const s = state();
+  managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
+  const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SELECTING], 2);
+  assert.deepEqual(targets(s, [A, B_SELECTING], joined, 1_000), []);
 
-  // The player can remain in team selection for any amount of time. No blind
-  // 30-second timeout should discard or repeatedly reset the session.
-  targets = managedWelcomeTargets(s, [A, B_SELECTING], [], { nowMs: 61_000, spawnSettleMs: 2_000 });
-  assert.equal(targets.length, 0);
-  assert.equal(s.welcomePending.has(B_SELECTING.steamId), true);
+  // First real-team observation confirms selection but is only stable poll 1.
+  assert.deepEqual(targets(s, [A, B_SPAWNED], [], 3_000), []);
+  assert.equal(s.welcomeTeamChoiceConfirmed.has(B_SPAWNED.steamId), true);
 
-  // WARDOGS reports a faction once the player has chosen a team / entered the
-  // gameplay flow. Start a short settle window, then whisper.
-  targets = managedWelcomeTargets(s, [A, B_SPAWNED], [], { nowMs: 70_000, spawnSettleMs: 2_000 });
-  assert.equal(targets.length, 0);
-  targets = managedWelcomeTargets(s, [A, B_SPAWNED], [], { nowMs: 72_000, spawnSettleMs: 2_000 });
-  assert.equal(targets.length, 1);
-  assert.equal(targets[0].steamId, B_SPAWNED.steamId);
+  // Stable poll 2 starts the spawn settle window.
+  assert.deepEqual(targets(s, [A, B_SPAWNED], [], 5_000), []);
+  assert.equal(s.welcomeReadyAt.get(B_SPAWNED.steamId), 10_000);
+
+  assert.deepEqual(targets(s, [A, B_SPAWNED], [], 9_999), []);
+  const ready = targets(s, [A, B_SPAWNED], [], 10_000);
+  assert.equal(ready.length, 1);
+  assert.equal(ready[0].steamId, B_SPAWNED.steamId);
+});
+
+test('a playable faction already present in the join snapshot is not enough to send early', () => {
+  const s = state();
+  managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
+  const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_PREASSIGNED], 2);
+  assert.equal(joined.length, 1);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], joined, 1_000), []);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 30_000), []);
+  assert.equal(s.welcomeTeamChoiceConfirmed.has(B_PREASSIGNED.steamId), false);
+});
+
+test('a post-join change from one real faction to another confirms team selection', () => {
+  const s = state();
+  managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
+  const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_PREASSIGNED], 2);
+  targets(s, [A, B_PREASSIGNED], joined, 1_000);
+  assert.deepEqual(targets(s, [A, B_OTHER_TEAM], [], 3_000), []);
+  assert.equal(s.welcomeTeamChoiceConfirmed.has(B_OTHER_TEAM.steamId), true);
+  targets(s, [A, B_OTHER_TEAM], [], 5_000);
+  assert.equal(targets(s, [A, B_OTHER_TEAM], [], 10_000).length, 1);
 });
 
 test('one incomplete roster snapshot does not delete a queued join', () => {
   const s = state();
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
   const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SELECTING], 2);
-  managedWelcomeTargets(s, [A, B_SELECTING], joined, { nowMs: 1_000, spawnSettleMs: 0 });
+  targets(s, [A, B_SELECTING], joined, 1_000);
   assert.equal(s.welcomePending.has(B_SELECTING.steamId), true);
 
-  // First miss is not a confirmed leave.
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
-  managedWelcomeTargets(s, [A], [], { nowMs: 5_000, spawnSettleMs: 0 });
+  targets(s, [A], [], 5_000);
   assert.equal(s.welcomePending.has(B_SELECTING.steamId), true);
 
-  // Same session comes back and later chooses a faction.
   assert.deepEqual(managedJoinCandidates(s.welcomeJoinTracker, [A, B_SPAWNED], 2), []);
-  const targets = managedWelcomeTargets(s, [A, B_SPAWNED], [], { nowMs: 10_000, spawnSettleMs: 0 });
-  assert.equal(targets.length, 1);
+  targets(s, [A, B_SPAWNED], [], 10_000);
+  targets(s, [A, B_SPAWNED], [], 12_000);
+  assert.equal(targets(s, [A, B_SPAWNED], [], 17_000).length, 1);
 });
 
 test('confirmed leave followed by rejoin creates a fresh welcome session', () => {
   const s = state();
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
-  let joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SPAWNED], 2);
-  let targets = managedWelcomeTargets(s, [A, B_SPAWNED], joined, { nowMs: 0, spawnSettleMs: 0 });
-  assert.equal(targets.length, 1);
+  let joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SELECTING], 2);
+  targets(s, [A, B_SELECTING], joined, 0);
+  targets(s, [A, B_SPAWNED], [], 2_000);
+  targets(s, [A, B_SPAWNED], [], 4_000);
+  let ready = targets(s, [A, B_SPAWNED], [], 9_000);
+  assert.equal(ready.length, 1);
   managedWelcomeSucceeded(s, B_SPAWNED.steamId);
   assert.equal(s.welcomeDelivered.has(B_SPAWNED.steamId), true);
 
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
-  managedWelcomeTargets(s, [A], [], { nowMs: 5_000, spawnSettleMs: 0 });
+  targets(s, [A], [], 11_000);
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
-  managedWelcomeTargets(s, [A], [], { nowMs: 10_000, spawnSettleMs: 0 });
+  targets(s, [A], [], 13_000);
   assert.equal(s.welcomeDelivered.has(B_SPAWNED.steamId), false);
 
-  joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SPAWNED], 2);
+  joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_SELECTING], 2);
   assert.equal(joined.length, 1);
-  targets = managedWelcomeTargets(s, [A, B_SPAWNED], joined, { nowMs: 15_000, spawnSettleMs: 0 });
-  assert.equal(targets.length, 1);
+  assert.deepEqual(targets(s, [A, B_SELECTING], joined, 15_000), []);
 });
 
-test('welcome variables render with the faction reported at spawn time', () => {
+test('welcome variables render with the faction reported at delivery time', () => {
   assert.equal(renderManagedWelcomeMessage('Hi {player} {steamid} {faction}', B_SPAWNED), `Hi Bravo ${B_SPAWNED.steamId} Valkyra`);
 });

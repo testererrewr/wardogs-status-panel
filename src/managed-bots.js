@@ -13,7 +13,7 @@ import {
 } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { safeHttpText } from './target-safety.js';
-import { factionMatches, normalizeSteamId64, playerFaction, playerHasFaction, playerSteamId, playerWardogsApiId, wardogsPlayerRows } from './wardogs-players.js';
+import { factionMatches, normalizeSteamId64, playerFaction, playerHasPlayableFaction, playerSteamId, playerWardogsApiId, wardogsPlayerRows } from './wardogs-players.js';
 import { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
@@ -32,11 +32,12 @@ const discordUiState = new Map();
 const lifecycleLocks = new Map();
 const recoveryState = new Map();
 const WELCOME_MAX_ATTEMPTS = 24;
-const WELCOME_RETRY_MS = 5000;
-// Wait for WARDOGS to report a faction/team, then give the pawn a short moment
-// to materialize before the first whisper. This works during seeding/Waiting for
-// Players too; it does not depend on the match having started.
-const WELCOME_SPAWN_SETTLE_MS = 2_000;
+const WELCOME_RETRY_MS = 2000;
+// Poll quickly enough to observe the team-selection transition, then require the
+// selected faction to remain stable and give the spawned pawn a short settle
+// window before the private welcome. This also works during seeding.
+const WELCOME_SPAWN_SETTLE_MS = 5_000;
+const WELCOME_TEAM_STABLE_POLLS = 2;
 const WELCOME_LEAVE_CONFIRM_POLLS = 2;
 
 // WARDOGS is most reliable when a single request at a time targets one game
@@ -475,7 +476,7 @@ async function sendManagedWelcomeWhisper(bot, state, player, message) {
   }
 }
 
-async function processManagedWelcomeQueue(bot, state, players = null) {
+async function processManagedWelcomeQueue(bot, state, players = null, validFactions = null) {
   if (bot?.welcomeWhisperEnabled !== true) return;
   if (!(state.welcomePending instanceof Set) || state.welcomePending.size === 0) return;
   if (state.welcomeInFlight) return;
@@ -486,7 +487,8 @@ async function processManagedWelcomeQueue(bot, state, players = null) {
       const data = await wardogsRequest(bot, '/v1/players');
       rows = wardogsPlayerRows(data);
     }
-    for (const player of managedWelcomeTargets(state, rows, [], { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, maxAttempts: WELCOME_MAX_ATTEMPTS })) {
+    const factionCatalog = Array.isArray(validFactions) ? validFactions : (Array.isArray(state.welcomeValidFactions) ? state.welcomeValidFactions : []);
+    for (const player of managedWelcomeTargets(state, rows, [], { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, teamStablePolls: WELCOME_TEAM_STABLE_POLLS, maxAttempts: WELCOME_MAX_ATTEMPTS, validFactions: factionCatalog })) {
       const steamId = playerSteamId(player);
       const message = renderManagedWelcomeMessage(bot.welcomeWhisperMessage, player);
       if (!steamId || !message) continue;
@@ -520,13 +522,24 @@ async function pollManagedWelcome(bot, state) {
   try {
     const data = await wardogsRequest(bot, '/v1/players');
     const players = wardogsPlayerRows(data);
+    // The status faction catalog is authoritative for what counts as a real team.
+    // A non-empty placeholder/stale faction from /v1/players must never unlock a
+    // welcome by itself.
+    try {
+      const status = await wardogsRequest(bot, '/v1/status');
+      const factionCatalog = Array.isArray(status?.factionScores)
+        ? [...new Set(status.factionScores.map((item) => String(item?.name || '').trim()).filter(Boolean))]
+        : [];
+      if (factionCatalog.length) state.welcomeValidFactions = factionCatalog;
+    } catch {}
+    const validFactions = Array.isArray(state.welcomeValidFactions) ? state.welcomeValidFactions : [];
     if (!state.welcomeJoinTracker) state.welcomeJoinTracker = createManagedJoinTracker();
-    // Welcome detection is separate from risk/detection joins. A session stays
-    // queued while the player is in team selection. The whisper becomes eligible
-    // only after WARDOGS reports a real faction/team. This also applies during
-    // seeding / Waiting for Players; match state is deliberately irrelevant.
+    // Welcome detection is separate from risk/detection joins. The bot now waits
+    // for an observed post-join team-selection transition to a faction that is
+    // actually present in /v1/status, then for two stable polls + a spawn settle
+    // window. Match state is irrelevant, so this works during seeding too.
     const joined = managedJoinCandidates(state.welcomeJoinTracker, players, WELCOME_LEAVE_CONFIRM_POLLS);
-    managedWelcomeTargets(state, players, joined, { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, maxAttempts: WELCOME_MAX_ATTEMPTS });
+    managedWelcomeTargets(state, players, joined, { spawnSettleMs: WELCOME_SPAWN_SETTLE_MS, teamStablePolls: WELCOME_TEAM_STABLE_POLLS, maxAttempts: WELCOME_MAX_ATTEMPTS, validFactions });
     if (joined.length) {
       const last = joined[joined.length - 1];
       setRuntime(bot.id, {
@@ -534,7 +547,7 @@ async function pollManagedWelcome(bot, state) {
         lastWelcomeJoinDetectedPlayer: String(last?.name || playerSteamId(last) || 'player')
       });
     }
-    await processManagedWelcomeQueue(bot, state, players);
+    await processManagedWelcomeQueue(bot, state, players, validFactions);
 
     const bySteamId = new Map(players.map((player) => [playerSteamId(player), player]).filter(([id]) => id));
     const pendingIds = state.welcomePending instanceof Set ? [...state.welcomePending] : [];
@@ -543,7 +556,8 @@ async function pollManagedWelcome(bot, state) {
     for (const id of pendingIds) {
       const player = bySteamId.get(id);
       if (!player) continue;
-      if (playerHasFaction(player)) spawnReady += 1;
+      const teamConfirmed = state.welcomeTeamChoiceConfirmed instanceof Set && state.welcomeTeamChoiceConfirmed.has(id);
+      if (teamConfirmed && playerHasPlayableFaction(player, validFactions)) spawnReady += 1;
       else waitingForFaction += 1;
     }
     setRuntime(bot.id, {
@@ -1587,7 +1601,7 @@ async function startOne(bot) {
   if (bot.controlPanelEnabled && !validSnowflake(bot.controlPanelChannelId)) throw new Error('Discord management panel channel ID is missing or invalid');
   const token = decryptSecret(bot.botTokenEnc);
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
+  const state = { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInitialFactionKey: new Map(), welcomeSawPreTeam: new Set(), welcomeTeamChoiceConfirmed: new Set(), welcomeFactionStableKey: new Map(), welcomeFactionStablePolls: new Map(), welcomeValidFactions: [], welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot.controlPanelMessageId || ''), panelChannelId: String(bot.controlPanelMessageChannelId || '') };
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, state).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {

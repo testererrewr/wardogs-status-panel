@@ -4,6 +4,7 @@ import {
   factionMatches,
   normalizeFactionKey,
   playerHasFaction,
+  playerHasPlayableFaction,
   playerSteamId,
   playerWardogsApiId,
   wardogsPlayerRows
@@ -25,7 +26,11 @@ test('team selection / spectator values are not spawn ready', () => {
   assert.equal(playerHasFaction({ faction: '' }), false);
   assert.equal(playerHasFaction({ faction: 'unassigned' }), false);
   assert.equal(playerHasFaction({ faction: 'spectator' }), false);
+  assert.equal(playerHasFaction({ faction: 'Faction.Invalid' }), false);
   assert.equal(playerHasFaction({ faction: 'Faction.Valkyra' }), true);
+  assert.equal(playerHasPlayableFaction({ faction: 'Faction.Valkyra' }, ['Valkyra','Lonestar','Manticore']), true);
+  assert.equal(playerHasPlayableFaction({ faction: 'Faction.Invalid' }, ['Valkyra','Lonestar','Manticore']), false);
+  assert.equal(playerHasPlayableFaction({ faction: 'Valkyra' }, []), false);
 });
 
 test('player rows accept the official object wrapper and direct mocks', () => {

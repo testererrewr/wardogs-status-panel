@@ -1,4 +1,14 @@
-# status-hub.lol v3.12.27
+# status-hub.lol v3.12.28
+
+## v3.12.28 – Welcome only after real team selection / spawn
+
+- Welcome whispers no longer treat any non-empty faction string as proof that the player selected a team.
+- The watcher now validates the player faction against the real faction catalog from `/v1/status.factionScores`.
+- A welcome requires an observed post-join team-selection transition: menu/unassigned → real faction, or a real faction change after join. A faction already present in the first join snapshot does not trigger the message by itself.
+- The selected faction must remain stable for two watcher polls, followed by a 5-second spawn settle before the private whisper is sent.
+- Welcome polling runs every 2 seconds so the menu → team transition is much less likely to be missed.
+- Seeding / `Waiting for Players` is still supported; match state is intentionally not used as a gate.
+- Expanded placeholder-faction filtering and regression tests for premature welcome delivery.
 
 ## v3.12.27 – WARDOGS request-body transport fix
 
