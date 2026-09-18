@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -17,7 +18,7 @@ import { factionMatches, normalizeSteamId64, playerFaction, playerHasPlayableFac
 import { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
-import { getManagedBot, upsertManagedBot } from './db.js';
+import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
 import { parseManagedRules, evaluateManagedRules, matchManagedRules, managedRulesNeedSteam } from './managed-rules.js';
 import { getSteamRiskProfiles, steamApiKeyAvailable } from './steam-risk.js';
 export { parseManagedRules, evaluateManagedRules, matchManagedRules } from './managed-rules.js';
@@ -368,6 +369,231 @@ export function formatManagedBanReason(bot, reason, durationMinutes = 0) {
   return `${prefix}${cleanReason.slice(0, available)}${suffix}`.slice(0, 180);
 }
 
+function banSyncServerForBot(bot) {
+  const roomId = String(bot?.banSyncServerId || '').trim();
+  if (!roomId) return null;
+  const room = getBanSyncServer(roomId);
+  if (!room || !(Array.isArray(room.members) ? room.members : []).map(String).includes(String(bot?.id || ''))) return null;
+  return room;
+}
+
+function banSyncPasswordHash(password) {
+  const clean = String(password || '');
+  if (clean.length < 4 || clean.length > 64) throw new Error('Ban Sync Community password must be 4–64 characters long');
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(clean, salt, 32);
+  return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+function banSyncPasswordMatches(stored, password) {
+  const [kind, saltHex, hashHex] = String(stored || '').split('$');
+  if (kind !== 'scrypt' || !/^[0-9a-f]+$/i.test(saltHex || '') || !/^[0-9a-f]+$/i.test(hashHex || '')) return false;
+  try {
+    const expected = Buffer.from(hashHex, 'hex');
+    const actual = crypto.scryptSync(String(password || ''), Buffer.from(saltHex, 'hex'), expected.length);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch { return false; }
+}
+function banSyncSharedRows(room) {
+  return (Array.isArray(room?.sharedBans) ? room.sharedBans : []).map((row) => ({
+    steamId: normalizeSteamId64(row?.steamId),
+    mode: ['permanent','temporary','dynamic'].includes(String(row?.mode || '')) ? String(row.mode) : 'permanent',
+    reason: String(row?.reason || '').slice(0,180),
+    expiresAt: row?.expiresAt || null,
+    templateId: String(row?.templateId || '').slice(0,64),
+    sourceBotId: String(row?.sourceBotId || '').slice(0,80),
+    updatedAt: row?.updatedAt || null
+  })).filter((row) => row.steamId && (row.mode === 'permanent' || Date.parse(row.expiresAt || '') > Date.now()));
+}
+function banSyncMembers(room) {
+  return [...new Set((Array.isArray(room?.members) ? room.members : []).map(String).filter(Boolean))]
+    .map((id) => getManagedBot(id))
+    .filter((bot) => bot && String(bot.serviceId || '') === 'wardogs-warning-bot');
+}
+function banSyncCommunityPolicy(room) {
+  return {
+    dynamicBanEnabled: room?.dynamicBanEnabled === true,
+    dynamicBanEscalateJoins: Math.max(2, Math.min(20, Math.floor(Number(room?.dynamicBanEscalateJoins) || 3))),
+    dynamicBanEscalateWindowMinutes: Math.max(1, Math.min(1440, Math.floor(Number(room?.dynamicBanEscalateWindowMinutes) || 5)))
+  };
+}
+function applyBanSyncCommunityPolicy(room, actor = 'system') {
+  const policy = banSyncCommunityPolicy(room);
+  let updated = 0;
+  for (const member of banSyncMembers(room)) {
+    const fresh = getManagedBot(member.id) || member;
+    const changed = fresh.dynamicBanEnabled !== policy.dynamicBanEnabled
+      || Number(fresh.dynamicBanEscalateJoins || 3) !== policy.dynamicBanEscalateJoins
+      || Number(fresh.dynamicBanEscalateWindowMinutes || 5) !== policy.dynamicBanEscalateWindowMinutes;
+    if (!changed) continue;
+    upsertManagedBot({ id: fresh.id, ...policy });
+    appendManagedAudit(fresh.id, {
+      actor,
+      action: 'ban-sync-community-policy-applied',
+      target: String(room?.id || ''),
+      detail: `Dynamic Ban ${policy.dynamicBanEnabled ? 'on' : 'off'} · ${policy.dynamicBanEscalateJoins} joins / ${policy.dynamicBanEscalateWindowMinutes} min`
+    });
+    updated += 1;
+  }
+  return { ...policy, updated };
+}
+
+export async function updateManagedBanSyncCommunitySettings(bot, settings = {}, actor = 'web') {
+  const source = getManagedBot(bot?.id) || bot;
+  const room = banSyncServerForBot(source);
+  if (!source?.id || !room) throw new Error('This bot is not connected to a Ban Sync Community');
+  if (String(room.ownerBotId || '') !== String(source.id)) throw new Error('Only the Ban Sync Community owner can change shared Dynamic Ban settings');
+  const policy = {
+    dynamicBanEnabled: settings?.dynamicBanEnabled === true,
+    dynamicBanEscalateJoins: Math.max(2, Math.min(20, Math.floor(Number(settings?.dynamicBanEscalateJoins) || 3))),
+    dynamicBanEscalateWindowMinutes: Math.max(1, Math.min(1440, Math.floor(Number(settings?.dynamicBanEscalateWindowMinutes) || 5)))
+  };
+  const updatedRoom = upsertBanSyncServer({ id: room.id, ...policy });
+  const result = applyBanSyncCommunityPolicy(updatedRoom, `ban-sync-community:${room.id}`);
+  appendManagedAudit(source.id, {
+    actor,
+    action: 'ban-sync-community-policy-updated',
+    target: room.id,
+    detail: `Dynamic Ban ${policy.dynamicBanEnabled ? 'on' : 'off'} · ${policy.dynamicBanEscalateJoins} joins / ${policy.dynamicBanEscalateWindowMinutes} min · propagated to ${result.updated} member(s)`
+  });
+  return { room: updatedRoom, ...policy, updated: result.updated };
+}
+function mergeSharedBan(current, incoming) {
+  if (!current) return incoming;
+  if (current.mode === 'permanent') return current;
+  if (incoming.mode === 'permanent') return incoming;
+  const currentExpiry = Date.parse(current.expiresAt || '') || 0;
+  const incomingExpiry = Date.parse(incoming.expiresAt || '') || 0;
+  return incomingExpiry >= currentExpiry ? incoming : current;
+}
+async function managedCurrentBanRows(bot) {
+  const [banData] = await Promise.all([wardogsRequest(bot, '/v1/bans')]);
+  const liveBans = Array.isArray(banData?.bans) ? banData.bans : [];
+  const temps = new Map(temporaryBans(bot).map((entry) => [entry.steamId, entry]));
+  const dynamics = new Map(dynamicBans(bot).map((entry) => [entry.steamId, entry]));
+  const desired = new Map();
+  for (const b of liveBans) {
+    const id = normalizeSteamId64(b?.steamId); if (!id) continue;
+    const d = dynamics.get(id), t = temps.get(id);
+    if (d && Date.parse(d.expiresAt) > Date.now()) desired.set(id, { mode: 'dynamic', steamId: id, reason: d.reason || b.reason, expiresAt: d.expiresAt, templateId: d.templateId });
+    else if (t && Date.parse(t.expiresAt) > Date.now()) desired.set(id, { mode: 'temporary', steamId: id, reason: t.reason || b.reason, expiresAt: t.expiresAt, templateId: t.templateId });
+    else desired.set(id, { mode: 'permanent', steamId: id, reason: String(b?.reason || 'Synced ban') });
+  }
+  for (const d of dynamics.values()) if (Date.parse(d.expiresAt) > Date.now()) desired.set(d.steamId, { mode: 'dynamic', steamId: d.steamId, reason: d.reason, expiresAt: d.expiresAt, templateId: d.templateId });
+  for (const t of temps.values()) if (Date.parse(t.expiresAt) > Date.now() && !desired.has(t.steamId)) desired.set(t.steamId, { mode: 'temporary', steamId: t.steamId, reason: t.reason, expiresAt: t.expiresAt, templateId: t.templateId });
+  return [...desired.values()];
+}
+async function applyBanSyncRow(target, row, roomId, sourceBotId) {
+  const normalized = normalizeSteamId64(row?.steamId); if (!normalized) return false;
+  const actor = `ban-sync-server:${roomId}`;
+  try {
+    if (row.mode === 'dynamic') {
+      const expiresAtMs = Date.parse(row.expiresAt || ''); if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return false;
+      const minutes = Math.max(1, Math.ceil((expiresAtMs - Date.now()) / 60_000));
+      await dynamicBanManagedPlayer(target, normalized, row.reason || 'Synced ban', minutes, { createdBy: actor, templateId: row.templateId, forcedExpiresAt: new Date(expiresAtMs).toISOString(), skipSync: true });
+    } else if (row.mode === 'temporary') {
+      const expiresAtMs = Date.parse(row.expiresAt || ''); if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return false;
+      const minutes = Math.max(1, Math.ceil((expiresAtMs - Date.now()) / 60_000));
+      await temporaryBanManagedPlayer(target, normalized, row.reason || 'Synced ban', minutes, { createdBy: actor, templateId: row.templateId, forcedExpiresAt: new Date(expiresAtMs).toISOString(), forceNormal: true, skipSync: true });
+    } else {
+      await banManagedPlayer(target, normalized, row.reason || 'Synced ban', { skipSync: true, actor });
+    }
+  } catch (error) {
+    // A resync may legitimately hit a ban that is already present on the target.
+    // Treat the usual duplicate/conflict responses as idempotent success instead
+    // of turning a healthy shared room red.
+    const status = Number(error?.status || 0);
+    const detail = String(error?.detail || error?.message || '').toLowerCase();
+    if (![409,422].includes(status) && !detail.includes('already banned') && !detail.includes('already exists')) throw error;
+  }
+  appendManagedAudit(target.id, { actor, action: 'ban-sync-server-applied', target: normalized, detail: `${row.mode} ban from ${sourceBotId || 'room'}${row.expiresAt ? ` until ${row.expiresAt}` : ''}` });
+  return true;
+}
+
+export async function createManagedBanSyncServer(bot, name, password, actor = 'web') {
+  const source = getManagedBot(bot?.id) || bot;
+  if (!source?.id || String(source.serviceId || '') !== 'wardogs-warning-bot') throw new Error('Management bot not found');
+  if (banSyncServerForBot(source)) throw new Error('This bot is already connected to a Ban Sync Community');
+  const cleanName = String(name || '').trim().slice(0,80);
+  if (cleanName.length < 3) throw new Error('Ban Sync Community name must be at least 3 characters long');
+  if (listBanSyncServers().some((room) => String(room?.name || '').trim().toLowerCase() === cleanName.toLowerCase())) throw new Error('A Ban Sync Community with this name already exists');
+  const id = crypto.randomUUID();
+  const snapshot = await managedCurrentBanRows(source);
+  const sharedBans = snapshot.map((row) => ({ ...row, sourceBotId: source.id, updatedAt: nowIso() }));
+  const policy = {
+    dynamicBanEnabled: source.dynamicBanEnabled === true,
+    dynamicBanEscalateJoins: Math.max(2, Math.min(20, Math.floor(Number(source.dynamicBanEscalateJoins) || 3))),
+    dynamicBanEscalateWindowMinutes: Math.max(1, Math.min(1440, Math.floor(Number(source.dynamicBanEscalateWindowMinutes) || 5)))
+  };
+  const room = upsertBanSyncServer({ id, name: cleanName, ownerBotId: source.id, passwordHash: banSyncPasswordHash(password), members: [source.id], sharedBans, ...policy });
+  upsertManagedBot({ id: source.id, banSyncServerId: id, banSyncTargetBotId: '' });
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-server-created', target: id, detail: `${cleanName} · ${sharedBans.length} existing bans imported.` });
+  return room;
+}
+
+export async function joinManagedBanSyncServer(bot, serverId, password, actor = 'web') {
+  const source = getManagedBot(bot?.id) || bot;
+  if (!source?.id || String(source.serviceId || '') !== 'wardogs-warning-bot') throw new Error('Management bot not found');
+  const current = banSyncServerForBot(source);
+  if (current && current.id !== String(serverId || '')) throw new Error('Leave the current Ban Sync Community first');
+  const room = getBanSyncServer(String(serverId || ''));
+  if (!room) throw new Error('Ban Sync Community not found');
+  if (!banSyncPasswordMatches(room.passwordHash, password)) throw new Error('Ban Sync Community password is incorrect');
+  const existingMembers = [...new Set((Array.isArray(room.members) ? room.members : []).map(String).filter(Boolean))];
+  if (!existingMembers.includes(source.id) && existingMembers.length >= 100) throw new Error('This Ban Sync Community already has the maximum of 100 members');
+  const localRows = await managedCurrentBanRows(source);
+  const merged = new Map(banSyncSharedRows(room).map((row) => [row.steamId, row]));
+  for (const row of localRows) merged.set(row.steamId, mergeSharedBan(merged.get(row.steamId), { ...row, sourceBotId: source.id, updatedAt: nowIso() }));
+  const members = [...new Set([...(Array.isArray(room.members) ? room.members : []), source.id])].slice(0,100);
+  const updated = upsertBanSyncServer({ id: room.id, members, sharedBans: [...merged.values()].slice(0,5000) });
+  upsertManagedBot({ id: source.id, banSyncServerId: room.id, banSyncTargetBotId: '' });
+  applyBanSyncCommunityPolicy(updated, `ban-sync-community:${room.id}`);
+  let applied = 0, failed = 0;
+  for (const member of banSyncMembers(updated)) {
+    for (const row of banSyncSharedRows(updated)) {
+      if (member.id === String(row.sourceBotId || '')) continue;
+      try { if (await applyBanSyncRow(member, row, updated.id, row.sourceBotId)) applied += 1; }
+      catch (error) { failed += 1; appendManagedAudit(member.id, { actor: `ban-sync-server:${updated.id}`, action: 'ban-sync-server-apply-failed', target: row.steamId, detail: String(error?.message || error).slice(0,300), status: 'error' }); }
+    }
+  }
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-server-joined', target: updated.id, detail: `${updated.name} · ${members.length} members · ${applied} sync operations, ${failed} failed.` });
+  return { room: updated, applied, failed };
+}
+
+export async function leaveManagedBanSyncServer(bot, actor = 'web') {
+  const source = getManagedBot(bot?.id) || bot;
+  const room = banSyncServerForBot(source);
+  if (!source?.id || !room) { if (source?.id) upsertManagedBot({ id: source.id, banSyncServerId: '' }); return { deleted: false, members: 0 }; }
+  const members = (Array.isArray(room.members) ? room.members : []).map(String).filter((id) => id !== source.id);
+  upsertManagedBot({ id: source.id, banSyncServerId: '' });
+  if (!members.length) {
+    deleteBanSyncServer(room.id);
+    appendManagedAudit(source.id, { actor, action: 'ban-sync-server-deleted', target: room.id, detail: room.name });
+    return { deleted: true, members: 0 };
+  }
+  const ownerBotId = room.ownerBotId === source.id ? members[0] : room.ownerBotId;
+  upsertBanSyncServer({ id: room.id, members, ownerBotId });
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-server-left', target: room.id, detail: `${room.name}. Existing bans remain local; only future sync stops.` });
+  return { deleted: false, members: members.length };
+}
+
+export async function resyncManagedBanSyncServer(bot, actor = 'web') {
+  const source = getManagedBot(bot?.id) || bot;
+  const room = banSyncServerForBot(source);
+  if (!room) throw new Error('This bot is not connected to a Ban Sync Community');
+  applyBanSyncCommunityPolicy(room, `ban-sync-community:${room.id}`);
+  const rows = banSyncSharedRows(room);
+  let applied = 0, failed = 0;
+  for (const member of banSyncMembers(room)) {
+    for (const row of rows) {
+      if (member.id === String(row.sourceBotId || '')) continue;
+      try { if (await applyBanSyncRow(member, row, room.id, row.sourceBotId)) applied += 1; }
+      catch (error) { failed += 1; appendManagedAudit(member.id, { actor: `ban-sync-server:${room.id}`, action: 'ban-sync-server-resync-failed', target: row.steamId, detail: String(error?.message || error).slice(0,300), status: 'error' }); }
+    }
+  }
+  appendManagedAudit(source.id, { actor, action: 'ban-sync-server-resync', target: room.id, detail: `${applied} apply operations, ${failed} failed.` });
+  return { room, applied, failed, bans: rows.length, members: banSyncMembers(room).length };
+}
+
 function managedSyncTarget(sourceBot) {
   const targetId = String(sourceBot?.banSyncTargetBotId || '').trim();
   if (!targetId || targetId === String(sourceBot?.id || '')) return null;
@@ -415,6 +641,28 @@ async function disconnectManagedBanSyncSource(sourceBot, targetBotId, actor = 's
 
 async function syncBanToAcceptedTarget(sourceBot, payload) {
   if (payload?.skipSync) return null;
+  const room = banSyncServerForBot(sourceBot);
+  if (room) {
+    const sourceBotId = String(sourceBot.id);
+    const normalized = normalizeSteamId64(payload?.steamId); if (!normalized) return null;
+    const mode = ['permanent','temporary','dynamic'].includes(payload?.mode) ? payload.mode : 'permanent';
+    if (mode !== 'permanent') {
+      const expiresAtMs = Date.parse(payload?.expiresAt || '');
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
+    }
+    const row = { steamId: normalized, mode, reason: String(payload?.reason || 'Synced ban').slice(0,180), expiresAt: mode === 'permanent' ? null : payload.expiresAt, templateId: String(payload?.templateId || '').slice(0,64), sourceBotId, updatedAt: nowIso() };
+    const shared = banSyncSharedRows(room).filter((item) => item.steamId !== normalized);
+    const updatedRoom = upsertBanSyncServer({ id: room.id, sharedBans: [...shared, row].slice(0,5000) });
+    let ok = 0, failed = 0;
+    for (const target of banSyncMembers(updatedRoom)) {
+      if (target.id === sourceBotId) continue;
+      try { if (await applyBanSyncRow(target, row, updatedRoom.id, sourceBotId)) ok += 1; }
+      catch (error) { failed += 1; appendManagedAudit(sourceBotId, { actor: payload?.actor || 'system', action: 'ban-sync-server-send-failed', target: normalized, detail: `${target.id}: ${String(error?.message || error).slice(0,300)}`, status: 'error' }); }
+    }
+    appendManagedAudit(sourceBotId, { actor: payload?.actor || 'system', action: 'ban-sync-server-sent', target: normalized, detail: `${mode} ban sent to ${ok} peer(s)${failed ? `; ${failed} failed` : ''}.` });
+    setRuntime(sourceBotId, { lastBanSyncAt: nowIso(), lastBanSyncError: failed ? `${failed} peer sync(s) failed` : null });
+    return updatedRoom;
+  }
   const target = managedSyncTarget(sourceBot);
   if (!target) return null;
   const sourceBotId = String(sourceBot.id);
@@ -450,6 +698,20 @@ async function syncBanToAcceptedTarget(sourceBot, payload) {
 
 async function syncUnbanToAcceptedTarget(sourceBot, steamId, meta = {}) {
   if (meta?.skipSync) return null;
+  const room = banSyncServerForBot(sourceBot);
+  if (room) {
+    const normalized = normalizeSteamId64(steamId); if (!normalized) return null;
+    const shared = banSyncSharedRows(room).filter((row) => row.steamId !== normalized);
+    const updatedRoom = upsertBanSyncServer({ id: room.id, sharedBans: shared });
+    let ok = 0, failed = 0;
+    for (const target of banSyncMembers(updatedRoom)) {
+      if (target.id === String(sourceBot.id)) continue;
+      try { await unbanManagedPlayer(target, normalized, { skipSync: true, actor: `ban-sync-server:${room.id}`, tolerateMissing: true }); ok += 1; }
+      catch (error) { failed += 1; appendManagedAudit(sourceBot.id, { actor: meta?.actor || 'system', action: 'ban-sync-server-unban-failed', target: normalized, detail: `${target.id}: ${String(error?.message || error).slice(0,300)}`, status: 'error' }); }
+    }
+    appendManagedAudit(sourceBot.id, { actor: meta?.actor || 'system', action: 'ban-sync-server-unban', target: normalized, detail: `Global unban sent to ${ok} peer(s)${failed ? `; ${failed} failed` : ''}.` });
+    return updatedRoom;
+  }
   const target = managedSyncTarget(sourceBot);
   if (!target) return null;
   const normalized = normalizeSteamId64(steamId); if (!normalized) return null;
@@ -516,6 +778,11 @@ export async function rejectManagedBanSync(targetBot, sourceBotId, actor = 'web'
 
 export async function syncManagedBanSnapshot(sourceBot, explicitTarget = null, meta = {}) {
   const source = getManagedBot(sourceBot?.id) || sourceBot;
+  const room = banSyncServerForBot(source);
+  if (room && !explicitTarget) {
+    const result = await resyncManagedBanSyncServer(source, meta?.actor || 'system');
+    return { synced: result.applied, removed: 0, failed: result.failed, members: result.members, bans: result.bans };
+  }
   const target = explicitTarget || managedSyncTarget(source);
   if (!source?.id || !target) return { synced: 0, removed: 0 };
   if (!banSyncAcceptedSources(target).includes(source.id)) return { synced: 0, removed: 0 };
@@ -546,8 +813,9 @@ export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule viol
   const result = await wardogsRequest(bot, '/v1/bans', { method: 'POST', body: { steamId: normalized, reason: formatManagedBanReason(bot, reason, options?.durationMinutes) } });
   const fresh = getManagedBot(bot?.id);
   if (fresh && options?.keepLocalTemporary !== true) {
-    const next = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
-    if (next.length !== temporaryBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: next });
+    const nextTemporary = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
+    const nextDynamic = dynamicBans(fresh).filter((entry) => entry.steamId !== normalized);
+    if (nextTemporary.length !== temporaryBans(fresh).length || nextDynamic.length !== dynamicBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: nextTemporary, dynamicBans: nextDynamic });
   }
   appendManagedAudit(bot.id, { actor: options?.actor || 'system', action: 'ban', target: normalized, detail: String(reason || '').slice(0, 300) });
   if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(bot.id) || bot, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });

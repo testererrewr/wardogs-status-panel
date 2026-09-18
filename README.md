@@ -1,7 +1,29 @@
-# status-hub.lol v3.12.33
+# status-hub.lol v3.12.35
 
 
 
+
+## v3.12.35 – Ban Sync Community policy
+
+- Renames the visible **Ban Sync Server Browser** to **Community Browser** / **Ban Sync Community**.
+- Unbans are synchronized across every connected community member, including automatic expiry of temporary and Dynamic Bans.
+- Dynamic Ban policy is now community-wide: the community owner controls Dynamic Ban on/off, the rejoin escalation threshold and the escalation window.
+- Every member automatically inherits the owner policy on join, resync and whenever the owner saves new values. Non-owner members see the settings read-only while connected.
+- Existing v3.12.34 communities inherit the current owner's Dynamic Ban settings during schema migration and propagate them to all members.
+- Database schema version 34.
+
+## v3.12.34 – Multi-server Ban Sync rooms + Management Bot naming
+
+- Replaces the old one-to-one BOT-ID Ban Sync UI with password-protected **Ban Sync Servers**.
+- A Ban Sync Server can contain up to 100 WARDOGS Management Bots / game servers.
+- Users can browse available Ban Sync Servers, create one with a password, or join one with its password.
+- Existing bans are merged when a room is created/joined; future permanent, temporary and Dynamic Bans as well as unbans are mirrored to all room members.
+- Temporary and Dynamic Bans preserve the original expiry time across every member and are never extended by syncing.
+- Leaving a room stops future synchronization but intentionally leaves already-applied bans local on that game server.
+- Ban Sync Server passwords are stored as salted scrypt hashes; plaintext passwords are never stored or displayed.
+- The old directional BOT-ID sync is retired during migration so no hidden legacy link remains active.
+- The visible service name is now consistently **WARDOGS Management Bot**. Existing default names such as `WARDOGS Warning & Management Bot #2` are migrated automatically.
+- Database schema version 33.
 
 ## v3.12.33 – Custom Bot `.env` file uploads
 

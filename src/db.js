@@ -101,8 +101,8 @@ function defaultBotServices() {
   return [{
     id: 'wardogs-warning-bot',
     slug: 'wardogs-warning-bot',
-    nameDe: 'WARDOGS Warning & Management Bot',
-    nameEn: 'WARDOGS Warning & Management Bot',
+    nameDe: 'WARDOGS Management Bot',
+    nameEn: 'WARDOGS Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
     featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion'],
@@ -145,7 +145,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 32, users: [], servers: [], customBots: [], managedBots: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 34, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -162,11 +162,12 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 32;
+  parsed.version = 34;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
   if (!Array.isArray(parsed.managedBots)) parsed.managedBots = [];
+  if (!Array.isArray(parsed.banSyncServers)) parsed.banSyncServers = [];
   if (!Array.isArray(parsed.statusNodes)) parsed.statusNodes = [];
   if (!Array.isArray(parsed.supporters)) parsed.supporters = [];
   if (!Array.isArray(parsed.botServices)) parsed.botServices = previousVersion < 8 ? defaultBotServices() : [];
@@ -385,6 +386,71 @@ function migrate(parsed) {
       if (!Array.isArray(bot.auditLog)) bot.auditLog = [];
     }
   }
+  if (previousVersion < 33) {
+    // v3.12.34 replaces one-to-one Ban Sync with password-protected Ban Sync
+    // Servers (rooms) that can contain any number of management bots. It also
+    // normalizes the public service name to the requested "WARDOGS Management Bot".
+    const defaults = defaultBotServices();
+    const service = defaults.find((x) => x.id === 'wardogs-warning-bot');
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    if (service && serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], nameDe: service.nameDe, nameEn: service.nameEn, updatedAt: migrationNow };
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || '') !== 'wardogs-warning-bot') continue;
+      if (typeof bot.banSyncServerId !== 'string') bot.banSyncServerId = '';
+      // The old directional BOT-ID sync is retired. Existing mirrored bans are
+      // intentionally left on the game servers, but no hidden legacy sync link
+      // continues after upgrading.
+      bot.banSyncTargetBotId = '';
+      bot.banSyncRequests = [];
+      bot.banSyncAcceptedSources = [];
+      bot.banSyncMirrors = [];
+      const oldName = String(bot.name || '');
+      const match = oldName.match(/^WARDOGS Warning & Management Bot(\s*#\d+)?$/i);
+      if (match) bot.name = `WARDOGS Management Bot${match[1] || ''}`;
+    }
+  }
+  if (previousVersion < 34) {
+    // v3.12.35 turns Ban Sync rooms into communities with centrally managed
+    // Dynamic Ban policy. Existing communities inherit the current owner's
+    // Dynamic Ban settings and every member immediately adopts that policy.
+    for (const room of (Array.isArray(parsed.banSyncServers) ? parsed.banSyncServers : [])) {
+      const owner = parsed.managedBots.find((bot) => String(bot?.id || '') === String(room?.ownerBotId || ''));
+      const dynamicBanEnabled = owner?.dynamicBanEnabled === true;
+      const dynamicBanEscalateJoins = Math.max(2, Math.min(20, Math.floor(Number(owner?.dynamicBanEscalateJoins) || 3)));
+      const dynamicBanEscalateWindowMinutes = Math.max(1, Math.min(1440, Math.floor(Number(owner?.dynamicBanEscalateWindowMinutes) || 5)));
+      room.dynamicBanEnabled = dynamicBanEnabled;
+      room.dynamicBanEscalateJoins = dynamicBanEscalateJoins;
+      room.dynamicBanEscalateWindowMinutes = dynamicBanEscalateWindowMinutes;
+      const memberIds = new Set((Array.isArray(room?.members) ? room.members : []).map(String));
+      for (const bot of parsed.managedBots) {
+        if (!memberIds.has(String(bot?.id || ''))) continue;
+        bot.dynamicBanEnabled = dynamicBanEnabled;
+        bot.dynamicBanEscalateJoins = dynamicBanEscalateJoins;
+        bot.dynamicBanEscalateWindowMinutes = dynamicBanEscalateWindowMinutes;
+      }
+    }
+  }
+  parsed.banSyncServers = (Array.isArray(parsed.banSyncServers) ? parsed.banSyncServers : []).map((room) => ({
+    id: String(room?.id || crypto.randomUUID()).slice(0, 80),
+    name: String(room?.name || 'Ban Sync Server').trim().slice(0, 80) || 'Ban Sync Server',
+    ownerBotId: String(room?.ownerBotId || '').slice(0, 80),
+    passwordHash: String(room?.passwordHash || '').slice(0, 300),
+    members: [...new Set((Array.isArray(room?.members) ? room.members : []).map((x) => String(x || '').slice(0, 80)).filter(Boolean))].slice(0, 100),
+    dynamicBanEnabled: room?.dynamicBanEnabled === true,
+    dynamicBanEscalateJoins: Math.max(2, Math.min(20, Math.floor(Number(room?.dynamicBanEscalateJoins) || 3))),
+    dynamicBanEscalateWindowMinutes: Math.max(1, Math.min(1440, Math.floor(Number(room?.dynamicBanEscalateWindowMinutes) || 5))),
+    sharedBans: (Array.isArray(room?.sharedBans) ? room.sharedBans : []).map((row) => ({
+      steamId: String(row?.steamId || ''),
+      mode: ['permanent','temporary','dynamic'].includes(String(row?.mode || '')) ? String(row.mode) : 'permanent',
+      reason: String(row?.reason || '').slice(0, 180),
+      expiresAt: row?.expiresAt || null,
+      templateId: String(row?.templateId || '').slice(0, 64),
+      sourceBotId: String(row?.sourceBotId || '').slice(0, 80),
+      updatedAt: row?.updatedAt || null
+    })).filter((row) => /^\d{17}$/.test(row.steamId)).filter((row, index, rows) => rows.findIndex((x) => x.steamId === row.steamId) === index).slice(0, 5000),
+    createdAt: room?.createdAt || migrationNow,
+    updatedAt: room?.updatedAt || migrationNow
+  })).filter((room) => room.id && room.name && room.ownerBotId && room.passwordHash && room.members.length).slice(0, 500);
   parsed.managedBots = parsed.managedBots.map((b) => ({
     ...b,
     id: b.id || crypto.randomUUID(),
@@ -432,6 +498,7 @@ function migrate(parsed) {
       escalated: entry?.escalated === true, escalatedAt: entry?.escalatedAt || null,
       joinAttempts: (Array.isArray(entry?.joinAttempts) ? entry.joinAttempts : []).map(String).filter((x) => Number.isFinite(Date.parse(x))).slice(-50)
     })).filter((entry) => /^\d{17}$/.test(entry.steamId) && Number.isFinite(Date.parse(entry.expiresAt || ''))).filter((entry, index, rows) => rows.findIndex((x) => x.steamId === entry.steamId) === index).slice(0, 1000),
+    banSyncServerId: String(b.banSyncServerId || '').slice(0, 80),
     banSyncTargetBotId: String(b.banSyncTargetBotId || '').slice(0, 80),
     banSyncRequests: (Array.isArray(b.banSyncRequests) ? b.banSyncRequests : []).map((row) => ({ sourceBotId: String(row?.sourceBotId || '').slice(0, 80), sourceOwnerDiscordId: String(row?.sourceOwnerDiscordId || '').slice(0, 20), requestedAt: row?.requestedAt || null })).filter((row) => row.sourceBotId).filter((row, index, rows) => rows.findIndex((x) => x.sourceBotId === row.sourceBotId) === index).slice(0, 50),
     banSyncAcceptedSources: [...new Set((Array.isArray(b.banSyncAcceptedSources) ? b.banSyncAcceptedSources : []).map((x) => String(x || '').slice(0, 80)).filter(Boolean))].slice(0, 50),
@@ -549,11 +616,32 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }
-export function deleteManagedBot(id) { updateDb((db) => { db.managedBots = (db.managedBots || []).filter((b) => b.id !== id); }); }
+export function deleteManagedBot(id) { updateDb((db) => {
+  db.managedBots = (db.managedBots || []).filter((b) => b.id !== id);
+  db.banSyncServers = (db.banSyncServers || []).map((room) => {
+    const members = (Array.isArray(room.members) ? room.members : []).filter((memberId) => memberId !== id);
+    if (!members.length) return null;
+    return { ...room, members, ownerBotId: room.ownerBotId === id ? members[0] : room.ownerBotId, updatedAt: new Date().toISOString() };
+  }).filter(Boolean);
+}); }
+
+export function listBanSyncServers() { return readDb().banSyncServers || []; }
+export function getBanSyncServer(id) { return listBanSyncServers().find((room) => room.id === String(id || '')) || null; }
+export function upsertBanSyncServer(room) {
+  return updateDb((db) => {
+    if (!Array.isArray(db.banSyncServers)) db.banSyncServers = [];
+    const now = new Date().toISOString();
+    const index = db.banSyncServers.findIndex((x) => x.id === room.id);
+    if (index >= 0) { db.banSyncServers[index] = { ...db.banSyncServers[index], ...room, updatedAt: now }; return db.banSyncServers[index]; }
+    const entry = { id: room.id || crypto.randomUUID(), createdAt: now, updatedAt: now, members: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, sharedBans: [], ...room };
+    db.banSyncServers.push(entry); return entry;
+  });
+}
+export function deleteBanSyncServer(id) { updateDb((db) => { db.banSyncServers = (db.banSyncServers || []).filter((room) => room.id !== String(id || '')); }); }
 
 export function listStatusNodes() { return readDb().statusNodes || []; }
 export function getStatusNode(id) { return listStatusNodes().find((n) => n.id === id) || null; }
