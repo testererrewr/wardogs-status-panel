@@ -1,10 +1,31 @@
-# status-hub.lol v3.12.39
+# status-hub.lol v3.12.42
 
 
 
 
 
 
+
+
+
+## v3.12.42
+
+- WARDOGS Status Bot kann alle gespeicherten Spieler-, Playtime- und Kill-Statistiken als Word-Dokument (`.docx`) exportieren.
+- Der Export funktioniert unabhängig vom Bot-Runtime-Status direkt aus den persistent gespeicherten Panel-Daten.
+
+## v3.12.41 – Dynamic Name im WARDOGS Management Bot
+
+Der Management Bot kann den echten WARDOGS-Servernamen jetzt optional dynamisch verwalten. Alle Teilfunktionen sind separat schaltbar: Score-/Stats-Format mit Platzhaltern, ein Seeding-Name für einen frei wählbaren Spielerbereich und eine Rotation zwischen zwei Namen alle X Minuten. Seeding hat Vorrang vor der Stats-Anzeige; die 2-Namen-Rotation kann als Basisname für die Stats dienen. Beim Abschalten des Features oder Stoppen des Management Bots wird der zuvor gespeicherte Originalname wiederhergestellt.
+
+Unterstützte Platzhalter sind unter anderem `{base}`, `{players}`, `{max}`, `{map}`, `{scores}`, `{team1}` bis `{team6}` und `{score1}` bis `{score6}`. Beispiel: `{base} | {score1} | {score2} | {score3}`. Die Änderung erfolgt über das WARDOGS Config-Dokument. Wenn der Hoster `ServerName` per Startparameter fest pinnt, zeigt das Panel stattdessen einen Dynamic-Name-Fehler an.
+
+## v3.12.40 – echte Join-Sessions + robuster Ban-Sync
+
+- Welcome-Whisper wird nicht mehr durch Matchende, Mapwechsel oder einen neuen Matchstart erneut ausgelöst. Bereits verbundene Spieler werden über WARDOGS-Roster-Resets hinweg als dieselbe Session behandelt.
+- Matchgrenzen werden anhand von Map/Rotation/Experience/Alternator und zurückgesetzten Faction-Scores erkannt. Zusätzlich bekommt ein komplett leeres `/v1/players`-Roster beim Welcome-Watcher eine längere Grace-Phase, weil WARDOGS die Liste während Matchwechseln kurz neu aufbaut.
+- Ein echter Leave + späterer Rejoin bleibt weiterhin ein neuer Join und erzeugt wieder genau einen Welcome-Whisper.
+- Ban-Sync behandelt `404 no player matching ...` nicht mehr als defekten Sync: aktuelle WARDOGS-Live-Builds können einen normalen Ban nur anlegen, solange der Spieler auf diesem Zielserver verbunden ist. Solche Einträge bleiben jetzt als **pending** in der Community und werden beim nächsten Join automatisch angewendet.
+- `Jetzt synchronisieren` räumt außerdem veraltete Community-Bans auf, wenn der ursprüngliche Quell-Bot den Ban nicht mehr führt, und zeigt getrennt `bereits synchron`, `pending`, `veraltete entfernt` und echte Fehler.
 
 ## v3.12.39 – Killfeed nur im Bot-Service WARDOGS Status Bot
 

@@ -15,23 +15,103 @@ export function renderManagedWelcomeMessage(template, player) {
 }
 
 export function createManagedJoinTracker() {
-  return { initialized: false, active: new Set(), missing: new Map() };
+  return {
+    initialized: false,
+    active: new Set(),
+    missing: new Map(),
+    missingSince: new Map(),
+    departed: new Map(),
+    boundaryCarryover: new Map()
+  };
+}
+
+function ensureJoinTrackerState(state) {
+  if (!(state.active instanceof Set)) state.active = new Set();
+  if (!(state.missing instanceof Map)) state.missing = new Map();
+  if (!(state.missingSince instanceof Map)) state.missingSince = new Map();
+  if (!(state.departed instanceof Map)) state.departed = new Map();
+  if (!(state.boundaryCarryover instanceof Map)) state.boundaryCarryover = new Map();
+}
+
+// WARDOGS briefly tears down /v1/players while a match/map changes. Players who
+// remain connected must not be manufactured into fresh joins when the roster
+// comes back. Mark all recently-known sessions as carry-over across that boundary.
+export function markManagedJoinBoundary(tracker, {
+  nowMs = Date.now(),
+  carryoverMs = 90_000,
+  departedLookbackMs = 45_000
+} = {}) {
+  const state = tracker || createManagedJoinTracker();
+  ensureJoinTrackerState(state);
+  const now = Number(nowMs) || Date.now();
+  const expiry = now + Math.max(5_000, Number(carryoverMs) || 90_000);
+  const lookback = Math.max(0, Number(departedLookbackMs) || 45_000);
+  const ids = new Set([...state.active, ...state.missing.keys()]);
+  for (const [id, meta] of state.departed) {
+    const at = Number(meta?.at || 0);
+    if (!at || now - at <= lookback) ids.add(id);
+  }
+  for (const id of ids) state.boundaryCarryover.set(id, expiry);
+  return ids.size;
+}
+
+function normalizedMatchSnapshot(status) {
+  const scores = {};
+  for (const row of Array.isArray(status?.factionScores) ? status.factionScores : []) {
+    const key = normalizeFactionKey(row?.name);
+    const score = Number(row?.score);
+    if (key && Number.isFinite(score)) scores[key] = score;
+  }
+  const experiences = (Array.isArray(status?.experiences) ? status.experiences : [])
+    .map((value) => String(value || '').trim().toLowerCase()).filter(Boolean).sort().join('|');
+  const rotationIndex = Number(status?.rotation?.nowIndex);
+  return {
+    map: String(status?.map || '').trim().toLowerCase(),
+    experiences,
+    alternator: String(status?.alternator || '').trim().toLowerCase(),
+    rotationIndex: Number.isFinite(rotationIndex) ? rotationIndex : null,
+    scores
+  };
+}
+
+// Live WARDOGS builds do not expose an explicit round id. A new round is visible
+// through a map/rotation/mode change or by faction scores falling back. These are
+// only used to suppress false re-joins; the first snapshot never counts as a
+// boundary.
+export function managedMatchBoundary(previousSnapshot, status) {
+  const next = normalizedMatchSnapshot(status);
+  const previous = previousSnapshot && typeof previousSnapshot === 'object' ? previousSnapshot : null;
+  if (!previous) return { changed: false, snapshot: next, reason: '' };
+  if (previous.map && next.map && previous.map !== next.map) return { changed: true, snapshot: next, reason: 'map' };
+  if (previous.rotationIndex != null && next.rotationIndex != null && previous.rotationIndex !== next.rotationIndex) return { changed: true, snapshot: next, reason: 'rotation' };
+  if (previous.experiences && next.experiences && previous.experiences !== next.experiences) return { changed: true, snapshot: next, reason: 'experience' };
+  if (previous.alternator && next.alternator && previous.alternator !== next.alternator) return { changed: true, snapshot: next, reason: 'alternator' };
+  for (const [key, oldScore] of Object.entries(previous.scores || {})) {
+    const newScore = Number(next.scores?.[key]);
+    if (Number.isFinite(newScore) && Number(oldScore) - newScore >= 1) return { changed: true, snapshot: next, reason: 'score-reset' };
+  }
+  return { changed: false, snapshot: next, reason: '' };
 }
 
 // The first successful snapshot is a baseline. Afterwards a player becomes a
 // join candidate when it appears after a confirmed absence. missingThreshold
 // deliberately requires consecutive successful snapshots so one incomplete
 // WARDOGS roster response cannot manufacture a leave/rejoin cycle.
-export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
+export function managedJoinCandidates(tracker, players, missingThreshold = 3, options = {}) {
   const state = tracker || createManagedJoinTracker();
-  if (!(state.active instanceof Set)) state.active = new Set();
-  if (!(state.missing instanceof Map)) state.missing = new Map();
+  ensureJoinTrackerState(state);
   const rows = Array.isArray(players) ? players : [];
   const current = new Set(rows.map(playerSteamId).filter(Boolean));
+  const now = Number(options?.nowMs) || Date.now();
+  const departedRetentionMs = Math.max(60_000, Number(options?.departedRetentionMs) || 10 * 60_000);
+  for (const [id, meta] of state.departed) if (now - Number(meta?.at || 0) > departedRetentionMs) state.departed.delete(id);
+  for (const [id, expiresAt] of state.boundaryCarryover) if (Number(expiresAt || 0) <= now) state.boundaryCarryover.delete(id);
+
   if (!state.initialized) {
     state.initialized = true;
     state.active = new Set(current);
     state.missing.clear();
+    state.missingSince.clear();
     return [];
   }
 
@@ -39,18 +119,29 @@ export function managedJoinCandidates(tracker, players, missingThreshold = 3) {
   for (const player of rows) {
     const id = playerSteamId(player);
     if (!id) continue;
-    if (!state.active.has(id)) candidates.push(player);
+    if (!state.active.has(id)) {
+      const carryover = Number(state.boundaryCarryover.get(id) || 0) > now;
+      if (!carryover) candidates.push(player);
+      state.boundaryCarryover.delete(id);
+      state.departed.delete(id);
+    }
     state.active.add(id);
     state.missing.delete(id);
+    state.missingSince.delete(id);
   }
 
-  const threshold = Math.max(2, Math.min(10, Number(missingThreshold) || 3));
+  const normalThreshold = Math.max(2, Math.min(30, Number(missingThreshold) || 3));
+  const emptyThreshold = Math.max(normalThreshold, Math.min(120, Number(options?.emptyRosterMissingThreshold) || normalThreshold));
+  const threshold = current.size === 0 && state.active.size > 0 ? emptyThreshold : normalThreshold;
   for (const id of [...state.active]) {
     if (current.has(id)) continue;
     const misses = Number(state.missing.get(id) || 0) + 1;
+    if (!state.missingSince.has(id)) state.missingSince.set(id, now);
     if (misses >= threshold) {
       state.active.delete(id);
       state.missing.delete(id);
+      state.departed.set(id, { at: now, missingSince: Number(state.missingSince.get(id) || now) });
+      state.missingSince.delete(id);
     } else state.missing.set(id, misses);
   }
   return candidates;

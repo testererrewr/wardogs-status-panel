@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   createManagedJoinTracker,
   managedJoinCandidates,
+  managedMatchBoundary,
+  markManagedJoinBoundary,
   managedWelcomeSucceeded,
   managedWelcomeTargets,
   renderManagedWelcomeMessage
@@ -128,4 +130,51 @@ test('confirmed leave followed by rejoin creates a fresh welcome session', () =>
 
 test('welcome variables render with the faction reported at delivery time', () => {
   assert.equal(renderManagedWelcomeMessage('Hi {player} {steamid} {faction}', B_SPAWNED), `Hi Bravo ${B_SPAWNED.steamId} Valkyra`);
+});
+
+
+test('match boundary suppresses a false rejoin for players who stayed through the round change', () => {
+  const tracker = createManagedJoinTracker();
+  assert.deepEqual(managedJoinCandidates(tracker, [A], 2, { nowMs: 0 }), []);
+
+  // WARDOGS may temporarily drop the roster around a map/round transition.
+  managedJoinCandidates(tracker, [], 2, { nowMs: 2_000 });
+  managedJoinCandidates(tracker, [], 2, { nowMs: 4_000 });
+  assert.equal(tracker.active.has(A.steamId), false);
+
+  markManagedJoinBoundary(tracker, { nowMs: 5_000, carryoverMs: 90_000, departedLookbackMs: 45_000 });
+  assert.deepEqual(managedJoinCandidates(tracker, [A], 2, { nowMs: 6_000 }), []);
+  assert.equal(tracker.active.has(A.steamId), true);
+});
+
+test('a real leave and rejoin without a match boundary is still a join', () => {
+  const tracker = createManagedJoinTracker();
+  managedJoinCandidates(tracker, [A], 2, { nowMs: 0 });
+  managedJoinCandidates(tracker, [], 2, { nowMs: 2_000 });
+  managedJoinCandidates(tracker, [], 2, { nowMs: 4_000 });
+  const joined = managedJoinCandidates(tracker, [A], 2, { nowMs: 20_000 });
+  assert.equal(joined.length, 1);
+  assert.equal(joined[0].steamId, A.steamId);
+});
+
+test('complete roster outage gets a longer grace window for welcome tracking', () => {
+  const tracker = createManagedJoinTracker();
+  managedJoinCandidates(tracker, [A], 2, { nowMs: 0, emptyRosterMissingThreshold: 5 });
+  for (let i = 1; i <= 4; i += 1) managedJoinCandidates(tracker, [], 2, { nowMs: i * 2_000, emptyRosterMissingThreshold: 5 });
+  assert.equal(tracker.active.has(A.steamId), true);
+  assert.deepEqual(managedJoinCandidates(tracker, [A], 2, { nowMs: 10_000, emptyRosterMissingThreshold: 5 }), []);
+});
+
+test('match boundary detection catches map changes and score resets', () => {
+  let result = managedMatchBoundary(null, { map: 'Kavkazi', factionScores: [{ name: 'Valkyra', score: 45 }, { name: 'Lonestar', score: 40 }], rotation: { nowIndex: 0 } });
+  assert.equal(result.changed, false);
+  const first = result.snapshot;
+
+  result = managedMatchBoundary(first, { map: 'Kavkazi', factionScores: [{ name: 'Valkyra', score: 0 }, { name: 'Lonestar', score: 0 }], rotation: { nowIndex: 0 } });
+  assert.equal(result.changed, true);
+  assert.equal(result.reason, 'score-reset');
+
+  result = managedMatchBoundary(first, { map: 'Europe', factionScores: [{ name: 'Valkyra', score: 0 }, { name: 'Lonestar', score: 0 }], rotation: { nowIndex: 1 } });
+  assert.equal(result.changed, true);
+  assert.equal(result.reason, 'map');
 });
