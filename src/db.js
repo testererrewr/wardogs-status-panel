@@ -146,7 +146,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 37, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 38, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -163,7 +163,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 37;
+  parsed.version = 38;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -532,6 +532,23 @@ function migrate(parsed) {
           killFeedEvents: Array.isArray(server?.killFeedEvents) && server.killFeedEvents.length ? server.killFeedEvents.slice(-150) : (Array.isArray(matchingStatus?.killFeedEvents) ? matchingStatus.killFeedEvents.slice(-150) : [])
         };
       });
+    }
+  }
+  if (previousVersion < 38) {
+    // v3.12.39 fixes the feature boundary: Discord killfeed + global kill stats
+    // belong only to the managed WARDOGS Status Bot (former Playtime Tracker),
+    // never to the classic/free Status Bot entries in db.servers.
+    // v3.12.38 already copied matching historic feed data into playtimeServers;
+    // here we disable the accidentally exposed classic feed endpoints without
+    // deleting archived event/stat data from disk.
+    for (const server of parsed.servers) {
+      server.killFeedChannelId = '';
+      server.killFeedMessageId = '';
+      server.killFeedTokenEnc = '';
+      server.killFeedConfiguredAt = null;
+      server.killFeedPublicUrl = '';
+      server.killFeedNeedsGameRestart = false;
+      server.killFeedLastPublishedAt = null;
     }
   }
   parsed.servers = parsed.servers.map((server) => ({

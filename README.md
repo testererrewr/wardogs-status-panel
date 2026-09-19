@@ -1,4 +1,4 @@
-# status-hub.lol v3.12.38
+# status-hub.lol v3.12.39
 
 
 
@@ -6,7 +6,7 @@
 
 
 
-## v3.12.38 – WARDOGS Status Bot: Playtime + Multi-Server Killfeed + globale Kill-Stats
+## v3.12.39 – Killfeed nur im Bot-Service WARDOGS Status Bot
 
 - Der bisher sichtbare **WARDOGS Playtime Tracker** heißt jetzt konsequent **WARDOGS Status Bot**. Bestehende Standardnamen werden bei der Datenbankmigration automatisch umbenannt.
 - Der WARDOGS Status Bot behält seine Multi-Server-Playtime-Funktionen und bekommt die Killfeed-/Stats-Funktionen direkt in dieselbe Bot-Service-Instanz.

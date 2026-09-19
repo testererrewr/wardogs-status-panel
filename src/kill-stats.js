@@ -4,7 +4,7 @@ import {
   ModalBuilder, TextInputBuilder, TextInputStyle
 } from 'discord.js';
 import { decryptSecret, encryptSecret } from './crypto.js';
-import { readDb, getManagedBot, upsertManagedBot, getServer, upsertServer } from './db.js';
+import { readDb, getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
 
@@ -401,20 +401,6 @@ export async function configureWardogsKillFeed(bot, publicUrl = process.env.PUBL
   return{bot:fresh,origin,needsGameRestart:true,result};
 }
 
-export async function configureWardogsStatusKillFeed(server, publicUrl = process.env.PUBLIC_URL || '') {
-  if(server?.gameType!=='wardogs')throw new Error('WARDOGS Status Bot required');
-  const origin=new URL(String(publicUrl||'')).origin;
-  const root=baseUrl(server?.queryConfig?.baseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
-  const secret=decryptMaybe(server?.querySecretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
-  let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
-  const {data:config}=await statusWardogsJson(server,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
-  const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
-  const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(server?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
-  let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
-  const fresh=upsertServer({id:server.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true});
-  return{server:fresh,origin,needsGameRestart:true,result};
-}
-
 export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl = process.env.PUBLIC_URL || '') {
   if(bot?.serviceId!==PLAYTIME_STATUS_SERVICE_ID)throw new Error('WARDOGS Status Bot required');
   const servers=Array.isArray(bot?.playtimeServers)?bot.playtimeServers:[];
@@ -434,11 +420,6 @@ export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl 
   return{bot:fresh,server:next[index],origin,needsGameRestart:true,result};
 }
 
-function statusServerForFeedToken(token) {
-  const servers=(readDb().servers||[]).filter((server)=>server?.gameType==='wardogs'&&server.killFeedTokenEnc);
-  for(const server of servers){const candidate=decryptMaybe(server.killFeedTokenEnc);if(candidate&&secureEqual(candidate,token))return server;}
-  return null;
-}
 function playtimeSourceForFeedToken(token) {
   const bots=(readDb().managedBots||[]).filter((bot)=>bot?.serviceId===PLAYTIME_STATUS_SERVICE_ID);
   for(const bot of bots){
@@ -455,12 +436,10 @@ function botForFeedToken(token) {
   return null;
 }
 function sourceTargetKey(source, kind) {
-  if(kind==='status')return targetKey(source?.queryConfig?.baseUrl);
   if(kind==='playtime')return targetKey(source?.server?.baseUrl);
   return targetKey(source?.wardogsBaseUrl);
 }
 function sourceSecret(source, kind) {
-  if(kind==='status')return decryptMaybe(source?.querySecretEnc);
   if(kind==='playtime')return decryptMaybe(source?.server?.secretEnc);
   return decryptMaybe(source?.wardogsSecretEnc);
 }
@@ -472,32 +451,20 @@ function matchesSourceTarget(source, sourceKind, target, targetKind) {
 }
 function feedTargets(source, sourceKind) {
   const db=readDb(); const out=[];
-  // Only one Status Bot per owner+WARDOGS endpoint participates, preventing
-  // duplicate all-time stats when an account accidentally has two status entries
-  // pointing at the same game server. If the feed token belongs to a Status Bot,
-  // that exact server wins for its owner so its own Discord panel receives events.
-  const seenStatusOwners=new Set();
-  if(sourceKind==='status'){
-    const owner=String(source?.ownerDiscordId||'');
-    if(owner){seenStatusOwners.add(owner);out.push({kind:'status',item:source});}
-  } else if(sourceKind==='playtime') {
-    out.push({kind:'playtime',item:source.bot,serverId:source.server.id});
-  }
-  for(const server of (db.servers||[])){
-    if(server?.gameType!=='wardogs'||String(server?.id||'')===String(sourceKind==='status'?source?.id:'')||!matchesSourceTarget(source,sourceKind,server,'status'))continue;
-    const owner=String(server.ownerDiscordId||'');
-    if(seenStatusOwners.has(owner))continue;
-    seenStatusOwners.add(owner);out.push({kind:'status',item:server});
-  }
+  // Killfeed/global stats live only in the managed WARDOGS Status Bot
+  // (service id wardogs-playtime-tracker). The Management Bot may still own
+  // a feed token for its separate 150-event moderation history, but classic
+  // free Status Bots never participate in killfeed/stat tracking.
+  if(sourceKind==='playtime') out.push({kind:'playtime',item:source.bot,serverId:source.server.id});
+  else if(sourceKind==='managed'&&source?.serviceId==='wardogs-warning-bot') out.push({kind:'managed',item:source});
+
   for(const bot of (db.managedBots||[])){
-    if(bot?.serviceId===PLAYTIME_STATUS_SERVICE_ID)continue;
-    if(!SUPPORTED_FEED_SERVICES.has(String(bot?.serviceId||''))||!matchesSourceTarget(source,sourceKind,bot,'managed')||!accessActive(bot)||!bot.enabled)continue;
-    out.push({kind:'managed',item:bot});
-  }
-  // A multi-server WARDOGS Status Bot may share the same gameserver target with
-  // a classic Status Bot or Management Bot. Feed events must still reach its
-  // global stats and the correct per-server killfeed exactly once.
-  for(const bot of (db.managedBots||[])){
+    if(bot?.serviceId==='wardogs-warning-bot'){
+      if(sourceKind==='managed'&&String(source?.id||'')===String(bot.id))continue;
+      if(!matchesSourceTarget(source,sourceKind,bot,'managed')||!accessActive(bot)||!bot.enabled)continue;
+      out.push({kind:'managed',item:bot});
+      continue;
+    }
     if(bot?.serviceId!==PLAYTIME_STATUS_SERVICE_ID||!accessActive(bot)||!bot.enabled)continue;
     for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){
       if(sourceKind==='playtime'&&String(source?.bot?.id||'')===String(bot.id)&&String(source?.server?.id||'')===String(server?.id||''))continue;
@@ -507,16 +474,6 @@ function feedTargets(source, sourceKind) {
     }
   }
   return out;
-}
-function updateStatusFeedTarget(server, events) {
-  let stats=emptyStats(server.killStats); let changed=0;
-  for(const event of events){const applied=applyEventToStats(stats,event);stats=applied.stats;if(!applied.duplicate)changed+=1;}
-  if(!changed)return 0;
-  const existing=(Array.isArray(server.killFeedEvents)?server.killFeedEvents:[]).map(normalizeStoredEvent).filter(Boolean);
-  const ids=new Set(existing.map((event)=>`${event.serverId||''}:${event.id||''}`).filter((key)=>!key.endsWith(':')));
-  const freshEvents=events.filter((event)=>!event.id||!ids.has(`${event.serverId||''}:${event.id}`));
-  upsertServer({id:server.id,killStats:stats,killFeedEvents:[...existing,...freshEvents].slice(-500),killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
-  return changed;
 }
 function updatePlaytimeFeedTarget(bot, serverId, events) {
   let stats=emptyStats(bot.killStats);let changed=0;
@@ -547,23 +504,20 @@ function updateManagedFeedTarget(bot, events) {
   return 0;
 }
 export async function ingestWardogsKillFeed(token, payload) {
-  const statusSource=statusServerForFeedToken(token);
-  const playtimeSource=statusSource?null:playtimeSourceForFeedToken(token);
-  const managedSource=(statusSource||playtimeSource)?null:botForFeedToken(token);
-  const source=statusSource||playtimeSource||managedSource; const sourceKind=statusSource?'status':playtimeSource?'playtime':managedSource?'managed':'';
+  const playtimeSource=playtimeSourceForFeedToken(token);
+  const managedSource=playtimeSource?null:botForFeedToken(token);
+  const source=playtimeSource||managedSource; const sourceKind=playtimeSource?'playtime':managedSource?'managed':'';
   if(!source)throw Object.assign(new Error('Invalid feed token'),{status:401});
   const sourceServer=sourceKind==='playtime'?source.server:null;
   const sourceBot=sourceKind==='playtime'?source.bot:source;
-  const enrichedPayload={...payload,serverId:String(statusSource?.id||sourceServer?.id||payload?.serverId||sourceBot?.id||''),serverName:String(payload?.serverName||sourceServer?.label||statusSource?.name||sourceBot?.name||'WARDOGS')};
+  const enrichedPayload={...payload,serverId:String(sourceServer?.id||payload?.serverId||sourceBot?.id||''),serverName:String(payload?.serverName||sourceServer?.label||sourceBot?.name||'WARDOGS')};
   const rawEvents=Array.isArray(payload?.events)?payload.events.slice(0,100):[];
   const events=rawEvents.map((raw)=>incomingEvent(enrichedPayload,raw)).filter(Boolean);
   const targets=feedTargets(source,sourceKind);let accepted=0;
   for(const target of targets){
-    if(target.kind==='status')accepted+=updateStatusFeedTarget(target.item,events);
-    else if(target.kind==='playtime')accepted+=updatePlaytimeFeedTarget(target.item,target.serverId,events);
+    if(target.kind==='playtime')accepted+=updatePlaytimeFeedTarget(target.item,target.serverId,events);
     else accepted+=updateManagedFeedTarget(target.item,events);
   }
   if(events.length&&sourceKind==='managed')upsertManagedBot({id:source.id,killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
-  if(events.length&&sourceKind==='status')upsertServer({id:source.id,killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
   return{events:events.length,accepted,targets:targets.length};
 }

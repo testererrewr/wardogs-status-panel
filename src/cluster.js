@@ -3,7 +3,6 @@ import { readDb, updateDb, getStatusNode, upsertStatusNode } from './db.js';
 import { decryptSecret } from './crypto.js';
 import { effectivePlan, isServerEntitled, brandedTemplates } from './plans.js';
 import { newNodeToken, hashNodeToken, safeTokenEqual } from './status-node-auth.js';
-import { aggregateKillStatsServers } from './kill-stats.js';
 
 const deadSeconds = Math.max(20, Number(process.env.STATUS_NODE_DEAD_SECONDS || 45));
 const minFreeMb = Math.max(0, Number(process.env.STATUS_NODE_MIN_FREE_MB || 150));
@@ -194,12 +193,6 @@ export function materializeWorkForNode(nodeId) {
   rebalanceAssignments();
   const db = readDb();
   const serviceDomain = String(db.siteSettings?.serviceDomain || process.env.SERVICE_DOMAIN || 'status-hub.lol').replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-  const ownerStatsCache = new Map();
-  const ownerStats = (ownerDiscordId) => {
-    const key = String(ownerDiscordId || '');
-    if (!ownerStatsCache.has(key)) ownerStatsCache.set(key, aggregateKillStatsServers(db.servers.filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === key)));
-    return ownerStatsCache.get(key);
-  };
   return db.servers.filter((s) => s.enabled && s.assignedNodeId === nodeId && isServerEntitled(s, db)).map((s) => {
     const owner = db.users.find((u) => u.discordId === s.ownerDiscordId);
     const plan = effectivePlan(owner);
@@ -214,14 +207,6 @@ export function materializeWorkForNode(nodeId) {
       querySecretPlain: s.querySecretEnc ? decryptSecret(s.querySecretEnc) : '',
       onlineTemplates: brandedTemplates(s, owner, serviceDomain),
       offlineTemplate: brandedOffline,
-      ...(s.gameType === 'wardogs' ? (() => {
-        const global = ownerStats(s.ownerDiscordId);
-        return {
-          killFeedRecent: (Array.isArray(s.killFeedEvents) ? s.killFeedEvents : []).slice(-15).reverse(),
-          killStatsGlobalSummary: { totalEvents: global.totalEvents, playerCount: global.players.length, top10: global.top25.slice(0, 10), lastEventAt: global.lastEventAt },
-          killStatsServerCount: db.servers.filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === String(s.ownerDiscordId || '') && (row.killStats?.totalEvents || row.killFeedConfiguredAt)).length
-        };
-      })() : {}),
       plan: plan.id
     };
   });

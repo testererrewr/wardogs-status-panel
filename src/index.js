@@ -25,7 +25,7 @@ import { prepareCustomBot, parseEnvText, deleteCustomBotFiles, listCustomBotFile
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotLogs } from './runner-client.js';
 import { managedBotRuntime, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, temporaryBanManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, whisperManagedFaction, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64, normalizeManagedBanDiscordLink, formatManagedBanDuration, requestManagedBanSync, acceptManagedBanSync, rejectManagedBanSync, syncManagedBanSnapshot, createManagedBanSyncServer, joinManagedBanSyncServer, leaveManagedBanSyncServer, resyncManagedBanSyncServer, updateManagedBanSyncCommunitySettings, appendManagedAudit } from './managed-bots.js';
 import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, playtimeTrackerServers, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
-import { KILL_STATS_SERVICE_ID, killStatsBotRuntime, syncKillStatsBots, restartKillStatsBot, stopKillStatsBot, shutdownKillStatsBots, testKillStatsWardogs, refreshKillStatsDiscord, killStatsSnapshot, searchKillStatsPlayer, managementKillFeed, prettyCause, configureWardogsKillFeed, configureWardogsStatusKillFeed, configureWardogsPlaytimeKillFeed, ingestWardogsKillFeed, aggregateKillStatsServers, killStatsSnapshotFromStats, searchKillStatsSnapshot, statusServerKillFeed } from './kill-stats.js';
+import { KILL_STATS_SERVICE_ID, killStatsBotRuntime, syncKillStatsBots, restartKillStatsBot, stopKillStatsBot, shutdownKillStatsBots, testKillStatsWardogs, refreshKillStatsDiscord, killStatsSnapshot, searchKillStatsPlayer, managementKillFeed, prettyCause, configureWardogsKillFeed, configureWardogsPlaytimeKillFeed, ingestWardogsKillFeed, killStatsSnapshotFromStats, searchKillStatsSnapshot } from './kill-stats.js';
 import { gameDigMeta, gameDigFieldDefs } from './game-catalog.js';
 import { PLANS, effectivePlan } from './plans.js';
 import { registerStatusNode, authenticateStatusNode, heartbeatStatusNode, materializeWorkForNode, rebalanceAssignments, clusterRuntime, nodeIsHealthy, leaseSeconds, moveServerToNode, moveAllFromNode, drainStatusNode, restartAllBotsOnNode } from './cluster.js';
@@ -531,16 +531,6 @@ function ownedServer(req, id) {
   return u.role === 'admin' || server.ownerDiscordId === u.discordId ? server : null;
 }
 
-function ownerWardogsStatusServers(server) {
-  return (readDb().servers || []).filter((row) => row.gameType === 'wardogs' && String(row.ownerDiscordId || '') === String(server?.ownerDiscordId || ''));
-}
-function statusKillfeedSetupPanel(req, server) {
-  if (server?.gameType !== 'wardogs') return '';
-  const configured=Boolean(server.killFeedTokenEnc && server.killFeedConfiguredAt);
-  const lastEvent=server.killFeedLastEventAt?new Date(server.killFeedLastEventAt).toLocaleString(localeCode(langOf(req))):'—';
-  const channel=server.killFeedChannelId||l(req,'nicht gesetzt','not set');
-  return `<section class="panel"><div class="row between"><div><span class="eyebrow">WARDOGS Status Bot</span><h2>${l(req,'Killfeed & globale Stats','Killfeed & global stats')}</h2><p>${l(req,'Dieser Server hat sein eigenes festes Discord-Killfeed-Panel mit den letzten 15 Kills. Spielerstatistiken werden accountweit über alle deine WARDOGS Status Bots zusammengezählt.','This server has its own fixed Discord killfeed panel with the latest 15 kills. Player statistics are aggregated account-wide across all your WARDOGS Status Bots.')}</p></div><span class="badge ${configured?'online':'neutral'}">${configured?l(req,'Feed konfiguriert','Feed configured'):l(req,'Feed nicht konfiguriert','Feed not configured')}</span></div><div class="managed-live-grid"><article class="panel"><span class="eyebrow">Discord Channel</span><strong class="small">${esc(channel)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Letztes Event','Last event')}</span><strong class="small">${esc(lastEvent)}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Getrackte Server','Tracked servers')}</span><strong>${esc(ownerWardogsStatusServers(server).length)}</strong></article></div>${server.killFeedNeedsGameRestart?`<div class="warning"><strong>${l(req,'Gameserver-Neustart erforderlich','Game server restart required')}:</strong> ${l(req,'WARDOGS liest die Server-Feed-Konfiguration beim Start ein.','WARDOGS reads the server-feed configuration at startup.')}</div>`:''}<div class="actions wrap"><form method="post" action="/servers/${esc(server.id)}/killfeed/configure" class="inline"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><button class="button primary">${configured?l(req,'Kill Feed erneut konfigurieren','Reconfigure Kill Feed'):l(req,'Kill Feed konfigurieren','Configure Kill Feed')}</button></form><a class="button ghost" href="/servers/${esc(server.id)}/stats">${l(req,'Killfeed & Stats öffnen','Open killfeed & stats')}</a></div></section>`;
-}
 function ownedCustom(req, id) {
   const bot = getCustomBot(id); const u = currentUser(req);
   if (!bot || !u) return null;
@@ -699,18 +689,6 @@ app.get('/api/status-nodes/work', requireStatusNode, (req, res) => {
   try { res.set('Cache-Control','no-store').json({ ok: true, leaseSeconds, servers: materializeWorkForNode(req.statusNode.id) }); }
   catch (error) { res.status(500).json({ error: error.message }); }
 });
-app.get('/api/status-nodes/stats/:serverId', requireStatusNode, (req, res) => {
-  try {
-    const server=getServer(String(req.params.serverId||''));
-    if(!server||server.assignedNodeId!==req.statusNode.id)return res.status(404).json({error:'Status server not assigned to this node'});
-    const ownerServers=(readDb().servers||[]).filter((row)=>row.gameType==='wardogs'&&String(row.ownerDiscordId||'')===String(server.ownerDiscordId||''));
-    const snapshot=aggregateKillStatsServers(ownerServers);
-    const q=String(req.query.q||'').trim();
-    const matches=q?searchKillStatsSnapshot(snapshot,q):[];
-    res.set('Cache-Control','no-store').json({ok:true,totalEvents:snapshot.totalEvents,playerCount:snapshot.players.length,top10:snapshot.top25.slice(0,10),matches:matches.slice(0,25),serverCount:ownerServers.length,lastEventAt:snapshot.lastEventAt});
-  } catch(error){res.status(500).json({error:String(error?.message||error).slice(0,240)});}
-});
-
 app.get('/login', (req, res) => {
   if (currentUser(req)) return res.redirect('/');
   const lang = langOf(req);
@@ -1038,7 +1016,7 @@ function managedBotForm(req, service, bot) {
     <input type="hidden" name="_csrf" value="${esc(csrf(req))}">
     <input type="hidden" name="botId" value="${esc(bot.id)}">
     <label>${tr(lang,'Bot-Name','Bot name')}<input name="name" maxlength="80" required value="${esc(bot.name||service.nameDe||service.nameEn||'WARDOGS Bot')}"></label>
-    <label>Discord Bot Token (${tr(lang,'optional','optional')})<input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'für Killfeed & Discord Top 25 nötig','needed for killfeed & Discord Top 25')}"></label>
+    <label>Discord Bot Token <span class="required">*</span><input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflicht für Discord Alerts und Management Panel','Required for Discord alerts and management panel')}"></label>
     <label>Discord Alert Channel ID<input name="alertChannelId" inputmode="numeric" required value="${esc(bot.alertChannelId||'')}" placeholder="123456789012345678"></label>
     <label>${tr(lang,'Rollen-Ping ID (optional)','Role mention ID (optional)')}<input name="mentionRoleId" inputmode="numeric" value="${esc(bot.mentionRoleId||'')}" placeholder="123456789012345678"></label>
     <label class="check span2"><input type="checkbox" name="controlPanelEnabled" value="1" ${bot.controlPanelEnabled===true?'checked':''}> <strong>${tr(lang,'Discord Management Panel aktivieren','Enable Discord management panel')}</strong></label>
@@ -1125,7 +1103,7 @@ function playtimeTrackerForm(req,service,bot) {
   return `<form method="post" action="/bot-services/${encodeURIComponent(service.id)}/manage" class="panel formgrid" id="playtime-tracker-config">
     <input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="botId" value="${esc(bot.id)}">
     <label>${tr(lang,'Bot-Name','Bot name')}<input name="name" maxlength="80" required value="${esc(bot.name||service.nameDe||service.nameEn||'WARDOGS Status Bot')}"></label>
-    <label>Discord Bot Token (${tr(lang,'optional','optional')})<input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'für Killfeed & Discord Top 25 nötig','needed for killfeed & Discord Top 25')}"></label>
+    <label>Discord Bot Token <span class="required">*</span><input name="botToken" type="password" autocomplete="new-password" placeholder="${bot.botTokenEnc?tr(lang,'Leer lassen = unverändert','Leave blank = unchanged'):tr(lang,'Pflicht für Discord Killfeed, Spielersuche und Top 25','Required for Discord killfeed, player search and Top 25')}"></label>
     <div class="span2 help"><strong>WARDOGS Status Bot:</strong> ${tr(lang,'Jeder eingetragene Gameserver hat seinen eigenen festen Discord-Killfeed mit den letzten 15 Kills. Kill-Stats und Spielersuche werden global über alle Server dieser Bot-Instanz zusammengeführt. Im Webpanel bleiben pro Server die letzten 150 Kill-/Death-Events für Moderation sichtbar.','Every configured game server has its own fixed Discord killfeed with the latest 15 kills. Kill stats and player search are aggregated globally across all servers in this bot instance. The web panel keeps the latest 150 kill/death events per server for moderation.')}</div>
     <div class="span2 managed-config-block"><div class="row between"><strong>${tr(lang,'WARDOGS Server · Status, Killfeed & Stats','WARDOGS servers · status, killfeed & stats')}</strong><button type="button" class="button ghost smallbtn" id="add-playtime-server">+ ${tr(lang,'Server','Server')}</button></div><div id="playtime-servers" data-next-index="${servers.length}">${serverRows}</div></div>
     <label>${tr(lang,'Prüfintervall','Poll interval')}<input name="pollSeconds" type="number" min="10" max="300" value="${esc(bot.pollSeconds||30)}"><span class="muted small">10–300 s</span></label>
@@ -1684,8 +1662,9 @@ app.post('/managed-bots/:id/ban-sync-server/join',requireLogin,banSyncJoinRate,c
   const bot=managedActionContext(req,res);if(!bot)return;
   try{
     const result=await joinManagedBanSyncServer(bot,String(req.body.serverId||''),String(req.body.password||''),`web:${currentUser(req)?.discordId||'unknown'}`);
-    const suffix=result.failed?l(req,` ${result.failed} Sync-Aktionen sind fehlgeschlagen; Details stehen im Audit Log.`,` ${result.failed} sync operations failed; details are in the audit log.`):'';
-    flash(req,result.failed?'err':'ok',l(req,`Ban-Sync-Community „${result.room.name}“ beigetreten. ${result.applied} Ban-Sync-Aktionen ausgeführt. Dynamic-Ban-Einstellungen wurden vom Community-Owner übernommen.${suffix}`,`Joined Ban Sync Community “${result.room.name}”. ${result.applied} ban-sync operations applied. Dynamic Ban settings were inherited from the community owner.${suffix}`));
+    const first=result.errors?.[0]?` ${l(req,'Erster Fehler','First error')}: ${result.errors[0]}`:'';
+    const suffix=result.failed?l(req,` ${result.failed} Sync-Aktionen sind fehlgeschlagen; Details stehen im Audit Log.${first}`,` ${result.failed} sync operations failed; details are in the audit log.${first}`):'';
+    flash(req,result.failed?'err':'ok',l(req,`Ban-Sync-Community „${result.room.name}“ beigetreten. ${result.applied} angewendet · ${result.skipped||0} bereits synchron. Dynamic-Ban-Einstellungen wurden vom Community-Owner übernommen.${suffix}`,`Joined Ban Sync Community “${result.room.name}”. ${result.applied} applied · ${result.skipped||0} already synchronized. Dynamic Ban settings were inherited from the community owner.${suffix}`));
   }catch(error){flash(req,'err',error.message);}
   return managedBack(res,bot);
 });
@@ -1695,7 +1674,7 @@ app.post('/managed-bots/:id/ban-sync-server/leave',requireLogin,managedActionRat
 });
 app.post('/managed-bots/:id/ban-sync-server/resync',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{
   const bot=managedActionContext(req,res);if(!bot)return;
-  try{const result=await resyncManagedBanSyncServer(bot,`web:${currentUser(req)?.discordId||'unknown'}`);flash(req,result.failed?'err':'ok',l(req,`Ban Sync Server neu synchronisiert: ${result.bans} Bans · ${result.members} Bots · ${result.applied} angewendet${result.failed?` · ${result.failed} Fehler`:''}.`,`Ban Sync Server resynchronized: ${result.bans} bans · ${result.members} bots · ${result.applied} applied${result.failed?` · ${result.failed} errors`:''}.`));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);
+  try{const result=await resyncManagedBanSyncServer(bot,`web:${currentUser(req)?.discordId||'unknown'}`);const first=result.errors?.[0]?` · ${l(req,'Erster Fehler','First error')}: ${result.errors[0]}`:'';flash(req,result.failed?'err':'ok',l(req,`Ban-Sync-Community synchronisiert: ${result.bans} Bans · ${result.members} Bots · ${result.applied} angewendet · ${result.skipped||0} bereits synchron${result.failed?` · ${result.failed} Fehler${first}`:''}.`,`Ban Sync Community synchronized: ${result.bans} bans · ${result.members} bots · ${result.applied} applied · ${result.skipped||0} already synchronized${result.failed?` · ${result.failed} errors${first}`:''}.`));}catch(error){flash(req,'err',error.message);}return managedBack(res,bot);
 });
 
 app.post('/managed-bots/:id/ban-sync/:sourceId/accept',requireLogin,managedActionRate,checkCsrf,async(req,res)=>{
@@ -2249,7 +2228,7 @@ app.get('/servers/new', requireLogin, (req, res) => {
   const requestedGame = gameDigMeta(String(req.query.game || '')) ? String(req.query.game) : '';
   const initial = { gameType: requestedType, queryConfig: requestedType === 'gamedig' && requestedGame ? { gameId: requestedGame, port: gameDigMeta(requestedGame)?.defaultPort || null, extraOptions: {} } : {} };
   const createTitle=requestedType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot erstellen','Create status bot');
-  render(req, res, createTitle, `<div class="pagehead"><div><span class="eyebrow">${requestedType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${requestedType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot erstellen','Create status bot')}</h1><p>${requestedType==='wardogs'?l(req,'Serverstatus, fester Killfeed pro Gameserver und globale Kill-Stats in einem Bot.','Server status, a fixed killfeed per game server and global kill stats in one bot.'):l(req,'Serverstatus oder reine Text-Rotation. Beides zählt als ein Status-Bot.','Server status or text-only rotation. Both count as one status bot.')}</p></div><a class="button ghost" href="/games">Games & FAQ</a></div>${serverForm({ server: initial, csrf: csrf(req), isAdmin: u.role === 'admin', lang: langOf(req) })}`);
+  render(req, res, createTitle, `<div class="pagehead"><div><span class="eyebrow">${requestedType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${requestedType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot erstellen','Create status bot')}</h1><p>${requestedType==='wardogs'?l(req,'Discord-Serverstatus für WARDOGS. Killfeed und globale Spieler-Stats gehören ausschließlich zum WARDOGS Status Bot unter Bot Services (ehemaliger Playtime Tracker).','Discord server status for WARDOGS. Killfeed and global player stats belong exclusively to the WARDOGS Status Bot under Bot Services (formerly Playtime Tracker).'):l(req,'Serverstatus oder reine Text-Rotation. Beides zählt als ein Status-Bot.','Server status or text-only rotation. Both count as one status bot.')}</p></div><a class="button ghost" href="/games">Games & FAQ</a></div>${serverForm({ server: initial, csrf: csrf(req), isAdmin: u.role === 'admin', lang: langOf(req) })}`);
 });
 
 app.post('/servers/new', requireLogin, checkCsrf, async (req, res) => {
@@ -2261,25 +2240,22 @@ app.post('/servers/new', requireLogin, checkCsrf, async (req, res) => {
     const bot = await validateBotToken(token);
     if (readDb().servers.some((x) => x.botId === bot.id)) throw new Error('Dieser Discord Bot wird bereits von einem anderen Status-Eintrag verwendet');
     const q = buildQuery(req);
-    const killFeedChannelId=q.gameType==='wardogs'?String(req.body.killFeedChannelId||'').trim():'';
-    if(killFeedChannelId&&!validSnowflake(killFeedChannelId))throw new Error(l(req,'Discord Killfeed Channel ID ist ungültig.','Discord killfeed channel ID is invalid.'));
     const entry = upsertServer({
       ownerDiscordId: u.discordId, name, botTokenEnc: encryptSecret(token), botId: bot.id,
       gameType: q.gameType, queryConfig: q.queryConfig, querySecretEnc: q.newSecret ? encryptSecret(q.newSecret) : null,
       allowPrivateTarget: u.role === 'admin' && req.body.allowPrivateTarget === '1',
       intervalSeconds: Math.min(3600, Math.max(10, Number(req.body.intervalSeconds) || 30)), switchSeconds: Math.min(3600, Math.max(5, Number(req.body.switchSeconds) || 15)),
       onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1',
-      killFeedChannelId, killFeedTokenEnc:'', killFeedConfiguredAt:null, killFeedPublicUrl:'', killFeedNeedsGameRestart:false, killFeedLastEventAt:null, killFeedMessageId:'', killFeedLastPublishedAt:null, killFeedEvents:[], killStats:null,
       enabled: req.body.enabled === '1', restartNonce: Date.now()
     });
-    rebalanceAssignments(); flash(req, 'ok', q.gameType==='wardogs'?l(req,`WARDOGS Status Bot „${entry.name}“ wurde erstellt. Konfiguriere jetzt einmal den Kill Feed, wenn du Killfeed/Stats nutzen willst.`,`WARDOGS Status Bot “${entry.name}” was created. Configure the Kill Feed once if you want killfeed/stats.`):`Status Bot „${entry.name}“ wurde erstellt und einem freien Status-Node zugewiesen.`); res.redirect(q.gameType==='wardogs'?`/servers/${encodeURIComponent(entry.id)}/edit`:'/');
+    rebalanceAssignments(); flash(req, 'ok', q.gameType==='wardogs'?l(req,`WARDOGS Status Bot „${entry.name}“ wurde erstellt.`,`WARDOGS Status Bot “${entry.name}” was created.`):`Status Bot „${entry.name}“ wurde erstellt und einem freien Status-Node zugewiesen.`); res.redirect(q.gameType==='wardogs'?`/servers/${encodeURIComponent(entry.id)}/edit`:'/');
   } catch (error) { flash(req, /limit/i.test(String(error.message)) ? 'status-limit' : 'err', error.message); res.redirect('/servers/new'); }
 });
 
 app.get('/servers/:id/edit', requireLogin, (req, res) => {
   const server = ownedServer(req, req.params.id); if (!server) return res.status(404).send('Server nicht gefunden');
   const title=server.gameType==='wardogs'?'WARDOGS Status Bot':l(req,'Status Bot bearbeiten','Edit status bot');
-  render(req, res, title, `<div class="pagehead"><div><span class="eyebrow">${server.gameType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${esc(server.name)}</h1><p>${l(req,'Leere Secret-Felder behalten vorhandene Werte.','Empty secret fields keep their current values.')}</p></div></div>${serverForm({ server, csrf: csrf(req), isEdit: true, isAdmin: isAdmin(req), lang: langOf(req) })}${statusKillfeedSetupPanel(req,server)}`);
+  render(req, res, title, `<div class="pagehead"><div><span class="eyebrow">${server.gameType==='wardogs'?'WARDOGS Status Bot':'Status Bot'}</span><h1>${esc(server.name)}</h1><p>${l(req,'Leere Secret-Felder behalten vorhandene Werte.','Empty secret fields keep their current values.')}</p></div></div>${serverForm({ server, csrf: csrf(req), isEdit: true, isAdmin: isAdmin(req), lang: langOf(req) })}`);
 });
 
 app.post('/servers/:id/edit', requireLogin, checkCsrf, async (req, res) => {
@@ -2287,39 +2263,17 @@ app.post('/servers/:id/edit', requireLogin, checkCsrf, async (req, res) => {
     const old = ownedServer(req, req.params.id); if (!old) return res.status(404).send('Server nicht gefunden');
     const name = String(req.body.name || '').trim(); if (!name) throw new Error('Name fehlt');
     const q = buildQuery(req, old);
-    const killFeedChannelId=q.gameType==='wardogs'?String(req.body.killFeedChannelId||'').trim():'';
-    if(killFeedChannelId&&!validSnowflake(killFeedChannelId))throw new Error(l(req,'Discord Killfeed Channel ID ist ungültig.','Discord killfeed channel ID is invalid.'));
     const patch = {
       id: old.id, name, gameType: q.gameType, queryConfig: q.queryConfig,
       allowPrivateTarget: isAdmin(req) ? req.body.allowPrivateTarget === '1' : Boolean(old.allowPrivateTarget),
       intervalSeconds: Math.min(3600, Math.max(10, Number(req.body.intervalSeconds) || 30)), switchSeconds: Math.min(3600, Math.max(5, Number(req.body.switchSeconds) || 15)),
-      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1', killFeedChannelId, enabled: req.body.enabled === '1'
+      onlineTemplates: parseTemplates(req.body.onlineTemplates, q.gameType), offlineTemplate: String(req.body.offlineTemplate || 'Server offline').slice(0, 128), wardogsSeedingEnabled: q.gameType === 'wardogs' && req.body.wardogsSeedingEnabled === '1', wardogsScoreEnabled: q.gameType === 'wardogs' && req.body.wardogsScoreEnabled === '1', enabled: req.body.enabled === '1'
     };
     if (req.body.botToken) { const bot = await validateBotToken(String(req.body.botToken).trim()); if (readDb().servers.some((x) => x.id !== old.id && x.botId === bot.id)) throw new Error('Dieser Discord Bot wird bereits von einem anderen Status-Eintrag verwendet'); patch.botTokenEnc = encryptSecret(String(req.body.botToken).trim()); patch.botId = bot.id; }
     if (q.newSecret) patch.querySecretEnc = encryptSecret(q.newSecret);
     else if (q.clearSecret) patch.querySecretEnc = null;
     const entry = upsertServer({ ...patch, restartNonce: Date.now() }); rebalanceAssignments(); flash(req, 'ok', l(req,'Gespeichert und Neustart ausgelöst. Der Status-Node übernimmt die Änderung.','Saved and restart triggered. The status node will apply the change.')); res.redirect(entry.gameType==='wardogs'?`/servers/${encodeURIComponent(entry.id)}/edit`:'/');
   } catch (error) { flash(req, 'err', error.message); res.redirect(`/servers/${encodeURIComponent(req.params.id)}/edit`); }
-});
-
-app.post('/servers/:id/killfeed/configure', requireLogin, checkCsrf, async (req,res)=>{
-  const server=ownedServer(req,req.params.id); if(!server)return res.status(404).send('Nicht gefunden');
-  try{
-    if(server.gameType!=='wardogs')throw new Error(l(req,'Killfeed ist nur für WARDOGS Status Bots verfügbar.','Killfeed is only available for WARDOGS Status Bots.'));
-    await configureWardogsStatusKillFeed(server,baseUrl);
-    flash(req,'ok',l(req,'WARDOGS Kill Feed wurde konfiguriert. Starte den Gameserver jetzt einmal neu; danach werden Kills dauerhaft erfasst.','WARDOGS Kill Feed was configured. Restart the game server once; kills will then be tracked persistently.'));
-  }catch(error){flash(req,'err',error.message);}
-  res.redirect(`/servers/${encodeURIComponent(server.id)}/edit`);
-});
-app.get('/servers/:id/stats', requireLogin, (req,res)=>{
-  const server=ownedServer(req,req.params.id); if(!server)return res.status(404).send('Nicht gefunden');
-  if(server.gameType!=='wardogs')return res.status(400).send('WARDOGS only');
-  const servers=ownerWardogsStatusServers(server); const snapshot=aggregateKillStatsServers(servers); const q=String(req.query.q||'').trim(); const matches=q?searchKillStatsSnapshot(snapshot,q):[]; const recent=statusServerKillFeed(server);
-  const topRows=snapshot.top25.map((p,i)=>`<tr><td>${i+1}</td><td><strong>${esc(p.name||p.steamId)}</strong><div class="muted small">${esc(p.steamId)}</div></td><td>${esc(p.kills)}</td><td>${esc(p.deaths)}</td><td>${esc(Number(p.kd||0).toFixed(2))}</td><td>${esc(p.headshots)}</td><td>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</td></tr>`).join('');
-  const searchCards=matches.map((p)=>{const causes=(p.topCauses||[]).slice(0,5).map(([cause,count])=>`${prettyCause(cause)}: ${count}`).join(' · ')||'—';return `<article class="panel"><div class="row between"><div><h2>${esc(p.name||p.steamId)}</h2><div class="muted small">${esc(p.steamId)}</div></div><span class="badge neutral">K/D ${esc(Number(p.kd||0).toFixed(2))}</span></div><dl><div><dt>Kills</dt><dd>${esc(p.kills)}</dd></div><div><dt>${l(req,'Tode','Deaths')}</dt><dd>${esc(p.deaths)}</dd></div><div><dt>Headshots</dt><dd>${esc(p.headshots)}</dd></div><div><dt>${l(req,'Längster Kill','Longest kill')}</dt><dd>${esc(Number(p.longestKillMeters||0).toFixed(1))} m</dd></div></dl><p class="muted small">${esc(causes)}</p></article>`;}).join('');
-  const recentRows=recent.map((e)=>{const flags=[e.headshot?'Headshot':'',e.penetration?'Penetration':'',e.ricochet?'Ricochet':'',e.melee?'Melee':'',e.roadKill?'Roadkill':'',e.vehicleExplosion?'Vehicle':'',e.suicide?'Suicide':''].filter(Boolean).join(', ')||'—';return `<tr><td>${e.receivedAt?esc(new Date(e.receivedAt).toLocaleString(localeCode(langOf(req)))):'—'}</td><td><strong>${esc(e.killerName||e.killerSteamId||'Environment')}</strong><div class="muted small">${esc(e.killerSteamId||'')}</div></td><td><strong>${esc(e.victimName||e.victimSteamId)}</strong><div class="muted small">${esc(e.victimSteamId)}</div></td><td>${esc(prettyCause(e.cause))}</td><td>${e.distanceMeters?`${esc(Number(e.distanceMeters).toFixed(1))} m`:'—'}</td><td>${esc(flags)}</td><td>${esc(e.mapName||'—')}</td></tr>`;}).join('');
-  const body=`<div class="pagehead"><div><span class="eyebrow">WARDOGS Status Bot</span><h1>${l(req,'Killfeed & globale Spieler-Stats','Killfeed & global player stats')}</h1><p>${l(req,`Stats werden über ${servers.length} WARDOGS Server dieses Accounts zusammengezählt. Der Killfeed unten gehört nur zu „${server.name}“.`,`Stats are aggregated across ${servers.length} WARDOGS servers on this account. The killfeed below belongs only to “${server.name}”.`)}</p></div><div class="actions wrap"><a class="button ghost" href="/servers/${esc(server.id)}/edit">${l(req,'Einstellungen','Settings')}</a><a class="button ghost" href="/">${l(req,'Zurück','Back')}</a></div></div><section class="managed-live-grid"><article class="panel"><span class="eyebrow">Events</span><strong>${esc(snapshot.totalEvents)}</strong></article><article class="panel"><span class="eyebrow">Players</span><strong>${esc(snapshot.players.length)}</strong></article><article class="panel"><span class="eyebrow">Servers</span><strong>${esc(servers.length)}</strong></article><article class="panel"><span class="eyebrow">Global #1</span><strong class="small">${snapshot.top25[0]?esc(`${snapshot.top25[0].name} · ${snapshot.top25[0].kills}`):'—'}</strong></article></section><section class="panel"><h2>${l(req,'Spieler suchen','Search player')}</h2><form method="get" action="/servers/${esc(server.id)}/stats" class="managed-add-row"><input name="q" value="${esc(q)}" maxlength="100" placeholder="${l(req,'Name oder SteamID64','Name or SteamID64')}"><button class="button primary">${l(req,'Suchen','Search')}</button></form></section>${q?`<section class="grid">${searchCards||`<div class="empty panel">${l(req,'Kein Spieler gefunden.','No player found.')}</div>`}</section>`:''}<section class="panel tablewrap"><h2>${l(req,'Globales Top-25 Kill Leaderboard','Global Top-25 kill leaderboard')}</h2><table><thead><tr><th>#</th><th>Player</th><th>Kills</th><th>${l(req,'Tode','Deaths')}</th><th>K/D</th><th>Headshots</th><th>${l(req,'Längster Kill','Longest kill')}</th></tr></thead><tbody>${topRows||`<tr><td colspan="7">${l(req,'Noch keine Kill-Stats erfasst.','No kill stats tracked yet.')}</td></tr>`}</tbody></table></section><section class="panel tablewrap"><h2>${l(req,'Letzte 150 Kills dieses Servers','Latest 150 kills on this server')}</h2><table><thead><tr><th>${l(req,'Zeit','Time')}</th><th>Killer</th><th>Victim</th><th>${l(req,'Waffe/Ursache','Weapon/cause')}</th><th>${l(req,'Distanz','Distance')}</th><th>Tags</th><th>Map</th></tr></thead><tbody>${recentRows||`<tr><td colspan="7">${l(req,'Noch keine Kills erfasst.','No kills tracked yet.')}</td></tr>`}</tbody></table></section>`;
-  render(req,res,'WARDOGS Status Bot · Stats',body);
 });
 
 app.post('/servers/:id/test', requireLogin, checkCsrf, async (req, res) => {
