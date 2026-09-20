@@ -91,7 +91,12 @@ function clearRecovery(id) {
 }
 
 function nowIso() { return new Date().toISOString(); }
-function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, ''); }
+function baseUrl(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
+  return raw.replace(/\/+$/, '');
+}
 function accessActive(bot) {
   if (bot?.adminGrant) return true;
   const until = Date.parse(bot?.accessUntil || '');
@@ -209,7 +214,7 @@ export function managedSteamRuleStatus(bot) {
   return { needsSteam: managedRulesNeedSteam(rules), apiKeyAvailable: steamApiKeyAvailable(bot) };
 }
 
-async function wardogsRequestDirect(bot, pathname, { method = 'GET', body } = {}) {
+async function wardogsRequestDirect(bot, pathname, { method = 'GET', body, timeoutMs = 8000 } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
   if (!root) throw new Error('WARDOGS base URL is missing');
   let secret = '';
@@ -218,7 +223,7 @@ async function wardogsRequestDirect(bot, pathname, { method = 'GET', body } = {}
   const response = await safeHttpText(`${root}${pathname}`, {
     allowPrivate: Boolean(bot?.allowPrivateTarget), method,
     headers: { Accept: 'application/json', Authorization: `Bearer ${secret}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-    body: body === undefined ? undefined : JSON.stringify(body), timeoutMs: 8000, maxBytes: 1024 * 1024
+    body: body === undefined ? undefined : JSON.stringify(body), timeoutMs: Math.max(500, Math.min(15000, Number(timeoutMs) || 8000)), maxBytes: 1024 * 1024
   });
   if (response.status >= 300 && response.status < 400) throw new Error('WARDOGS API redirects are not allowed');
   const text = response.text;
@@ -1613,27 +1618,42 @@ export async function managedMapOptions(bot, map) {
 
 export async function managedDashboard(bot) {
   const requests = {
-    status: ['/v1/status'],
-    health: ['/v1/health'],
-    players: ['/v1/players'],
-    bans: ['/v1/bans'],
-    capabilities: ['/v1/capabilities'],
-    serverId: ['/v1/server-id'],
-    reserved: ['/v1/reserved-slots'],
-    rotation: ['/v1/rotation'],
-    maps: ['/v1/catalog/maps'],
-    lightings: ['/v1/catalog/lightings'],
-    experiences: ['/v1/catalog/experiences'],
-    audit: ['/v1/audit?limit=40']
+    status: '/v1/status',
+    health: '/v1/health',
+    players: '/v1/players',
+    bans: '/v1/bans',
+    capabilities: '/v1/capabilities',
+    serverId: '/v1/server-id',
+    reserved: '/v1/reserved-slots',
+    rotation: '/v1/rotation',
+    maps: '/v1/catalog/maps',
+    lightings: '/v1/catalog/lightings',
+    experiences: '/v1/catalog/experiences',
+    audit: '/v1/audit?limit=40'
   };
-  const keys = Object.keys(requests);
-  const settled = await Promise.allSettled(keys.map((key) => wardogsRequest(bot, requests[key][0])));
+  const entries = Object.entries(requests);
   const out = { errors: {} };
-  settled.forEach((result, index) => {
-    const key = keys[index];
-    if (result.status === 'fulfilled') out[key] = result.value;
-    else { out[key] = null; out.errors[key] = String(result.reason?.message || result.reason || 'Error'); }
-  });
+  let cursor = 0;
+
+  // Dashboard reads are GET-only. Running them through the normal per-server
+  // request lane made a server switch wait for every endpoint one after another
+  // (and also behind background polling). Use a small, bounded read pool instead:
+  // actions/writes stay serialized, while the web dashboard can load in parallel.
+  const worker = async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= entries.length) return;
+      const [key, pathname] = entries[index];
+      try {
+        const critical = key === 'status' || key === 'players' || key === 'bans';
+        out[key] = await wardogsRequestDirect(bot, pathname, { timeoutMs: critical ? 4000 : 2500 });
+      } catch (error) {
+        out[key] = null;
+        out.errors[key] = String(error?.message || error || 'Error');
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => worker()));
   return out;
 }
 

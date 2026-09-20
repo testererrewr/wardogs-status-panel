@@ -12,3 +12,10 @@ test('management bot keeps multiple WARDOGS servers with separate Discord channe
   assert.equal(managedServerContext(bot,'eu2').wardogsBaseUrl,'http://eu2:8080');
   assert.equal(managedServerByChannel(bot,'42345678901234567')._managedServerId,'eu2');
 });
+
+
+test('legacy management server URLs without scheme are normalized to http', () => {
+  const bot={id:'bot2',managedServers:[{id:'legacy',label:'Legacy',baseUrl:'127.0.0.1:8080',secretEnc:'x'}]};
+  assert.equal(normalizeManagedServers(bot)[0].baseUrl,'http://127.0.0.1:8080');
+  assert.equal(managedServerContext(bot,'legacy').wardogsBaseUrl,'http://127.0.0.1:8080');
+});

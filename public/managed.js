@@ -394,3 +394,30 @@
   next?.addEventListener('click', () => { if (page < pages - 1) load(page + 1); });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !modal.hidden) close(); });
 })();
+
+(() => {
+  const lists = document.querySelectorAll('[data-managed-player-list]');
+  if (!lists.length) return;
+  for (const list of lists) {
+    const input = list.querySelector('[data-managed-player-search]');
+    const count = list.querySelector('[data-managed-player-visible]');
+    const rows = [...list.querySelectorAll('[data-managed-player-row]')];
+    const empty = list.querySelector('[data-managed-player-empty]');
+    if (!input || !rows.length) continue;
+    const normalize = (value) => String(value || '').trim().toLocaleLowerCase();
+    const filter = () => {
+      const query = normalize(input.value);
+      let visible = 0;
+      for (const row of rows) {
+        const haystack = normalize(row.dataset.playerSearch || row.textContent || '');
+        const show = !query || haystack.includes(query);
+        row.hidden = !show;
+        if (show) visible += 1;
+      }
+      if (count) count.textContent = String(visible);
+      if (empty) empty.hidden = visible !== 0;
+    };
+    input.addEventListener('input', filter);
+    input.addEventListener('search', filter);
+  }
+})();

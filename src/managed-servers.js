@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 
 const snowflake = (value) => /^\d{17,20}$/.test(String(value || '').trim()) ? String(value).trim() : '';
-const cleanUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+const cleanUrl = (value) => {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
+  return raw.replace(/\/+$/, '');
+};
 
 export function normalizeManagedServers(bot) {
   const raw = Array.isArray(bot?.managedServers) ? bot.managedServers : [];

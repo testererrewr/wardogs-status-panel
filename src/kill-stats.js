@@ -238,7 +238,31 @@ function feedLine(event) {
   return `${killer} → **${victim}** · ${cause || 'Unknown'}${distance}${flags ? ` · ${flags}` : ''}`;
 }
 export function prettyCause(value) {
-  return String(value || '').replace(/^Id\.Item\./i, '').replace(/^Id\./i, '').replace(/[._]+/g, ' ').trim() || 'Unknown';
+  let text = String(value || '').trim();
+  if (!text) return 'Unknown';
+  text = text
+    .replace(/^Id\.Item\./i, '')
+    .replace(/^Id\./i, '')
+    .replace(/^(?:BP|DA|WBP)[._-]+/i, '')
+    .replace(/_C$/i, '')
+    .replace(/[._-]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const aliases = [
+    [/^vehicle variant air rota(?:tor)?$/i, 'Aircraft rotor'],
+    [/^vehicle.*air.*rota(?:tor)?$/i, 'Aircraft rotor'],
+    [/^vehicle weapon extension$/i, 'Vehicle weapon'],
+    [/^vehicle.*weapon.*extension$/i, 'Vehicle weapon'],
+    [/^weapon extension$/i, 'Vehicle weapon'],
+    [/^vehicle variant air$/i, 'Aircraft'],
+    [/^vehicle variant ground$/i, 'Vehicle'],
+    [/^vehicle collision$/i, 'Vehicle collision'],
+    [/^road kill$/i, 'Roadkill'],
+    [/^falling$/i, 'Falling']
+  ];
+  for (const [pattern, label] of aliases) if (pattern.test(text)) return label;
+  return text || 'Unknown';
 }
 function playerEmbed(player) {
   const causes = (player.topCauses || Object.entries(player.causes || {}).sort((a,b)=>b[1]-a[1]).slice(0,5)).map(([cause,count]) => `${prettyCause(cause)}: ${count}`).join('\n') || '—';

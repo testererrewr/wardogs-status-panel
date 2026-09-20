@@ -27,3 +27,18 @@ test('management bot token is not described as optional/top-25 token', () => {
   assert.equal(managedForm.includes('Pflicht für Discord Alerts und Management Panel'), true);
   assert.equal(playtimeForm.includes('Pflicht für Discord Killfeed, Spielersuche und Top 25'), true);
 });
+
+
+test('status bot killfeed is compact and player search can disambiguate matches', () => {
+  const tracker = fs.readFileSync(new URL('../src/playtime-tracker.js', import.meta.url), 'utf8');
+  assert.equal(tracker.includes("name: 'Server events'"), false);
+  assert.equal(tracker.includes('StringSelectMenuBuilder'), true);
+  assert.equal(tracker.includes('wdstatus:pick:'), true);
+  assert.equal(tracker.includes('Mehrere Spieler passen zu'), true);
+});
+
+test('technical WARDOGS causes have readable aliases', () => {
+  const stats = fs.readFileSync(new URL('../src/kill-stats.js', import.meta.url), 'utf8');
+  assert.equal(stats.includes("'Aircraft rotor'"), true);
+  assert.equal(stats.includes("'Vehicle weapon'"), true);
+});

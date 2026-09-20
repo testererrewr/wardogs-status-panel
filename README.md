@@ -485,3 +485,16 @@ WARDOGS supports live faction scores from `/v1/status`. Available status tags: `
 ## WARDOGS Management Bot multi-server / chat history (v3.12.43)
 
 A single Management Bot can manage up to 12 WARDOGS servers. Each server has separate Discord alert and management-panel channels. Chat History is stored per server and displayed in a 50-message paginated popup. Outgoing panel messages are always recorded; incoming player chat is recorded when WARDOGS emits matching Server Feed events.
+
+
+## Status Bot killfeed/search cleanup (v3.12.44)
+
+- Discord Killfeed des WARDOGS Status Bots wurde kompakter aufgebaut; der technische Block `Server events` wurde entfernt.
+- Technische WARDOGS-Ursachennamen werden fuer die Anzeige lesbarer normalisiert (z. B. Aircraft rotor / Vehicle weapon).
+- Discord-Spielersuche zeigt bei mehreren Treffern ein Auswahlmenue statt automatisch den ersten Spieler zu nehmen.
+- Alte gespeicherte WARDOGS-Ziele ohne `http://`/`https://` werden zur Laufzeit als `http://` normalisiert, damit Legacy-Konfigurationen nicht wiederholt `Ungueltige URL` erzeugen.
+
+## Management live player search & faster server switching (v3.12.45)
+
+- The Management Bot live player table can be filtered instantly by player name or SteamID64 without another WARDOGS request.
+- Switching between managed game servers no longer waits for the full dashboard endpoint set sequentially. Read-only dashboard calls use bounded parallelism; moderation and configuration writes remain serialized.

@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
@@ -20,7 +20,12 @@ function accessActive(bot) {
   const until = Date.parse(bot.accessUntil || '');
   return Number.isFinite(until) && until > Date.now();
 }
-function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, ''); }
+function baseUrl(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
+  return raw.replace(/\/+$/, '');
+}
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
 function setRuntime(id, patch) { runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: nowIso() }); }
 export function playtimeBotRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
@@ -274,15 +279,16 @@ async function publishLeaderboard(bot, state) {
 }
 
 function killFlagText(event) {
-  return [event?.headshot ? '🎯' : '', event?.penetration ? '🧱' : '', event?.ricochet ? '↪' : '', event?.melee ? '🔪' : '', event?.roadKill ? '🚙' : '', event?.vehicleExplosion ? '💥' : ''].filter(Boolean).join('');
+  return [event?.penetration ? '🧱' : '', event?.ricochet ? '↪️' : ''].filter(Boolean).join(' ');
 }
 function killFeedLine(event) {
-  const killer = event?.suicide ? '☠️ Suicide' : event?.killerSteamId ? String(event.killerName || event.killerSteamId).slice(0, 28) : '🌍 Environment';
-  const victim = String(event?.victimName || event?.victimSteamId || 'Unknown').slice(0, 28);
-  const cause = prettyCause(event?.cause).slice(0, 24);
-  const distance = Number(event?.distanceMeters || 0) > 0 ? ` · ${Number(event.distanceMeters).toFixed(Number(event.distanceMeters) >= 100 ? 0 : 1)}m` : '';
+  const killer = event?.suicide ? 'Suicide' : event?.killerSteamId ? String(event.killerName || event.killerSteamId).slice(0, 26) : 'Environment';
+  const victim = String(event?.victimName || event?.victimSteamId || 'Unknown').slice(0, 26);
+  const cause = prettyCause(event?.cause).replace(/`/g, '').slice(0, 30) || 'Unknown';
+  const distance = Number(event?.distanceMeters || 0) > 0 ? ` · **${Number(event.distanceMeters).toFixed(Number(event.distanceMeters) >= 100 ? 0 : 1)} m**` : '';
   const flags = killFlagText(event);
-  return `${killer} → **${victim}** · ${cause || 'Unknown'}${distance}${flags ? ` · ${flags}` : ''}`;
+  const lead = event?.suicide ? '☠️' : event?.headshot ? '🎯' : event?.vehicleExplosion ? '💥' : event?.roadKill ? '🚙' : event?.melee ? '🔪' : event?.falling ? '⬇️' : '⚔️';
+  return `${lead} **${killer}** → **${victim}** · \`${cause}\`${distance}${flags ? ` · ${flags}` : ''}`;
 }
 function killStatsPlayerEmbed(player) {
   const causes = (player?.topCauses || Object.entries(player?.causes || {}).sort((a,b)=>b[1]-a[1]).slice(0,5)).map(([cause,count]) => `${prettyCause(cause)}: ${count}`).join('\n') || '—';
@@ -298,23 +304,33 @@ function killStatsPlayerEmbed(player) {
 function killfeedPayload(bot, server) {
   const snapshot = killStatsSnapshotFromStats(bot?.killStats);
   const recent = (Array.isArray(server?.killFeedEvents) ? server.killFeedEvents : []).slice(-15).reverse();
-  const lines = recent.length ? recent.map(killFeedLine).join('\n') : 'No kills tracked yet. Configure the WARDOGS Server Feed and restart this game server once.';
-  const embed = new EmbedBuilder().setTitle(`WARDOGS · ${String(server?.label || 'Server').slice(0, 80)} · Live Killfeed`).setDescription(lines.slice(0, 4000))
-    .addFields(
-      { name: 'Server events', value: String((Array.isArray(server?.killFeedEvents) ? server.killFeedEvents : []).length), inline: true },
-      { name: 'Global tracked players', value: String(snapshot.players.length), inline: true },
-      { name: 'Global #1', value: snapshot.top25[0] ? `${String(snapshot.top25[0].name).slice(0, 35)} · ${snapshot.top25[0].kills} kills` : '—', inline: true }
-    ).setFooter({ text: 'Fixed message · latest 15 kills on this server · global player stats' }).setTimestamp(new Date());
+  const lines = recent.length ? recent.map(killFeedLine).join('\n') : 'Noch keine Kills erfasst. WARDOGS Server Feed konfigurieren und den Gameserver einmal neu starten.';
+  const top = snapshot.top25[0];
+  const footer = `Letzte 15 Kills · ${snapshot.players.length} Spieler global${top ? ` · #1 ${String(top.name || top.steamId).slice(0, 28)} (${top.kills})` : ''}`;
+  const embed = new EmbedBuilder()
+    .setTitle(`⚔️ ${String(server?.label || 'WARDOGS').slice(0, 80)} · Killfeed`)
+    .setDescription(lines.slice(0, 4000))
+    .setFooter({ text: footer.slice(0, 2048) })
+    .setTimestamp(new Date());
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Search player').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`wdstatus:top:${bot.id}`).setLabel('Top kills').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`wdstatus:top:${bot.id}`).setLabel('Top Kills').setStyle(ButtonStyle.Secondary)
   );
   return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
 }
 function killStatsSearchModal(botId) {
-  return new ModalBuilder().setCustomId(`wdstatus:searchmodal:${botId}`).setTitle('Search global player stats').addComponents(
-    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('query').setLabel('Player name, alias or SteamID64').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100))
+  return new ModalBuilder().setCustomId(`wdstatus:searchmodal:${botId}`).setTitle('Spieler suchen').addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('query').setLabel('Name, Alias oder SteamID64').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100))
   );
+}
+function playerPickRow(botId, matches) {
+  const options = matches.slice(0, 25).map((player) => ({
+    label: String(player?.name || player?.steamId || 'Unbekannt').slice(0, 100),
+    description: `${player?.kills || 0} Kills · ${player?.deaths || 0} Tode · ${player?.steamId || '—'}`.slice(0, 100),
+    value: String(player?.steamId || '').slice(0, 100)
+  })).filter((row) => row.value);
+  const menu = new StringSelectMenuBuilder().setCustomId(`wdstatus:pick:${botId}`).setPlaceholder('Spieler auswählen…').addOptions(options);
+  return new ActionRowBuilder().addComponents(menu);
 }
 async function handleStatusInteraction(botId, interaction) {
   const bot = getManagedBot(botId); if (!bot) return;
@@ -322,16 +338,29 @@ async function handleStatusInteraction(botId, interaction) {
   if (id === `wdstatus:search:${botId}` && interaction.isButton()) return interaction.showModal(killStatsSearchModal(botId));
   if (id === `wdstatus:top:${botId}` && interaction.isButton()) {
     const top = killStatsSnapshotFromStats(bot.killStats).top25.slice(0, 10);
-    const text = top.length ? top.map((p,i) => `**${i+1}.** ${String(p.name).slice(0,40)} — **${p.kills}** kills · ${p.deaths} deaths · K/D ${Number(p.kd||0).toFixed(2)}`).join('\n') : 'No kill stats tracked yet.';
-    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle('Global all-time · Top kills').setDescription(text.slice(0, 3900))], allowedMentions: { parse: [] } });
+    const text = top.length ? top.map((p,i) => `**${i+1}.** ${String(p.name).slice(0,40)} — **${p.kills}** Kills · ${p.deaths} Tode · K/D ${Number(p.kd||0).toFixed(2)}`).join('\n') : 'Noch keine Kill-Stats erfasst.';
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle('Global · Top Kills').setDescription(text.slice(0, 3900))], allowedMentions: { parse: [] } });
   }
   if (id === `wdstatus:searchmodal:${botId}` && interaction.isModalSubmit()) {
     const query = interaction.fields.getTextInputValue('query');
-    const matches = searchKillStatsSnapshot(killStatsSnapshotFromStats(bot.killStats), query);
-    if (!matches.length) return interaction.reply({ ephemeral: true, content: `No tracked player found for \`${String(query).slice(0,80)}\`.` });
+    const snapshot = killStatsSnapshotFromStats(bot.killStats);
+    const matches = searchKillStatsSnapshot(snapshot, query);
+    if (!matches.length) return interaction.reply({ ephemeral: true, content: `Kein getrackter Spieler für \`${String(query).slice(0,80)}\` gefunden.` });
     const exact = normalizeSteamId64(query);
-    const player = exact ? matches.find((p) => p.steamId === exact) || matches[0] : matches[0];
-    return interaction.reply({ ephemeral: true, embeds: [killStatsPlayerEmbed(player)], allowedMentions: { parse: [] } });
+    const exactPlayer = exact ? matches.find((p) => p.steamId === exact) : null;
+    if (exactPlayer || matches.length === 1) return interaction.reply({ ephemeral: true, embeds: [killStatsPlayerEmbed(exactPlayer || matches[0])], allowedMentions: { parse: [] } });
+    return interaction.reply({
+      ephemeral: true,
+      content: `Mehrere Spieler passen zu **${String(query).replace(/[*_~|>]/g, '').slice(0, 80)}**. Bitte auswählen:`,
+      components: [playerPickRow(botId, matches)],
+      allowedMentions: { parse: [] }
+    });
+  }
+  if (id === `wdstatus:pick:${botId}` && interaction.isStringSelectMenu()) {
+    const steamId = normalizeSteamId64(interaction.values?.[0]);
+    const player = killStatsSnapshotFromStats(bot.killStats).players.find((row) => row.steamId === steamId);
+    if (!player) return interaction.update({ content: 'Spieler wurde nicht mehr in den gespeicherten Stats gefunden.', embeds: [], components: [] });
+    return interaction.update({ content: null, embeds: [killStatsPlayerEmbed(player)], components: [], allowedMentions: { parse: [] } });
   }
 }
 async function publishServerKillfeed(bot, state, server, force = false) {
