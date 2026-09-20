@@ -4,10 +4,12 @@
   if (!rules || !grants) return;
 
   const banTemplates = document.getElementById('managed-ban-templates');
+  const managedServers = document.getElementById('managed-server-list');
   const lang = rules.dataset.lang === 'en' ? 'en' : 'de';
   let ruleIndex = Number(rules.dataset.nextIndex || 0);
   let grantIndex = Number(grants.dataset.nextIndex || grants.children.length || 0);
   let banTemplateIndex = Number(banTemplates?.dataset.nextIndex || banTemplates?.children.length || 0);
+  let managedServerIndex = Number(managedServers?.dataset.nextIndex || managedServers?.children.length || 0);
 
   const t = {
     role: lang === 'en' ? 'Discord role' : 'Discord Rolle',
@@ -105,6 +107,23 @@
     </div>`;
   }
 
+  function managedServerTemplate(i) {
+    const id = (globalThis.crypto?.randomUUID?.() || `server-${Date.now()}-${i}`);
+    return `<div class="managed-config-block managed-server-row" data-managed-server-row>
+      <input type="hidden" name="managedServerPresent_${i}" value="1"><input type="hidden" name="managedServerId_${i}" value="${id}">
+      <div class="row between"><strong>${lang === 'en' ? 'Game server' : 'Gameserver'} ${i + 1}</strong><button class="button danger smallbtn" type="button" data-remove-managed-server>×</button></div>
+      <div class="formgrid compact">
+        <label>${lang === 'en' ? 'Server label' : 'Server-Name im Panel'}<input name="managedServerLabel_${i}" maxlength="80" value="Server ${i + 1}" placeholder="EU${i + 1}"></label>
+        <label>WARDOGS API / RCON URL<input name="managedServerUrl_${i}" required placeholder="http://server.example.com:7776"></label>
+        <label>WARDOGS RCON / Bearer Password<input name="managedServerSecret_${i}" type="password" autocomplete="new-password" required placeholder="${lang === 'en' ? 'Required' : 'Pflichtfeld'}"></label>
+        <label>Discord Alert Channel ID<input name="managedServerAlertChannelId_${i}" inputmode="numeric" required placeholder="123456789012345678"></label>
+        <label class="check"><input type="checkbox" name="managedServerControlPanelEnabled_${i}" value="1"> <strong>${lang === 'en' ? 'Discord management panel for this server' : 'Discord Management Panel für diesen Server'}</strong></label>
+        <label>Discord Management Panel Channel ID<input name="managedServerControlPanelChannelId_${i}" inputmode="numeric" placeholder="123456789012345678"></label>
+      </div>
+      <p class="muted small">${lang === 'en' ? 'Each game server uses its own alert and management-panel channels.' : 'Jeder Gameserver verwendet eigene Alert- und Management-Panel-Channels.'}</p>
+    </div>`;
+  }
+
   function syncRuleAction(row) {
     const action = row?.querySelector('[data-rule-action]');
     const duration = row?.querySelector('[data-rule-duration]');
@@ -151,12 +170,21 @@
     syncDuration(banTemplates.lastElementChild?.querySelector('[data-ban-duration]'));
   });
 
+  document.getElementById('add-managed-server')?.addEventListener('click', () => {
+    if (!managedServers || managedServerIndex >= 12) return;
+    managedServers.insertAdjacentHTML('beforeend', managedServerTemplate(managedServerIndex++));
+  });
+
   document.addEventListener('click', (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (target.matches('[data-remove-rule]')) target.closest('[data-rule-row]')?.remove();
     if (target.matches('[data-remove-grant]')) target.closest('[data-grant-row]')?.remove();
     if (target.matches('[data-remove-ban-template]')) target.closest('[data-ban-template-row]')?.remove();
+    if (target.matches('[data-remove-managed-server]')) {
+      const rows = managedServers?.querySelectorAll('[data-managed-server-row]') || [];
+      if (rows.length > 1) target.closest('[data-managed-server-row]')?.remove();
+    }
   });
 
   document.addEventListener('change', (event) => {
@@ -313,4 +341,56 @@
   });
   form?.addEventListener('submit', () => { if (submit) { submit.disabled = true; submit.textContent = 'BAN…'; } });
   syncDuration(); syncCount();
+})();
+
+
+(() => {
+  const modal = document.querySelector('[data-managed-chat-modal]');
+  const open = document.querySelector('[data-managed-chat-open]');
+  if (!modal || !open) return;
+  const body = modal.querySelector('[data-managed-chat-body]');
+  const summary = modal.querySelector('[data-managed-chat-summary]');
+  const pageLabel = modal.querySelector('[data-managed-chat-page]');
+  const prev = modal.querySelector('[data-managed-chat-prev]');
+  const next = modal.querySelector('[data-managed-chat-next]');
+  let page = 0, pages = 1;
+  const close = () => { modal.hidden = true; document.body.classList.remove('modal-open'); };
+  const safe = (value) => String(value ?? '');
+  const fmt = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return safe(iso); } };
+  const render = (data) => {
+    page = Number(data.page || 0); pages = Math.max(1, Number(data.pages || 1));
+    if (summary) summary.textContent = `${Number(data.total || 0)} ${document.documentElement.lang?.startsWith('en') ? 'stored messages' : 'gespeicherte Nachrichten'} · 50 / ${document.documentElement.lang?.startsWith('en') ? 'page' : 'Seite'}`;
+    if (pageLabel) pageLabel.textContent = `${page + 1} / ${pages}`;
+    if (prev) prev.disabled = page <= 0;
+    if (next) next.disabled = page >= pages - 1;
+    if (!body) return;
+    body.innerHTML = '';
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    if (!rows.length) {
+      const tr = document.createElement('tr'), td = document.createElement('td'); td.colSpan = 5; td.textContent = document.documentElement.lang?.startsWith('en') ? 'No stored messages yet.' : 'Noch keine gespeicherten Nachrichten.'; tr.append(td); body.append(tr); return;
+    }
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      const values = [fmt(row.at), row.direction === 'out' ? '→ OUT' : '← IN', row.playerName || row.actor || row.steamId || '—', [row.channel,row.kind].filter(Boolean).join(' · ') || '—', row.message || ''];
+      for (const value of values) { const td = document.createElement('td'); td.textContent = safe(value); tr.append(td); }
+      body.append(tr);
+    }
+  };
+  const load = async (wanted = 0) => {
+    const base = open.dataset.chatUrl; if (!base) return;
+    if (body) body.innerHTML = '<tr><td colspan="5">Loading…</td></tr>';
+    try {
+      const url = new URL(base, location.origin); url.searchParams.set('page', String(wanted));
+      const response = await fetch(url, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+      const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); render(data);
+    } catch (error) {
+      if (body) { body.innerHTML = ''; const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=5;td.textContent=String(error.message||error);tr.append(td);body.append(tr); }
+    }
+  };
+  open.addEventListener('click', () => { modal.hidden = false; document.body.classList.add('modal-open'); load(0); });
+  modal.querySelectorAll('[data-managed-chat-close]').forEach((button) => button.addEventListener('click', close));
+  modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
+  prev?.addEventListener('click', () => { if (page > 0) load(page - 1); });
+  next?.addEventListener('click', () => { if (page < pages - 1) load(page + 1); });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !modal.hidden) close(); });
 })();

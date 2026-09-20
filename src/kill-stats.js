@@ -7,6 +7,8 @@ import { decryptSecret, encryptSecret } from './crypto.js';
 import { readDb, getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
+import { normalizeManagedServers, managedServerContext, managedServerPatch } from './managed-servers.js';
+import { appendManagedChat, extractChatEvents } from './managed-chat.js';
 
 export const KILL_STATS_SERVICE_ID = 'wardogs-kill-stats';
 const PLAYTIME_STATUS_SERVICE_ID = 'wardogs-playtime-tracker';
@@ -420,14 +422,33 @@ export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl 
   return{bot:fresh,server:next[index],origin,needsGameRestart:true,result};
 }
 
+export async function configureWardogsManagementFeed(bot, serverId, publicUrl = process.env.PUBLIC_URL || '') {
+  if(bot?.serviceId!=='wardogs-warning-bot')throw new Error('WARDOGS Management Bot required');
+  const servers=normalizeManagedServers(bot);const index=servers.findIndex((row)=>String(row.id)===String(serverId||''));
+  if(index<0)throw new Error('Managed WARDOGS server not found');
+  const server={...servers[index]},ctx=managedServerContext(bot,server);
+  const origin=new URL(String(publicUrl||'')).origin;
+  const root=baseUrl(server.baseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
+  const secret=decryptMaybe(server.secretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
+  let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
+  const {data:config}=await wardogsJson(ctx,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
+  const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
+  const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(bot?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
+  let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
+  const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true});
+  const primary=next[0]||server;
+  const fresh=upsertManagedBot({id:bot.id,managedServers:next,wardogsBaseUrl:primary.baseUrl,wardogsSecretEnc:primary.secretEnc,alertChannelId:primary.alertChannelId,controlPanelEnabled:primary.controlPanelEnabled,controlPanelChannelId:primary.controlPanelChannelId});
+  return{bot:fresh,server:next.find((row)=>row.id===server.id),origin,needsGameRestart:true,result};
+}
+
 function playtimeSourceForFeedToken(token) {
   const bots=(readDb().managedBots||[]).filter((bot)=>bot?.serviceId===PLAYTIME_STATUS_SERVICE_ID);
-  for(const bot of bots){
-    for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){
-      const candidate=decryptMaybe(server?.killFeedTokenEnc);
-      if(candidate&&secureEqual(candidate,token))return {bot,server};
-    }
-  }
+  for(const bot of bots){for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){const candidate=decryptMaybe(server?.killFeedTokenEnc);if(candidate&&secureEqual(candidate,token))return {bot,server};}}
+  return null;
+}
+function managementSourceForFeedToken(token) {
+  const bots=(readDb().managedBots||[]).filter((bot)=>bot?.serviceId==='wardogs-warning-bot');
+  for(const bot of bots){for(const server of normalizeManagedServers(bot)){const candidate=decryptMaybe(server?.killFeedTokenEnc);if(candidate&&secureEqual(candidate,token))return {bot,server};}}
   return null;
 }
 function botForFeedToken(token) {
@@ -436,11 +457,11 @@ function botForFeedToken(token) {
   return null;
 }
 function sourceTargetKey(source, kind) {
-  if(kind==='playtime')return targetKey(source?.server?.baseUrl);
+  if(kind==='playtime'||kind==='managementServer')return targetKey(source?.server?.baseUrl);
   return targetKey(source?.wardogsBaseUrl);
 }
 function sourceSecret(source, kind) {
-  if(kind==='playtime')return decryptMaybe(source?.server?.secretEnc);
+  if(kind==='playtime'||kind==='managementServer')return decryptMaybe(source?.server?.secretEnc);
   return decryptMaybe(source?.wardogsSecretEnc);
 }
 function matchesSourceTarget(source, sourceKind, target, targetKind) {
@@ -451,30 +472,27 @@ function matchesSourceTarget(source, sourceKind, target, targetKind) {
 }
 function feedTargets(source, sourceKind) {
   const db=readDb(); const out=[];
-  // Killfeed/global stats live only in the managed WARDOGS Status Bot
-  // (service id wardogs-playtime-tracker). The Management Bot may still own
-  // a feed token for its separate 150-event moderation history, but classic
-  // free Status Bots never participate in killfeed/stat tracking.
-  if(sourceKind==='playtime') out.push({kind:'playtime',item:source.bot,serverId:source.server.id});
-  else if(sourceKind==='managed'&&source?.serviceId==='wardogs-warning-bot') out.push({kind:'managed',item:source});
-
+  if(sourceKind==='playtime')out.push({kind:'playtime',item:source.bot,serverId:source.server.id});
+  else if(sourceKind==='managementServer')out.push({kind:'managementServer',item:source.bot,serverId:source.server.id});
+  else if(sourceKind==='managed'&&source?.serviceId==='wardogs-warning-bot')out.push({kind:'managed',item:source});
   for(const bot of (db.managedBots||[])){
-    if(bot?.serviceId==='wardogs-warning-bot'){
-      if(sourceKind==='managed'&&String(source?.id||'')===String(bot.id))continue;
-      if(!matchesSourceTarget(source,sourceKind,bot,'managed')||!accessActive(bot)||!bot.enabled)continue;
-      out.push({kind:'managed',item:bot});
-      continue;
+    if(bot?.serviceId==='wardogs-warning-bot'&&accessActive(bot)&&bot.enabled){
+      for(const server of normalizeManagedServers(bot)){
+        if(sourceKind==='managementServer'&&String(source?.bot?.id||'')===String(bot.id)&&String(source?.server?.id||'')===String(server.id))continue;
+        const target={bot,server};if(!matchesSourceTarget(source,sourceKind,target,'managementServer'))continue;
+        out.push({kind:'managementServer',item:bot,serverId:server.id});
+      }
     }
     if(bot?.serviceId!==PLAYTIME_STATUS_SERVICE_ID||!accessActive(bot)||!bot.enabled)continue;
     for(const server of (Array.isArray(bot.playtimeServers)?bot.playtimeServers:[])){
       if(sourceKind==='playtime'&&String(source?.bot?.id||'')===String(bot.id)&&String(source?.server?.id||'')===String(server?.id||''))continue;
-      const target={bot,server};
-      if(!matchesSourceTarget(source,sourceKind,target,'playtime'))continue;
+      const target={bot,server};if(!matchesSourceTarget(source,sourceKind,target,'playtime'))continue;
       out.push({kind:'playtime',item:bot,serverId:server.id});
     }
   }
   return out;
 }
+
 function updatePlaytimeFeedTarget(bot, serverId, events) {
   let stats=emptyStats(bot.killStats);let changed=0;
   for(const event of events){const applied=applyEventToStats(stats,event);stats=applied.stats;if(!applied.duplicate)changed+=1;}
@@ -487,6 +505,14 @@ function updatePlaytimeFeedTarget(bot, serverId, events) {
   });
   if(changed||events.length){upsertManagedBot({id:bot.id,killStats:stats,playtimeServers:servers,killFeedLastEventAt:events.length?nowIso():bot.killFeedLastEventAt});}
   return changed;
+}
+function updateManagementServerFeedTarget(bot, serverId, events) {
+  const server=normalizeManagedServers(bot).find((row)=>String(row.id)===String(serverId||''));if(!server)return 0;
+  const existing=(Array.isArray(server.killFeedEvents)?server.killFeedEvents:[]).map(normalizeStoredEvent).filter(Boolean);
+  const ids=new Set(existing.map((event)=>event.id).filter(Boolean));const freshEvents=events.filter((event)=>!event.id||!ids.has(event.id));
+  if(!freshEvents.length)return 0;
+  const next=managedServerPatch(bot,server.id,{killFeedEvents:[...existing,...freshEvents].slice(-150),killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
+  upsertManagedBot({id:bot.id,managedServers:next});return freshEvents.length;
 }
 function updateManagedFeedTarget(bot, events) {
   if(bot.serviceId==='wardogs-warning-bot'){
@@ -505,19 +531,25 @@ function updateManagedFeedTarget(bot, events) {
 }
 export async function ingestWardogsKillFeed(token, payload) {
   const playtimeSource=playtimeSourceForFeedToken(token);
-  const managedSource=playtimeSource?null:botForFeedToken(token);
-  const source=playtimeSource||managedSource; const sourceKind=playtimeSource?'playtime':managedSource?'managed':'';
+  const managementServerSource=playtimeSource?null:managementSourceForFeedToken(token);
+  const managedSource=(playtimeSource||managementServerSource)?null:botForFeedToken(token);
+  const source=playtimeSource||managementServerSource||managedSource;
+  const sourceKind=playtimeSource?'playtime':managementServerSource?'managementServer':managedSource?'managed':'';
   if(!source)throw Object.assign(new Error('Invalid feed token'),{status:401});
-  const sourceServer=sourceKind==='playtime'?source.server:null;
-  const sourceBot=sourceKind==='playtime'?source.bot:source;
+  const sourceServer=(sourceKind==='playtime'||sourceKind==='managementServer')?source.server:null;
+  const sourceBot=(sourceKind==='playtime'||sourceKind==='managementServer')?source.bot:source;
   const enrichedPayload={...payload,serverId:String(sourceServer?.id||payload?.serverId||sourceBot?.id||''),serverName:String(payload?.serverName||sourceServer?.label||sourceBot?.name||'WARDOGS')};
   const rawEvents=Array.isArray(payload?.events)?payload.events.slice(0,100):[];
   const events=rawEvents.map((raw)=>incomingEvent(enrichedPayload,raw)).filter(Boolean);
-  const targets=feedTargets(source,sourceKind);let accepted=0;
+  const chats=extractChatEvents(enrichedPayload);
+  const targets=feedTargets(source,sourceKind);let accepted=0,chatAccepted=0;
   for(const target of targets){
     if(target.kind==='playtime')accepted+=updatePlaytimeFeedTarget(target.item,target.serverId,events);
-    else accepted+=updateManagedFeedTarget(target.item,events);
+    else if(target.kind==='managementServer'){
+      accepted+=updateManagementServerFeedTarget(target.item,target.serverId,events);
+      for(const chat of chats){try{appendManagedChat(target.item.id,target.serverId,chat);chatAccepted+=1;}catch{}}
+    }else accepted+=updateManagedFeedTarget(target.item,events);
   }
   if(events.length&&sourceKind==='managed')upsertManagedBot({id:source.id,killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});
-  return{events:events.length,accepted,targets:targets.length};
+  return{events:events.length,chats:chats.length,chatAccepted,accepted,targets:targets.length};
 }

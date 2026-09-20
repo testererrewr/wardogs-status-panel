@@ -105,9 +105,9 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Management Bot',
     descriptionDe: 'Managed WARDOGS Bot für Spieler-Überwachung und Server-Management. Er überwacht Spieler-Joins und sendet Discord-Warnungen, wenn deine Erkennungsregeln einen beitretenden Spieler als auffällig markieren.',
     descriptionEn: 'Managed WARDOGS bot for player monitoring and server management. It monitors player joins and sends Discord alerts when your detection rules flag a joining player as suspicious.',
-    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Moderations-Killfeed mit den letzten 150 Kills/Toden inkl. Distanz & Kill-Tags', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion', 'Dynamic Server Name: Scores, Seeding & 2-Name-Rotation'],
+    featuresDe: ['Join-Überwachung', 'Live-Spielerliste & Spieleraktionen', 'Server-Announcements (manuell & automatisch)', 'Banliste & Unban', 'Match-, Map- & Lighting-Controls', 'Serverstatus, Health, Join Code, Reserved Slots, Rotation & Audit', 'Steam-Risikoregeln: VAC-/Game-Bans, Spielzeit, Kontoalter & mehr', 'Optionaler Auto-Ban (standardmäßig AUS)', 'Permanentes Discord Management Panel', 'Granulare Discord Rollen-/Benutzerrechte', 'Discord Alert-Channel', 'Konfigurierbare Rollen-Pings', 'Join-Welcome-Whisper nach Spieler-Spawn', 'Temporäre Bans & Ban Templates', 'Discord-Link automatisch in Ban-Nachrichten', 'Detection Rules mit eigener Aktion', 'Moderations-Killfeed mit den letzten 150 Kills/Toden inkl. Distanz & Kill-Tags', 'Config Export / Import', 'Auto-Recovery', 'Whisper an ganze Fraktion', 'Dynamic Server Name: Scores, Seeding & 2-Name-Rotation', 'Mehrere WARDOGS Server pro Management Bot mit eigenem Discord Panel/Alert Channel', 'Persistente Chat-History je Server (wenn WARDOGS Chat-Events liefert)'],
     category: 'wardogs',
-    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Moderation killfeed with the latest 150 kills/deaths including distance & kill tags', 'Config export / import', 'Auto recovery', 'Whisper entire faction', 'Dynamic server name: scores, seeding & two-name rotation'],
+    featuresEn: ['Join monitoring', 'Live player list & player actions', 'Server announcements (manual & scheduled)', 'Ban list & unban', 'Match, map & lighting controls', 'Server status, health, join code, reserved slots, rotation & audit', 'Steam risk rules: VAC/game bans, playtime, account age & more', 'Optional auto-ban (OFF by default)', 'Persistent Discord management panel', 'Granular Discord role/user permissions', 'Discord alert channel', 'Configurable role mentions', 'Join welcome whisper after player spawn', 'Temporary bans & ban templates', 'Discord link appended to ban messages', 'Per-rule detection actions', 'Moderation killfeed with the latest 150 kills/deaths including distance & kill tags', 'Config export / import', 'Auto recovery', 'Whisper entire faction', 'Dynamic server name: scores, seeding & two-name rotation', 'Multiple WARDOGS servers per management bot with separate Discord panel/alert channels', 'Persistent per-server chat history (when WARDOGS emits chat events)'],
     priceLabel: '€3.99 / month',
     monthlyAmount: '3.99',
     currency: 'EUR',
@@ -146,7 +146,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 39, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 40, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -163,7 +163,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 39;
+  parsed.version = 40;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -573,6 +573,31 @@ function migrate(parsed) {
       bot.dynamicNameOriginalName = String(bot.dynamicNameOriginalName || '');
     }
   }
+  if (previousVersion < 40) {
+    // v3.12.43: one WARDOGS Management Bot may manage up to 12 game servers.
+    // Existing single-server installations are migrated into managedServers[0].
+    const defaults = defaultBotServices();
+    const service = defaults.find((x) => x.id === 'wardogs-warning-bot');
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
+    if (service && serviceIndex >= 0) parsed.botServices[serviceIndex] = { ...parsed.botServices[serviceIndex], featuresDe: service.featuresDe, featuresEn: service.featuresEn, updatedAt: migrationNow };
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || '') !== 'wardogs-warning-bot') continue;
+      if (!Array.isArray(bot.managedServers) || !bot.managedServers.length) {
+        const url = String(bot.wardogsBaseUrl || '').trim().replace(/\/+$/, '');
+        const secretEnc = String(bot.wardogsSecretEnc || '');
+        bot.managedServers = url && secretEnc ? [{
+          id: 'primary', label: String(bot.serverLabel || bot.name || 'Server 1').trim().slice(0,80) || 'Server 1',
+          baseUrl: url, secretEnc, alertChannelId: String(bot.alertChannelId || ''),
+          controlPanelEnabled: bot.controlPanelEnabled === true, controlPanelChannelId: String(bot.controlPanelChannelId || ''),
+          controlPanelMessageId: String(bot.controlPanelMessageId || ''), controlPanelMessageChannelId: String(bot.controlPanelMessageChannelId || ''),
+          dynamicNameOriginalName: String(bot.dynamicNameOriginalName || ''), dynamicNameLastAppliedName: String(bot.dynamicNameLastAppliedName || ''),
+          killFeedTokenEnc: String(bot.killFeedTokenEnc || ''), killFeedConfiguredAt: bot.killFeedConfiguredAt || null,
+          killFeedPublicUrl: String(bot.killFeedPublicUrl || ''), killFeedNeedsGameRestart: bot.killFeedNeedsGameRestart === true,
+          killFeedLastEventAt: bot.killFeedLastEventAt || null, killFeedEvents: Array.isArray(bot.killFeedEvents) ? bot.killFeedEvents.slice(-150) : []
+        }] : [];
+      }
+    }
+  }
   parsed.servers = parsed.servers.map((server) => ({
     ...server,
     killFeedTokenEnc: String(server?.killFeedTokenEnc || ''),
@@ -687,6 +712,22 @@ function migrate(parsed) {
     killFeedLastPublishedAt: b.killFeedLastPublishedAt || null,
     killFeedEvents: (Array.isArray(b.killFeedEvents) ? b.killFeedEvents : []).slice(-150),
     killStats: b.killStats && typeof b.killStats === 'object' ? b.killStats : null,
+    managedServers: (Array.isArray(b.managedServers) ? b.managedServers : []).map((row,index)=>({
+      id: String(row?.id || `server-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g,'-').slice(0,64) || `server-${index + 1}`,
+      label: String(row?.label || `Server ${index + 1}`).trim().slice(0,80) || `Server ${index + 1}`,
+      baseUrl: String(row?.baseUrl || row?.wardogsBaseUrl || '').trim().replace(/\/+$/,''),
+      secretEnc: String(row?.secretEnc || row?.wardogsSecretEnc || ''),
+      alertChannelId: /^\d{17,20}$/.test(String(row?.alertChannelId || '')) ? String(row.alertChannelId) : '',
+      controlPanelEnabled: row?.controlPanelEnabled === true,
+      controlPanelChannelId: /^\d{17,20}$/.test(String(row?.controlPanelChannelId || '')) ? String(row.controlPanelChannelId) : '',
+      controlPanelMessageId: /^\d{17,20}$/.test(String(row?.controlPanelMessageId || '')) ? String(row.controlPanelMessageId) : '',
+      controlPanelMessageChannelId: /^\d{17,20}$/.test(String(row?.controlPanelMessageChannelId || '')) ? String(row.controlPanelMessageChannelId) : '',
+      dynamicNameOriginalName: String(row?.dynamicNameOriginalName || '').replace(/[\r\n\0]/g,' ').trim().slice(0,96),
+      dynamicNameLastAppliedName: String(row?.dynamicNameLastAppliedName || '').replace(/[\r\n\0]/g,' ').trim().slice(0,96),
+      killFeedTokenEnc: String(row?.killFeedTokenEnc || ''), killFeedConfiguredAt: row?.killFeedConfiguredAt || null,
+      killFeedPublicUrl: String(row?.killFeedPublicUrl || '').slice(0,300), killFeedNeedsGameRestart: row?.killFeedNeedsGameRestart === true,
+      killFeedLastEventAt: row?.killFeedLastEventAt || null, killFeedEvents: (Array.isArray(row?.killFeedEvents) ? row.killFeedEvents : []).slice(-150)
+    })).filter((row)=>row.baseUrl && row.secretEnc).slice(0,12),
     accessSource: String(b.accessSource || ''),
     accessRecordId: String(b.accessRecordId || ''),
     accessUntil: b.accessUntil || null,
@@ -804,7 +845,7 @@ export function upsertManagedBot(bot) {
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', dynamicNameEnabled: false, dynamicNameStatsEnabled: false, dynamicNameStatsTemplate: '{base} | {score1} | {score2} | {score3}', dynamicNameSeedingEnabled: false, dynamicNameSeedingMinPlayers: 1, dynamicNameSeedingMaxPlayers: 20, dynamicNameSeedingTemplate: 'JOIN SEEDING', dynamicNameRotationEnabled: false, dynamicNameRotationNameA: '', dynamicNameRotationNameB: '', dynamicNameRotationMinutes: 5, dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedChannelId: '', killFeedMessageId: '', killFeedLastPublishedAt: null, killFeedEvents: [], killStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, managedServers: [], autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', dynamicNameEnabled: false, dynamicNameStatsEnabled: false, dynamicNameStatsTemplate: '{base} | {score1} | {score2} | {score3}', dynamicNameSeedingEnabled: false, dynamicNameSeedingMinPlayers: 1, dynamicNameSeedingMaxPlayers: 20, dynamicNameSeedingTemplate: 'JOIN SEEDING', dynamicNameRotationEnabled: false, dynamicNameRotationNameA: '', dynamicNameRotationNameB: '', dynamicNameRotationMinutes: 5, dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedChannelId: '', killFeedMessageId: '', killFeedLastPublishedAt: null, killFeedEvents: [], killStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

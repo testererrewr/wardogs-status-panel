@@ -482,3 +482,6 @@ WARDOGS supports live faction scores from `/v1/status`. Available status tags: `
 - Node entrypoints can be detected from `package.json`; additional common Node/Python entry filenames are recognized.
 - Multipart upload errors return cleanly to the upload form and upload fields/parts have explicit limits.
 - Failed build/start attempts no longer leave custom bots marked as enabled.
+## WARDOGS Management Bot multi-server / chat history (v3.12.43)
+
+A single Management Bot can manage up to 12 WARDOGS servers. Each server has separate Discord alert and management-panel channels. Chat History is stored per server and displayed in a 50-message paginated popup. Outgoing panel messages are always recorded; incoming player chat is recorded when WARDOGS emits matching Server Feed events.
