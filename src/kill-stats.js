@@ -9,6 +9,7 @@ import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
 import { normalizeManagedServers, managedServerContext, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat, extractChatEvents } from './managed-chat.js';
+import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
 
 export const KILL_STATS_SERVICE_ID = 'wardogs-kill-stats';
 const PLAYTIME_STATUS_SERVICE_ID = 'wardogs-playtime-tracker';
@@ -17,12 +18,45 @@ const instances = new Map();
 const runtime = new Map();
 const locks = new Map();
 const publishTimers = new Map();
+const wardogsAuthFailures = new Map();
 
 function nowIso() { return new Date().toISOString(); }
 function baseUrl(value) { return String(value || '').trim().replace(/\/+$/, ''); }
 function targetKey(value) { return baseUrl(value).toLowerCase(); }
 function validSnowflake(value) { return /^\d{17,20}$/.test(String(value || '').trim()); }
 function setRuntime(id, patch) { runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: nowIso() }); }
+function managedAuthId(bot) { return String(bot?._managedParentBotId || bot?.id || '').trim(); }
+function managedAuthKey(bot, target = bot?.wardogsBaseUrl) { return `${managedAuthId(bot)}:${targetKey(target)}`; }
+function assertManagedWardogsAuthAllowed(bot, target = bot?.wardogsBaseUrl) {
+  const id = managedAuthId(bot);
+  if (!id) return;
+  const fresh = getManagedBot(id) || bot;
+  if (fresh?.wardogsAuthLockedAt) throw createWardogsAuthLockedError(fresh.wardogsAuthLockedReason || 'WARDOGS Authentifizierung gesperrt');
+  const key = managedAuthKey(bot, target);
+  const previous = wardogsAuthFailures.get(key);
+  if (previous && Number(previous.restartNonce || 0) !== Number(fresh?.restartNonce || 0)) wardogsAuthFailures.delete(key);
+}
+function clearManagedWardogsAuthFailure(bot, target = bot?.wardogsBaseUrl) {
+  const key = managedAuthKey(bot, target);
+  if (key && key !== ':') wardogsAuthFailures.delete(key);
+}
+function recordManagedWardogsAuthFailure(bot, error, target = bot?.wardogsBaseUrl) {
+  if (!isWardogsAuthFailure(error)) return false;
+  const id = managedAuthId(bot);
+  if (!id) return false;
+  const fresh = getManagedBot(id) || bot;
+  if (fresh?.wardogsAuthLockedAt) throw createWardogsAuthLockedError(fresh.wardogsAuthLockedReason || error?.message || 'WARDOGS Authentifizierung gesperrt');
+  const key = managedAuthKey(bot, target);
+  const previous = wardogsAuthFailures.get(key);
+  const nonce = Number(fresh?.restartNonce || 0);
+  const count = Number(previous?.restartNonce || 0) === nonce ? Math.min(WARDOGS_AUTH_MAX_FAILURES, Number(previous?.count || 0) + 1) : 1;
+  wardogsAuthFailures.set(key, { count, restartNonce: nonce });
+  if (count < WARDOGS_AUTH_MAX_FAILURES) return true;
+  const reason = String(error?.message || error || '').slice(0, 220);
+  upsertManagedBot({ id, enabled:false, wardogsAuthLockedAt:nowIso(), wardogsAuthLockedReason:reason, wardogsAuthFailureCount:count });
+  if (String(fresh?.serviceId || '') === KILL_STATS_SERVICE_ID) setRuntime(id, { state:'auth-locked', requiresManualRestart:true, authFailureCount:count, authLockedAt:nowIso(), lastError:wardogsAuthLockedMessage(reason) });
+  throw createWardogsAuthLockedError(reason);
+}
 export function killStatsBotRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
 function accessActive(bot) {
   if (!bot) return false;
@@ -77,6 +111,9 @@ function normalizePlayerStat(raw, steamId) {
     vehicleKills: Math.max(0, Math.floor(Number(raw?.vehicleKills) || 0)), roadKills: Math.max(0, Math.floor(Number(raw?.roadKills) || 0)),
     suicides: Math.max(0, Math.floor(Number(raw?.suicides) || 0)), environmentalDeaths: Math.max(0, Math.floor(Number(raw?.environmentalDeaths) || 0)),
     longestKillMeters: Math.max(0, Number(raw?.longestKillMeters) || 0),
+    killRecord: Math.max(0, Math.floor(Number(raw?.killRecord) || 0)),
+    currentMatchId: String(raw?.currentMatchId || '').slice(0, 100),
+    currentMatchKills: Math.max(0, Math.floor(Number(raw?.currentMatchKills) || 0)),
     firstSeenAt: raw?.firstSeenAt || null, lastSeenAt: raw?.lastSeenAt || null,
     causes: Object.fromEntries(Object.entries(causes).map(([key, value]) => [String(key).slice(0, 100), Math.max(0, Math.floor(Number(value) || 0))]).filter(([, value]) => value > 0).slice(0, 100))
   };
@@ -144,6 +181,11 @@ function applyEventToStats(statsInput, event) {
   if (event.killerSteamId && !event.suicide) {
     const killer = ensurePlayer(stats, event.killerSteamId, event.killerName, at);
     killer.kills += 1;
+    if (event.matchId) {
+      if (killer.currentMatchId === event.matchId) killer.currentMatchKills += 1;
+      else { killer.currentMatchId = event.matchId; killer.currentMatchKills = 1; }
+      killer.killRecord = Math.max(killer.killRecord, killer.currentMatchKills);
+    }
     if (event.headshot) killer.headshots += 1;
     if (event.penetration) killer.penetrations += 1;
     if (event.ricochet) killer.ricochets += 1;
@@ -348,7 +390,7 @@ async function stopOne(id, keepRuntime = true) {
 async function startOne(bot) {
   await stopOne(bot.id, false);
   if (bot.serviceId !== KILL_STATS_SERVICE_ID) return;
-  if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: accessActive(bot)?'stopped':'access-expired' }); return; }
+  if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: bot.wardogsAuthLockedAt?'auth-locked':(accessActive(bot)?'stopped':'access-expired'), requiresManualRestart:Boolean(bot.wardogsAuthLockedAt), lastError:bot.wardogsAuthLockedAt?wardogsAuthLockedMessage(bot.wardogsAuthLockedReason):null }); return; }
   const wantsDiscord = validSnowflake(bot.killFeedChannelId);
   const token = decryptMaybe(bot.botTokenEnc);
   if (wantsDiscord && !token) throw new Error('Discord bot token is required when a killfeed channel is configured');
@@ -369,7 +411,7 @@ export async function syncKillStatsBots(bots) {
   const ids = new Set([...instances.keys(), ...snapshots.keys()]);
   for (const id of ids) await withLock(id, async()=>{
     const fresh = getManagedBot(id) || snapshots.get(id);
-    if (!fresh || fresh.serviceId !== KILL_STATS_SERVICE_ID || !fresh.enabled || !accessActive(fresh)) { if (instances.has(id)) await stopOne(id); setRuntime(id,{state:fresh?.enabled&&!accessActive(fresh)?'access-expired':'stopped'}); return; }
+    if (!fresh || fresh.serviceId !== KILL_STATS_SERVICE_ID || !fresh.enabled || !accessActive(fresh)) { if (instances.has(id)) await stopOne(id); setRuntime(id,{state:fresh?.wardogsAuthLockedAt?'auth-locked':(fresh?.enabled&&!accessActive(fresh)?'access-expired':'stopped'),requiresManualRestart:Boolean(fresh?.wardogsAuthLockedAt),lastError:fresh?.wardogsAuthLockedAt?wardogsAuthLockedMessage(fresh.wardogsAuthLockedReason):null}); return; }
     const existing=instances.get(id); if(existing?.signature===signature(fresh)) return;
     try{await startOne(fresh);}catch(error){await stopOne(id,false);setRuntime(id,{state:'error',lastError:String(error?.message||error).slice(0,300)});}
   });
@@ -381,14 +423,17 @@ export async function refreshKillStatsDiscord(bot){if(bot.serviceId!==KILL_STATS
 
 async function wardogsJson(bot, pathname) {
   const root=baseUrl(bot?.wardogsBaseUrl); if(!root)throw new Error('WARDOGS base URL is missing');
+  assertManagedWardogsAuthAllowed(bot, root);
   const secret=decryptMaybe(bot?.wardogsSecretEnc); if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   const response=await safeHttpText(`${root}${pathname}`,{allowPrivate:Boolean(bot?.allowPrivateTarget),headers:{Accept:'application/json',Authorization:`Bearer ${secret}`},timeoutMs:8000,maxBytes:1024*1024});
   let data={}; if(response.text){try{data=JSON.parse(response.text);}catch{data={message:response.text.slice(0,300)};}}
-  if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);
+  if(!response.ok){const error=new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);error.status=response.status;recordManagedWardogsAuthFailure(bot,error,root);throw error;}
+  clearManagedWardogsAuthFailure(bot, root);
   return {data,headers:response.headers||{}};
 }
 async function statusWardogsJson(server, pathname) {
   const root=baseUrl(server?.queryConfig?.baseUrl); if(!root)throw new Error('WARDOGS base URL is missing');
+  if(server?.wardogsAuthLockedAt)throw createWardogsAuthLockedError(server.wardogsAuthLockedReason || 'WARDOGS Authentifizierung gesperrt');
   const secret=decryptMaybe(server?.querySecretEnc); if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   const response=await safeHttpText(`${root}${pathname}`,{allowPrivate:Boolean(server?.allowPrivateTarget),headers:{Accept:'application/json',Authorization:`Bearer ${secret}`},timeoutMs:8000,maxBytes:1024*1024});
   let data={}; if(response.text){try{data=JSON.parse(response.text);}catch{data={message:response.text.slice(0,300)};}}
@@ -397,13 +442,15 @@ async function statusWardogsJson(server, pathname) {
 }
 async function playtimeWardogsJson(bot, server, pathname) {
   const root=baseUrl(server?.baseUrl); if(!root)throw new Error('WARDOGS base URL is missing');
+  assertManagedWardogsAuthAllowed(bot, root);
   const secret=decryptMaybe(server?.secretEnc); if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   const response=await safeHttpText(`${root}${pathname}`,{allowPrivate:Boolean(bot?.allowPrivateTarget),headers:{Accept:'application/json',Authorization:`Bearer ${secret}`},timeoutMs:8000,maxBytes:1024*1024});
   let data={}; if(response.text){try{data=JSON.parse(response.text);}catch{data={message:response.text.slice(0,300)};}}
-  if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);
+  if(!response.ok){const error=new Error(`WARDOGS API ${response.status}: ${String(data?.error?.message||data?.message||data?.error||'Error').slice(0,220)}`);error.status=response.status;recordManagedWardogsAuthFailure(bot,error,root);throw error;}
+  clearManagedWardogsAuthFailure(bot, root);
   return {data,headers:response.headers||{}};
 }
-export async function testKillStatsWardogs(bot){const [{data:players},{data:capabilities}]=await Promise.all([wardogsJson(bot,'/v1/players'),wardogsJson(bot,'/v1/capabilities').catch(()=>({data:{routes:[]}}))]);return{playerCount:Array.isArray(players?.players)?players.players.length:0,feedConfigSupported:true,routes:Array.isArray(capabilities?.routes)?capabilities.routes:[]};}
+export async function testKillStatsWardogs(bot){const {data:players}=await wardogsJson(bot,'/v1/players');const {data:capabilities}=await wardogsJson(bot,'/v1/capabilities').catch((error)=>{if(error?.wardogsAuthLocked||isWardogsAuthFailure(error))throw error;return{data:{routes:[]}};});return{playerCount:Array.isArray(players?.players)?players.players.length:0,feedConfigSupported:true,routes:Array.isArray(capabilities?.routes)?capabilities.routes:[]};}
 function patchIniKey(lines, sectionName, key, value) {
   let start=-1,end=lines.length;
   for(let i=0;i<lines.length;i+=1){const m=lines[i].match(/^\s*\[([^\]]+)\]\s*$/);if(!m)continue;if(m[1].trim()===sectionName){start=i;for(let j=i+1;j<lines.length;j+=1){if(/^\s*\[[^\]]+\]\s*$/.test(lines[j])){end=j;break;}}break;}}

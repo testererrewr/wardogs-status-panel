@@ -52,7 +52,11 @@ async function safeJson(url, options = {}, allowPrivate = false, timeoutMs = 700
     body: options.body, timeoutMs, maxBytes: 1024 * 1024
   });
   if (result.status >= 300 && result.status < 400) throw new Error('HTTP Redirects sind aus Sicherheitsgründen nicht erlaubt');
-  if (!result.ok) throw new Error(`HTTP ${result.status}${result.text ? `: ${result.text.slice(0, 180)}` : ''}`);
+  if (!result.ok) {
+    const error = new Error(`HTTP ${result.status}${result.text ? `: ${result.text.slice(0, 180)}` : ''}`);
+    error.status = result.status;
+    throw error;
+  }
   return JSON.parse(result.text || '{}');
 }
 

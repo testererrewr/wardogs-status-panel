@@ -1,9 +1,12 @@
 import { Client, ActivityType, GatewayIntentBits } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { fetchServerStatus } from './server-query.js';
+import { WARDOGS_AUTH_MAX_FAILURES, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
 
 const instances = new Map();
 const runtime = new Map();
+const wardogsAuthFailures = new Map();
+const wardogsAuthLocks = new Map();
 
 function serverSignature(server) {
   return JSON.stringify({
@@ -18,6 +21,42 @@ function setRuntime(id, patch) {
   runtime.set(id, { ...(runtime.get(id) || {}), ...patch, updatedAt: new Date().toISOString() });
 }
 export function getRuntime(id) { return runtime.get(id) || { state: 'stopped' }; }
+
+function clearWardogsAuthState(id) {
+  wardogsAuthFailures.delete(id);
+  wardogsAuthLocks.delete(id);
+}
+
+function destroyRunningInstance(id) {
+  const existing = instances.get(id);
+  if (!existing) return;
+  clearInterval(existing.pollTimer);
+  clearInterval(existing.rotateTimer);
+  try { existing.client.destroy(); } catch {}
+  instances.delete(id);
+}
+
+function registerWardogsAuthFailure(server, error) {
+  const id = String(server?.id || '');
+  const attempts = Number(wardogsAuthFailures.get(id) || 0) + 1;
+  wardogsAuthFailures.set(id, attempts);
+  if (attempts < WARDOGS_AUTH_MAX_FAILURES) return false;
+  const reason = String(error?.message || error || 'WARDOGS authentication failed').slice(0, 300);
+  const lock = { restartNonce: server?.restartNonce || 0, attempts, reason, lockedAt: new Date().toISOString() };
+  wardogsAuthLocks.set(id, lock);
+  destroyRunningInstance(id);
+  setRuntime(id, {
+    state: 'auth-locked',
+    lastError: wardogsAuthLockedMessage(reason),
+    authFailureCount: attempts,
+    authLockedAt: lock.lockedAt,
+    requiresManualRestart: true,
+    players: null,
+    maxPlayers: null,
+    map: null
+  });
+  return true;
+}
 
 function render(template, values) {
   return String(template)
@@ -80,6 +119,7 @@ function offlinePresence(server, client) {
 async function refresh(server, client, state) {
   try {
     const status = await fetchServerStatus(server);
+    if (server.gameType === 'wardogs') wardogsAuthFailures.delete(server.id);
     const previousStatus = state.latestStatus;
     const wasOnline = Boolean(previousStatus);
     const seedingRangeChanged = server.gameType === 'wardogs'
@@ -95,6 +135,19 @@ async function refresh(server, client, state) {
     if (!wasOnline) state.rotationIndex = 0;
     if (!wasOnline || seedingRangeChanged) onlinePresence(server, client, state, false);
   } catch (error) {
+    if (server.gameType === 'wardogs' && isWardogsAuthFailure(error)) {
+      const locked = registerWardogsAuthFailure(server, error);
+      if (locked) return;
+      state.latestStatus = null;
+      offlinePresence(server, client);
+      setRuntime(server.id, {
+        state: 'offline', botTag: client.user?.tag || null, botId: client.user?.id || null,
+        players: null, maxPlayers: null, map: null, ping: null, lastCheck: new Date().toISOString(),
+        authFailureCount: Number(wardogsAuthFailures.get(server.id) || 0),
+        lastError: `${error.message} · Loginversuch ${Number(wardogsAuthFailures.get(server.id) || 0)}/${WARDOGS_AUTH_MAX_FAILURES}`
+      });
+      return;
+    }
     state.latestStatus = null;
     offlinePresence(server, client);
     setRuntime(server.id, {
@@ -105,12 +158,7 @@ async function refresh(server, client, state) {
 }
 
 export async function stopServerBot(id) {
-  const existing = instances.get(id);
-  if (existing) {
-    clearInterval(existing.pollTimer); clearInterval(existing.rotateTimer);
-    try { existing.client.destroy(); } catch {}
-    instances.delete(id);
-  }
+  destroyRunningInstance(id);
   setRuntime(id, { state: 'stopped', lastError: null });
 }
 
@@ -151,6 +199,21 @@ export async function syncBots(servers) {
   const changes = [];
   for (const server of servers) {
     if (!server.enabled) { await stopServerBot(server.id); continue; }
+    if (server.gameType === 'wardogs') {
+      const lock = wardogsAuthLocks.get(server.id);
+      if (lock && String(lock.restartNonce || 0) === String(server.restartNonce || 0)) {
+        destroyRunningInstance(server.id);
+        setRuntime(server.id, {
+          state: 'auth-locked',
+          lastError: wardogsAuthLockedMessage(lock.reason),
+          authFailureCount: lock.attempts,
+          authLockedAt: lock.lockedAt,
+          requiresManualRestart: true
+        });
+        continue;
+      }
+      if (lock) clearWardogsAuthState(server.id);
+    }
     const existing = instances.get(server.id);
     const sig = serverSignature(server);
     if (!existing || existing.signature !== sig) changes.push(server);

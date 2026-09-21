@@ -25,7 +25,7 @@ test('management bot token is not described as optional/top-25 token', () => {
   assert.equal(managedForm.includes("Discord Bot Token (${tr(lang,'optional','optional')})"), false);
   assert.equal(managedForm.includes('needed for killfeed & Discord Top 25'), false);
   assert.equal(managedForm.includes('Pflicht für Discord Alerts und Management Panel'), true);
-  assert.equal(playtimeForm.includes('Pflicht für Discord Killfeed, Spielersuche und Top 25'), true);
+  assert.equal(playtimeForm.includes('Pflicht für Discord Killfeed, Slash Commands und Top-15 Leaderboard'), true);
 });
 
 

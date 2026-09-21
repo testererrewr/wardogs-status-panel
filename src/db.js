@@ -128,8 +128,8 @@ function defaultBotServices() {
     nameEn: 'WARDOGS Status Bot',
     descriptionDe: 'Gehosteter WARDOGS Status Bot für mehrere Gameserver: Spielzeit, globale Spieler- und Kill-Statistiken sowie ein eigener fester Discord-Killfeed pro Server in einer Instanz.',
     descriptionEn: 'Hosted WARDOGS Status Bot for multiple game servers: playtime, global player and kill statistics, plus one fixed Discord killfeed panel per server in a single instance.',
-    featuresDe: ['Mehrere WARDOGS Server pro Bot', 'Eigener Discord Killfeed pro Server (letzte 15 Kills)', 'Globale Kill-Stats über alle eingebundenen Server', 'Spielersuche nach Name / Alias / Steam64ID', 'Kills, Tode, K/D, Headshots, Distanz & Kill-Tags', 'Spielzeit pro Spieler & Steam64ID', 'Globale Top-25 Leaderboards', 'Discord Top-25 Spielzeit', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Webpanel mit letzten 150 Kills pro Server', 'Config Export / Import', 'Auto-Recovery'],
-    featuresEn: ['Multiple WARDOGS servers per bot', 'Dedicated Discord killfeed per server (latest 15 kills)', 'Global kill stats across all connected servers', 'Player search by name / alias / Steam64ID', 'Kills, deaths, K/D, headshots, distance & kill tags', 'Playtime per player & Steam64ID', 'Global Top-25 leaderboards', 'Discord Top-25 playtime', 'Peak activity by hour of day', 'Most used clan tags', 'Web panel with the latest 150 kills per server', 'Config export / import', 'Auto recovery'],
+    featuresDe: ['Mehrere WARDOGS Server pro Bot', 'Sichere Discord↔Game-Verknüpfung per Ingame-Whisper-Code', 'Slash Commands: /status, /whois, /whoisplayer, /playerstats & /linkgame', 'Eigener Discord Killfeed pro Server (letzte 15 Kills)', 'Globale Stats: Kills, Tode, K/D, Headshot-Rate, Kill-Rekord, Spielzeit, Matches, Siege & Seeding-Zeit', 'Top-15 Leaderboard pro Statistik-Kategorie mit Spielersuche und exakter Platzierung', 'Spielersuche nach Name / Alias / Steam64ID mit Auswahl bei mehreren Treffern', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Webpanel mit letzten 150 Kills pro Server', 'Config Export / Import', 'Auto-Recovery'],
+    featuresEn: ['Multiple WARDOGS servers per bot', 'Secure Discord↔game linking using an in-game whisper code', 'Slash commands: /status, /whois, /whoisplayer, /playerstats & /linkgame', 'Dedicated Discord killfeed per server (latest 15 kills)', 'Global stats: kills, deaths, K/D, headshot rate, kill record, playtime, matches, wins & seeding time', 'Top-15 leaderboard per stat category with player search and exact placement', 'Player search by name / alias / Steam64ID with selection for ambiguous matches', 'Peak activity by hour of day', 'Most used clan tags', 'Web panel with the latest 150 kills per server', 'Config export / import', 'Auto recovery'],
     priceLabel: '€1.99 / month',
     monthlyAmount: '1.99',
     currency: 'EUR',
@@ -146,7 +146,7 @@ function defaultBotServices() {
   }];
 }
 
-const emptyDb = () => ({ version: 40, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
+const emptyDb = () => ({ version: 42, users: [], servers: [], customBots: [], managedBots: [], banSyncServers: [], statusNodes: [], supporters: [], botServices: defaultBotServices(), paypalPurchases: [], paypalSubscriptions: [], paypalServiceSubscriptions: [], paypalWebhookEvents: [], stripePurchases: [], stripeSubscriptions: [], stripeWebhookEvents: [], siteSettings: defaultSettings() });
 
 function mergeSettings(input = {}) {
   const base = defaultSettings();
@@ -163,7 +163,7 @@ function mergeSettings(input = {}) {
 
 function migrate(parsed) {
   const previousVersion = Number(parsed.version || 0);
-  parsed.version = 40;
+  parsed.version = 42;
   if (!Array.isArray(parsed.users)) parsed.users = [];
   if (!Array.isArray(parsed.servers)) parsed.servers = [];
   if (!Array.isArray(parsed.customBots)) parsed.customBots = [];
@@ -598,6 +598,49 @@ function migrate(parsed) {
       }
     }
   }
+  if (previousVersion < 42) {
+    // v3.12.47 expands the WARDOGS Status Bot with Discord↔game account
+    // verification, slash commands, per-match stats and category leaderboards.
+    const defaults = defaultBotServices();
+    const service = defaults.find((x) => x.id === 'wardogs-playtime-tracker');
+    const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-playtime-tracker' || x.slug === 'wardogs-playtime-tracker');
+    if (service && serviceIndex >= 0) parsed.botServices[serviceIndex] = {
+      ...parsed.botServices[serviceIndex],
+      descriptionDe: service.descriptionDe, descriptionEn: service.descriptionEn,
+      featuresDe: service.featuresDe, featuresEn: service.featuresEn,
+      updatedAt: migrationNow
+    };
+    for (const bot of parsed.managedBots) {
+      if (String(bot.serviceId || '') !== 'wardogs-playtime-tracker') continue;
+      if (!Array.isArray(bot.discordPlayerLinks)) bot.discordPlayerLinks = [];
+      if (!Array.isArray(bot.playerLinkChallenges)) bot.playerLinkChallenges = [];
+      // Best-effort backfill of the per-match kill record from the persisted
+      // recent feed window. Full historical match boundaries were not stored in
+      // older versions, so older records continue accurately from this point on.
+      const stats = bot.killStats && typeof bot.killStats === 'object' ? bot.killStats : null;
+      if (stats?.players && typeof stats.players === 'object' && Array.isArray(stats.recentEvents)) {
+        const perMatch = new Map();
+        const latest = new Map();
+        for (const event of stats.recentEvents) {
+          const steamId = String(event?.killerSteamId || '');
+          const matchId = String(event?.matchId || '');
+          if (!/^\d{17}$/.test(steamId) || !matchId || event?.suicide === true) continue;
+          const key = `${steamId}\u0000${matchId}`;
+          const count = Number(perMatch.get(key) || 0) + 1;
+          perMatch.set(key, count);
+          latest.set(steamId, { matchId, count });
+          const player = stats.players[steamId];
+          if (player && typeof player === 'object') player.killRecord = Math.max(0, Number(player.killRecord) || 0, count);
+        }
+        for (const [steamId, row] of latest) {
+          const player = stats.players[steamId];
+          if (!player || typeof player !== 'object') continue;
+          player.currentMatchId = row.matchId;
+          player.currentMatchKills = row.count;
+        }
+      }
+    }
+  }
   parsed.servers = parsed.servers.map((server) => ({
     ...server,
     killFeedTokenEnc: String(server?.killFeedTokenEnc || ''),
@@ -636,7 +679,11 @@ function migrate(parsed) {
     ...b,
     id: b.id || crypto.randomUUID(),
     serviceId: String(b.serviceId || 'wardogs-warning-bot'),
+    sharedPanelUserIds: [...new Set((Array.isArray(b.sharedPanelUserIds) ? b.sharedPanelUserIds : []).map((x) => String(x || '').trim()).filter((x) => /^\d{17,20}$/.test(x) && x !== String(b.ownerDiscordId || '')))].slice(0, 20),
     enabled: Boolean(b.enabled),
+    wardogsAuthLockedAt: b.wardogsAuthLockedAt || null,
+    wardogsAuthLockedReason: String(b.wardogsAuthLockedReason || '').slice(0, 500),
+    wardogsAuthFailureCount: Math.max(0, Math.min(2, Math.floor(Number(b.wardogsAuthFailureCount) || 0))),
     autoBanEnabled: b.autoBanEnabled === true,
     announcementEnabled: b.announcementEnabled === true,
     announcementIntervalMinutes: Math.max(1, Math.min(1440, Number(b.announcementIntervalMinutes) || 15)),
@@ -736,6 +783,17 @@ function migrate(parsed) {
     leaderboardChannelId: /^\d{17,20}$/.test(String(b.leaderboardChannelId || '')) ? String(b.leaderboardChannelId) : '',
     leaderboardMessageId: /^\d{17,20}$/.test(String(b.leaderboardMessageId || '')) ? String(b.leaderboardMessageId) : '',
     lastLeaderboardAt: b.lastLeaderboardAt || null,
+    discordPlayerLinks: (Array.isArray(b.discordPlayerLinks) ? b.discordPlayerLinks : []).map((row) => ({
+      discordUserId: String(row?.discordUserId || ''), steamId: String(row?.steamId || ''), playerName: String(row?.playerName || '').trim().slice(0, 100),
+      linkedAt: row?.linkedAt || null, lastVerifiedAt: row?.lastVerifiedAt || row?.linkedAt || null
+    })).filter((row) => /^\d{17,20}$/.test(row.discordUserId) && /^\d{17}$/.test(row.steamId))
+      .filter((row, index, rows) => rows.findIndex((x) => x.discordUserId === row.discordUserId) === index)
+      .filter((row, index, rows) => rows.findIndex((x) => x.steamId === row.steamId) === index).slice(-5000),
+    playerLinkChallenges: (Array.isArray(b.playerLinkChallenges) ? b.playerLinkChallenges : []).map((row) => ({
+      discordUserId: String(row?.discordUserId || ''), steamId: String(row?.steamId || ''), playerName: String(row?.playerName || '').trim().slice(0, 100),
+      serverId: String(row?.serverId || '').replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64), codeHash: String(row?.codeHash || '').slice(0, 64),
+      expiresAt: row?.expiresAt || null, attempts: Math.max(0, Math.min(5, Math.floor(Number(row?.attempts) || 0))), createdAt: row?.createdAt || null
+    })).filter((row) => /^\d{17,20}$/.test(row.discordUserId) && /^\d{17}$/.test(row.steamId) && /^[0-9a-f]{64}$/i.test(row.codeHash) && Number.isFinite(Date.parse(row.expiresAt || ''))).slice(-100),
     playtimeStats: b.playtimeStats && typeof b.playtimeStats === 'object' ? b.playtimeStats : null,
     playtimeServers: (Array.isArray(b.playtimeServers) ? b.playtimeServers : []).map((row,index)=>({
       id: String(row?.id || `server-${index + 1}`).replace(/[^a-zA-Z0-9_-]+/g,'-').slice(0,64) || `server-${index + 1}`,
@@ -819,7 +877,10 @@ export function upsertUser(user) {
     db.users.push(entry); return entry;
   });
 }
-export function deleteUser(discordId) { updateDb((db) => { db.users = db.users.filter((u) => u.discordId !== discordId); }); }
+export function deleteUser(discordId) { updateDb((db) => {
+  db.users = db.users.filter((u) => u.discordId !== discordId);
+  for (const bot of db.managedBots || []) bot.sharedPanelUserIds = (Array.isArray(bot.sharedPanelUserIds) ? bot.sharedPanelUserIds : []).filter((id) => id !== discordId);
+}); }
 
 export function getCustomBot(id) { return readDb().customBots.find((b) => b.id === id) || null; }
 export function listCustomBotsFor(discordId, isAdmin = false) { const bots = readDb().customBots; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId); }
@@ -836,16 +897,18 @@ export function deleteCustomBot(id) { updateDb((db) => { db.customBots = db.cust
 
 export function getManagedBot(id) { return (readDb().managedBots || []).find((b) => b.id === id) || null; }
 export function listManagedBotsForUserService(discordId, serviceId) { return (readDb().managedBots || []).filter((b) => b.ownerDiscordId === discordId && b.serviceId === serviceId).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
+export function listManagedBotsAccessibleToUserService(discordId, serviceId, isAdmin = false) { return (readDb().managedBots || []).filter((b) => b.serviceId === serviceId && (isAdmin || b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId)))).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
 export function getManagedBotForUserService(discordId, serviceId) { return listManagedBotsForUserService(discordId, serviceId)[0] || null; }
 export function getManagedBotByAccessRecord(accessRecordId) { const id = String(accessRecordId || ''); return id ? (readDb().managedBots || []).find((b) => String(b.accessRecordId || '') === id) || null : null; }
 export function listManagedBotsFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId); }
+export function listManagedBotsAccessibleFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId))); }
 export function upsertManagedBot(bot) {
   return updateDb((db) => {
     if (!Array.isArray(db.managedBots)) db.managedBots = [];
     const now = new Date().toISOString();
     const index = db.managedBots.findIndex((b) => b.id === bot.id);
     if (index >= 0) { db.managedBots[index] = { ...db.managedBots[index], ...bot, updatedAt: now }; return db.managedBots[index]; }
-    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, managedServers: [], autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', dynamicNameEnabled: false, dynamicNameStatsEnabled: false, dynamicNameStatsTemplate: '{base} | {score1} | {score2} | {score3}', dynamicNameSeedingEnabled: false, dynamicNameSeedingMinPlayers: 1, dynamicNameSeedingMaxPlayers: 20, dynamicNameSeedingTemplate: 'JOIN SEEDING', dynamicNameRotationEnabled: false, dynamicNameRotationNameA: '', dynamicNameRotationNameB: '', dynamicNameRotationMinutes: 5, dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, playtimeStats: null, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedChannelId: '', killFeedMessageId: '', killFeedLastPublishedAt: null, killFeedEvents: [], killStats: null, createdAt: now, updatedAt: now, ...bot };
+    const entry = { id: bot.id || crypto.randomUUID(), enabled: false, sharedPanelUserIds: [], wardogsAuthLockedAt: null, wardogsAuthLockedReason: '', wardogsAuthFailureCount: 0, managedServers: [], autoBanEnabled: false, autoRecoveryEnabled: true, banDiscordLink: '', banTemplates: [], temporaryBans: [], dynamicBanEnabled: false, dynamicBanEscalateJoins: 3, dynamicBanEscalateWindowMinutes: 5, dynamicBans: [], banSyncServerId: '', banSyncTargetBotId: '', banSyncRequests: [], banSyncAcceptedSources: [], banSyncMirrors: [], auditLog: [], announcementEnabled: false, announcementIntervalMinutes: 15, announcementMessages: '', dynamicNameEnabled: false, dynamicNameStatsEnabled: false, dynamicNameStatsTemplate: '{base} | {score1} | {score2} | {score3}', dynamicNameSeedingEnabled: false, dynamicNameSeedingMinPlayers: 1, dynamicNameSeedingMaxPlayers: 20, dynamicNameSeedingTemplate: 'JOIN SEEDING', dynamicNameRotationEnabled: false, dynamicNameRotationNameA: '', dynamicNameRotationNameB: '', dynamicNameRotationMinutes: 5, dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', pollSeconds: 20, rulesText: '', legacyJoinSeedingCleanupDone: true, playtimeServers: [], steamWebApiKeyEnc: '', steamAppId: '1867240', ignoredPlayers: [], statsTimezone: 'Europe/Vienna', leaderboardChannelId: '', leaderboardMessageId: '', lastLeaderboardAt: null, discordPlayerLinks: [], playerLinkChallenges: [], playtimeStats: null, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedChannelId: '', killFeedMessageId: '', killFeedLastPublishedAt: null, killFeedEvents: [], killStats: null, createdAt: now, updatedAt: now, ...bot };
     db.managedBots.push(entry); return entry;
   });
 }

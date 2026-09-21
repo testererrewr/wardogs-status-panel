@@ -54,6 +54,15 @@ export function heartbeatStatusNode(node, payload = {}) {
     for (const [serverId, rt] of Object.entries(runtimes)) {
       const server = db.servers.find((row) => row.id === serverId && row.assignedNodeId === node.id);
       if (!server || server.gameType !== 'wardogs') continue;
+      if (rt?.state === 'auth-locked' && rt?.requiresManualRestart === true) {
+        server.enabled = false;
+        server.assignedNodeId = null;
+        server.wardogsAuthLockedAt = String(rt.authLockedAt || new Date().toISOString());
+        server.wardogsAuthLockedReason = String(rt.lastError || 'WARDOGS authentication failed').slice(0, 500);
+        server.wardogsAuthFailureCount = Math.max(2, Number(rt.authFailureCount) || 2);
+        server.updatedAt = new Date().toISOString();
+        continue;
+      }
       const messageId = /^\d{17,20}$/.test(String(rt?.killFeedMessageId || '')) ? String(rt.killFeedMessageId) : '';
       if (messageId && messageId !== String(server.killFeedMessageId || '')) server.killFeedMessageId = messageId;
       if (rt?.killFeedLastPublishedAt) server.killFeedLastPublishedAt = String(rt.killFeedLastPublishedAt);
@@ -215,6 +224,7 @@ export function materializeWorkForNode(nodeId) {
 export function clusterRuntime(serverId) {
   const db = readDb();
   const server = db.servers.find((s) => s.id === serverId);
+  if (server?.gameType === 'wardogs' && server?.wardogsAuthLockedAt) return { state: 'auth-locked', lastError: server.wardogsAuthLockedReason || 'WARDOGS login protection active', authLockedAt: server.wardogsAuthLockedAt, authFailureCount: server.wardogsAuthFailureCount || 2, requiresManualRestart: true };
   if (server?.enabled && !isServerEntitled(server, db)) return { state: 'plan-paused', lastError: 'This bot is currently above the account plan limit.' };
   if (!server?.assignedNodeId) return { state: server?.enabled ? 'waiting-node' : 'stopped' };
   const node = db.statusNodes.find((n) => n.id === server.assignedNodeId);

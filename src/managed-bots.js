@@ -24,6 +24,7 @@ export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, 
 import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
 import { parseManagedRules, evaluateManagedRules, matchManagedRules, managedRulesNeedSteam } from './managed-rules.js';
 import { getSteamRiskProfiles, steamApiKeyAvailable } from './steam-risk.js';
+import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
 export { parseManagedRules, evaluateManagedRules, matchManagedRules } from './managed-rules.js';
 
 export const MANAGED_DISCORD_PERMISSION_KEYS = Object.freeze([
@@ -35,6 +36,7 @@ const runtime = new Map();
 const discordUiState = new Map();
 const lifecycleLocks = new Map();
 const recoveryState = new Map();
+const wardogsAuthFailures = new Map();
 const WELCOME_MAX_ATTEMPTS = 24;
 const WELCOME_RETRY_MS = 2000;
 // Poll quickly enough to observe the team-selection transition, then require the
@@ -214,6 +216,35 @@ export function managedSteamRuleStatus(bot) {
   return { needsSteam: managedRulesNeedSteam(rules), apiKeyAvailable: steamApiKeyAvailable(bot) };
 }
 
+function managedAuthParentId(bot) { return String(bot?._managedParentBotId || bot?.id || ''); }
+function managedAuthKey(bot) { return `${managedAuthParentId(bot)}:${baseUrl(bot?.wardogsBaseUrl).toLowerCase()}`; }
+function managedAuthParent(bot) { const id=managedAuthParentId(bot); return (id && getManagedBot(id)) || bot || null; }
+function assertManagedWardogsAuthAllowed(bot) {
+  const parent=managedAuthParent(bot);
+  if(parent?.wardogsAuthLockedAt)throw createWardogsAuthLockedError(parent.wardogsAuthLockedReason || 'WARDOGS authentication is locked');
+  const key=managedAuthKey(bot),previous=wardogsAuthFailures.get(key);
+  if(previous&&String(previous.restartNonce||0)!==String(parent?.restartNonce||bot?.restartNonce||0))wardogsAuthFailures.delete(key);
+}
+function clearManagedWardogsAuthFailure(bot) { wardogsAuthFailures.delete(managedAuthKey(bot)); }
+function recordManagedWardogsAuthFailure(bot,error) {
+  if(!isWardogsAuthFailure(error))return error;
+  const parent=managedAuthParent(bot),id=managedAuthParentId(bot),key=managedAuthKey(bot);
+  const previous=wardogsAuthFailures.get(key);
+  const restartNonce=parent?.restartNonce||bot?.restartNonce||0;
+  const attempts=String(previous?.restartNonce||0)===String(restartNonce)?Number(previous?.attempts||0)+1:1;
+  const reason=String(error?.message||error||'WARDOGS authentication failed').slice(0,300);
+  wardogsAuthFailures.set(key,{attempts,restartNonce,reason});
+  if(id)setRuntime(id,{authFailureCount:attempts,lastError:`${reason} · Loginversuch ${attempts}/${WARDOGS_AUTH_MAX_FAILURES}`});
+  if(attempts<WARDOGS_AUTH_MAX_FAILURES)return error;
+  const lockedAt=nowIso();
+  if(id){
+    upsertManagedBot({id,enabled:false,wardogsAuthLockedAt:lockedAt,wardogsAuthLockedReason:reason,wardogsAuthFailureCount:attempts});
+    recoveryState.delete(id);
+    setRuntime(id,{state:'auth-locked',lastError:wardogsAuthLockedMessage(reason),authFailureCount:attempts,authLockedAt:lockedAt,requiresManualRestart:true,needsRecovery:false,nextRecoveryAt:null});
+  }
+  return createWardogsAuthLockedError(reason);
+}
+
 async function wardogsRequestDirect(bot, pathname, { method = 'GET', body, timeoutMs = 8000 } = {}) {
   const root = baseUrl(bot?.wardogsBaseUrl);
   if (!root) throw new Error('WARDOGS base URL is missing');
@@ -241,7 +272,11 @@ async function wardogsRequestDirect(bot, pathname, { method = 'GET', body, timeo
 }
 
 async function wardogsRequest(bot, pathname, options = {}) {
-  return withWardogsLane(bot, () => wardogsRequestDirect(bot, pathname, options));
+  return withWardogsLane(bot, async () => {
+    assertManagedWardogsAuthAllowed(bot);
+    try { const result=await wardogsRequestDirect(bot, pathname, options); clearManagedWardogsAuthFailure(bot); return result; }
+    catch(error){ throw recordManagedWardogsAuthFailure(bot,error); }
+  });
 }
 
 async function wardogsTextRequestDirect(bot, pathname, { method = 'GET', textBody, headers = {} } = {}) {
@@ -276,7 +311,11 @@ async function wardogsTextRequestDirect(bot, pathname, { method = 'GET', textBod
 }
 
 async function wardogsTextRequest(bot, pathname, options = {}) {
-  return withWardogsLane(bot, () => wardogsTextRequestDirect(bot, pathname, options));
+  return withWardogsLane(bot, async () => {
+    assertManagedWardogsAuthAllowed(bot);
+    try { const result=await wardogsTextRequestDirect(bot, pathname, options); clearManagedWardogsAuthFailure(bot); return result; }
+    catch(error){ throw recordManagedWardogsAuthFailure(bot,error); }
+  });
 }
 
 function managedServerNameWritable(config) {
@@ -1631,14 +1670,21 @@ export async function managedDashboard(bot) {
     experiences: '/v1/catalog/experiences',
     audit: '/v1/audit?limit=40'
   };
-  const entries = Object.entries(requests);
   const out = { errors: {} };
+  // Authenticate with one guarded request before starting parallel dashboard reads.
+  // This keeps the fast read pool from firing several bad-login requests at once.
+  try { out.status = await wardogsRequest(bot, '/v1/status', { timeoutMs: 4000 }); }
+  catch (error) {
+    out.status = null;
+    out.errors.status = String(error?.message || error || 'Error');
+    if (error?.wardogsAuthLocked || isWardogsAuthFailure(error)) throw error;
+  }
+  const entries = Object.entries(requests).filter(([key]) => key !== 'status');
   let cursor = 0;
 
-  // Dashboard reads are GET-only. Running them through the normal per-server
-  // request lane made a server switch wait for every endpoint one after another
-  // (and also behind background polling). Use a small, bounded read pool instead:
-  // actions/writes stay serialized, while the web dashboard can load in parallel.
+  // After the guarded authentication probe succeeds, the remaining GET-only
+  // dashboard calls can use a small bounded read pool for fast server switching.
+  // Actions/writes stay serialized.
   const worker = async () => {
     while (true) {
       const index = cursor++;
@@ -2553,7 +2599,7 @@ async function stopOne(id, keepRuntime = true) {
 
 async function startOne(bot) {
   await stopOne(bot.id, false);
-  if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: accessActive(bot) ? 'stopped' : 'access-expired' }); return; }
+  if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: bot.wardogsAuthLockedAt ? 'auth-locked' : (accessActive(bot) ? 'stopped' : 'access-expired'), lastError: bot.wardogsAuthLockedAt ? wardogsAuthLockedMessage(bot.wardogsAuthLockedReason) : null, requiresManualRestart: Boolean(bot.wardogsAuthLockedAt) }); return; }
   parseManagedRules(bot.rulesText || '');
   if (!bot.botTokenEnc) throw new Error('Discord bot token is missing');
   const servers = managedServerContexts(bot);
@@ -2605,7 +2651,7 @@ async function startOne(bot) {
     const freshBeforeRun = getManagedBot(bot.id) || bot;
     if (!freshBeforeRun.enabled || !accessActive(freshBeforeRun)) {
       try { await client.destroy(); } catch {}
-      setRuntime(bot.id, { state: accessActive(freshBeforeRun) ? 'stopped' : 'access-expired' });
+      setRuntime(bot.id, { state: freshBeforeRun.wardogsAuthLockedAt ? 'auth-locked' : (accessActive(freshBeforeRun) ? 'stopped' : 'access-expired'), lastError: freshBeforeRun.wardogsAuthLockedAt ? wardogsAuthLockedMessage(freshBeforeRun.wardogsAuthLockedReason) : null, requiresManualRestart: Boolean(freshBeforeRun.wardogsAuthLockedAt) });
       return;
     }
     await cleanupLegacySeedingDiscordNickname(freshBeforeRun, client);
@@ -2683,7 +2729,7 @@ export async function syncManagedBots(bots) {
         }
         if (instances.has(id)) await stopOne(id);
         recoveryState.delete(id);
-        setRuntime(id, { state: fresh?.enabled && !accessActive(fresh) ? 'access-expired' : 'stopped', botTag: null, players: null, needsRecovery: false, nextRecoveryAt: null });
+        setRuntime(id, { state: fresh?.wardogsAuthLockedAt ? 'auth-locked' : (fresh?.enabled && !accessActive(fresh) ? 'access-expired' : 'stopped'), botTag: null, players: null, needsRecovery: false, nextRecoveryAt: null, requiresManualRestart: Boolean(fresh?.wardogsAuthLockedAt), lastError: fresh?.wardogsAuthLockedAt ? wardogsAuthLockedMessage(fresh.wardogsAuthLockedReason) : null });
         return;
       }
       const existing = instances.get(id);
@@ -2695,7 +2741,7 @@ export async function syncManagedBots(bots) {
         const needsRecovery = !ready || rt?.needsRecovery === true;
         if (!needsRecovery || fresh.autoRecoveryEnabled === false || (disconnectedAt && Date.now() - disconnectedAt < 10_000)) return;
         try { await startOne(fresh); }
-        catch (error) { await stopOne(id, false); markRecoveryFailure(id, error); }
+        catch (error) { await stopOne(id, false); if(error?.wardogsAuthLocked)setRuntime(id,{state:'auth-locked',lastError:error.message,requiresManualRestart:true,needsRecovery:false,nextRecoveryAt:null});else markRecoveryFailure(id, error); }
         return;
       }
 
@@ -2711,7 +2757,7 @@ export async function syncManagedBots(bots) {
         }
       }
       try { await startOne(fresh); }
-      catch (error) { await stopOne(id, false); markRecoveryFailure(id, error); }
+      catch (error) { await stopOne(id, false); if(error?.wardogsAuthLocked)setRuntime(id,{state:'auth-locked',lastError:error.message,requiresManualRestart:true,needsRecovery:false,nextRecoveryAt:null});else markRecoveryFailure(id, error); }
     });
   }
 }
@@ -2735,7 +2781,7 @@ export async function restartManagedBot(bot) {
       return managedBotRuntime(bot.id);
     } catch (error) {
       await stopOne(bot.id, false);
-      markRecoveryFailure(bot.id, error);
+      if(error?.wardogsAuthLocked)setRuntime(bot.id,{state:'auth-locked',lastError:error.message,requiresManualRestart:true,needsRecovery:false,nextRecoveryAt:null});else markRecoveryFailure(bot.id, error);
       throw error;
     }
   });

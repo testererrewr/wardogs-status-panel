@@ -1,4 +1,4 @@
-# status-hub.lol v3.12.42
+# status-hub.lol v3.12.47
 
 
 
@@ -6,7 +6,20 @@
 
 
 
+## v3.12.47 – WARDOGS Status Bot: Discord↔Game Linking + Advanced Stats
 
+- Sichere Discord↔Game-Verknüpfung per `/linkgame`: Ingame-/Steam-Name suchen, bei mehreren Treffern explizit auswählen, 6-stelligen Zufallscode per WARDOGS-Whisper empfangen und im Discord-Modal bestätigen. Codes laufen nach 10 Minuten ab und sind auf 5 Eingabeversuche begrenzt.
+- Neue Slash Commands: `/status [user]`, `/whois [user]`, `/whoisplayer [user]` und `/playerstats spieler`. `/playerstats` funktioniert auch für nicht mit Discord verknüpfte Spieler.
+- Neue All-Time-Stats: Kills, Tode, K/D, Spielzeit, Kill-Rekord pro Match, Headshot-Rate, Match-Siege + Winrate, Matches gespielt und Seeding-Zeit bei 1–20 Spielern.
+- Discord-Leaderboard zeigt Top 15 in neun Kategorien; die K/D-Rangliste zählt wie im Beispiel erst ab 100 Kills. Die Spielersuche darunter erzwingt bei mehreren Treffern eine Auswahl und zeigt anschließend die exakte Position in jeder Kategorie – auch außerhalb der Top 15.
+- Match-Siege/Matches werden ab diesem Update aus WARDOGS `/v1/status` Matchgrenzen und Faction-Scores fortlaufend ermittelt. Historische Siege vor dem Update können nicht vollständig rekonstruiert werden.
+- Kill-Rekorde werden fortlaufend aus `matchId` im WARDOGS Server Feed getrackt; beim Upgrade wird das gespeicherte Recent-Feed-Fenster bestmöglich zurückgerechnet.
+- Datenbankschema 42; bestehende Status-Bots werden automatisch migriert.
+
+## v3.12.46 – WARDOGS Login-Schutz + Service-Bot Sharing
+
+- Nach zwei WARDOGS HTTP-401/403-Fehlern wird der betroffene BOT deaktiviert und bleibt bis zu einem manuellen Start/Restart offline.
+- Service-BOTs können mit bestehenden Panel-Usern geteilt werden; Owner/Admin behalten Abo, Löschen und Freigabeverwaltung.
 
 ## v3.12.42
 
@@ -498,3 +511,13 @@ A single Management Bot can manage up to 12 WARDOGS servers. Each server has sep
 
 - The Management Bot live player table can be filtered instantly by player name or SteamID64 without another WARDOGS request.
 - Switching between managed game servers no longer waits for the full dashboard endpoint set sequentially. Read-only dashboard calls use bounded parallelism; moderation and configuration writes remain serialized.
+
+
+## WARDOGS login protection & shared service bots (v3.12.46)
+
+- All WARDOGS bot types stop further WARDOGS authentication traffic after two HTTP 401/403 authentication failures. The affected bot is kept offline until an explicit manual restart/start; the lock is visible in the panel.
+- WARDOGS Status Bots persist the authentication lock through the status-node heartbeat so a node or panel restart does not immediately resume failed login traffic.
+- Managed WARDOGS service bots persist the lock on the service instance and bypass Auto-Recovery while authentication is locked.
+- Service Bot owners can add up to 20 existing panel users as shared operators. Shared users can configure, test, start/stop and operate the bot, while subscription cancellation, permanent deletion and sharing management remain owner/admin-only.
+- Deleting a panel account automatically removes it from all Service Bot sharing lists.
+
