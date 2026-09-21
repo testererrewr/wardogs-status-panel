@@ -627,7 +627,8 @@ function slashCommands() {
     { name: 'status', description: 'Zeigt die Stats eines verknüpften Discord-Accounts.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
     { name: 'whois', description: 'Zeigt Ingame-Account und Stats eines Discord-Users.', options: [{ type: 6, name: 'user', description: 'Discord-User; ohne Auswahl wird dein Account verwendet', required: false }] },
     { name: 'whoisplayer', description: 'Zeigt deinen verknüpften Ingame-Account und deine Stats.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
-    { name: 'playerstats', description: 'Sucht Stats zu einem Ingame-Spieler, auch ohne Discord-Verknüpfung.', options: [{ type: 3, name: 'spieler', description: 'Ingame-Name, Alias oder SteamID64', required: true, maxLength: 100 }] }
+    { name: 'playerstats', description: 'Sucht Stats zu einem Ingame-Spieler, auch ohne Discord-Verknüpfung.', options: [{ type: 3, name: 'spieler', description: 'Ingame-Name, Alias oder SteamID64', required: true, maxLength: 100 }] },
+    { name: 'leaderboard', description: 'Zeigt das All-Time Top-15 Leaderboard pro Statistik-Kategorie.' }
   ];
 }
 async function registerSlashCommands(client, botId) {
@@ -660,6 +661,10 @@ async function handleStatusCommand(botId, interaction) {
     const snapshot = combinedStatsSnapshot(bot, instances.get(botId)?.state || null);
     const player = snapshot.players.find((row) => row.steamId === link.steamId) || { steamId: link.steamId, name: link.playerName, aliases: [], kills: 0, deaths: 0, kd: 0, totalSeconds: 0, seedingSeconds: 0, killRecord: 0, headshotRate: 0, matchWins: 0, matchesPlayed: 0, winRate: 0 };
     return interaction.reply({ embeds: [playerStatsEmbed(bot, player, snapshot, { showIdentity: command !== 'status', discordUser: command !== 'status' ? target : null })], allowedMentions: { users: [target.id] } });
+  }
+  if (command === 'leaderboard') {
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null);
+    return interaction.reply({ ...payload, allowedMentions: { parse: [] } });
   }
   if (command === 'playerstats') {
     const query = interaction.options.getString('spieler', true);
