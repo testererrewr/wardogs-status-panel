@@ -1,6 +1,7 @@
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apk add --no-cache rsvg-convert font-dejavu font-noto-emoji
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts
 COPY public ./public

@@ -1,10 +1,19 @@
-# status-hub.lol v3.12.49
+# status-hub.lol v3.12.50
 
 
 
 
 
 
+
+## v3.12.50 – Discord-Leaderboard im Webpanel-Look
+
+- Das feste Discord-Leaderboard und `/leaderboard` werden jetzt als gerenderte PNG-Grafik im selben Stil wie das Webpanel ausgegeben: goldene `LEADERBOARD`-Überschrift, dunkler Außenbereich, schwarzes Board, gelbe Seitenlinie, zwei Spalten und kompakte Top-15-Zeilen.
+- Top 3 werden als eigene Gold/Silber/Bronze-Medaillen gezeichnet; Plätze 4–15 verwenden dieselben dunklen Rang-Badges wie die Web-Ansicht.
+- K/D bleibt ab 100 Kills, Headshot-Rate ab 50 Kills. Die Regeln stehen oben rechts direkt im Discord-Bild.
+- Der `Spieler suchen`-Button bleibt unter dem Bild und zeigt weiterhin genaue Positionen auch außerhalb der Top 15.
+- Beim Aktualisieren derselben festen Discord-Nachricht wird die alte Grafik ersetzt statt als weitere Datei angehängt.
+- Docker installiert `rsvg-convert`, DejaVu-Fonts und Noto Emoji für die serverseitige PNG-Erzeugung; falls die Bild-Engine ausnahmsweise nicht verfügbar ist, fällt der Bot automatisch auf das bisherige Embed-Leaderboard zurück.
 
 ## v3.12.49 – Screenshot-Leaderboard + Headshot-Mindestkills
 

@@ -7,6 +7,7 @@ import { normalizeFactionKey, normalizeSteamId64, playerFaction, playerSteamId a
 import { managedMatchBoundary } from './managed-welcome.js';
 import { killStatsSnapshotFromStats, prettyCause } from './kill-stats.js';
 import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
+import { renderLeaderboardPng } from './leaderboard-image.js';
 
 export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
 const instances = new Map();
@@ -431,8 +432,7 @@ function leaderboardField(category) {
   const value = rows.length ? rows.map((p, index) => `${medals[index] || `**${index + 1}.**`} ${cleanDisplayName(p.name, p.steamId).slice(0, 18)} — **${category.format(p)}**`).join('\n') : 'Noch keine Daten.';
   return { name: category.label, value: value.slice(0, 1024), inline: true };
 }
-export async function buildLeaderboardPayload(bot, state) {
-  const snapshot = combinedStatsSnapshot(bot, state);
+function fallbackLeaderboardPayload(snapshot, bot) {
   const fields = snapshot.categories.map(leaderboardField);
   const groups = [];
   for (let i = 0; i < fields.length; i += 2) groups.push(fields.slice(i, i + 2));
@@ -451,6 +451,26 @@ export async function buildLeaderboardPayload(bot, state) {
   );
   return { embeds, components: [row], allowedMentions: { parse: [] } };
 }
+export async function buildLeaderboardPayload(bot, state) {
+  const snapshot = combinedStatsSnapshot(bot, state);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary)
+  );
+  try {
+    const rendered = await renderLeaderboardPng(snapshot, { timeZone: timeZone(bot) });
+    setRuntime(bot.id, { leaderboardRenderError: null });
+    return {
+      content: null,
+      embeds: [],
+      files: [{ attachment: rendered.png, name: 'wardogs-leaderboard.png', description: 'WARDOGS All-Time Leaderboard' }],
+      components: [row],
+      allowedMentions: { parse: [] }
+    };
+  } catch (error) {
+    setRuntime(bot.id, { leaderboardRenderError: String(error?.message || error).slice(0, 500) });
+    return fallbackLeaderboardPayload(snapshot, bot);
+  }
+}
 
 async function publishLeaderboard(bot, state) {
   if (!validSnowflake(bot?.leaderboardChannelId)) return { skipped: true };
@@ -462,7 +482,7 @@ async function publishLeaderboard(bot, state) {
   let message = null;
   const storedId = String(bot.leaderboardMessageId || state.leaderboardMessageId || '');
   if (storedId) {
-    try { message = await channel.messages.fetch(storedId); await message.edit(payload); } catch { message = null; }
+    try { message = await channel.messages.fetch(storedId); await message.edit({ ...payload, attachments: [] }); } catch { message = null; }
   }
   if (!message) message = await channel.send(payload);
   const at = nowIso();
