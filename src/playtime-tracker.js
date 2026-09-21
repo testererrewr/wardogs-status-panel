@@ -19,6 +19,7 @@ const LEADERBOARD_MS = 6 * 60 * 60 * 1000;
 const SAVE_MS = 60 * 1000;
 const LINK_CODE_TTL_MS = 10 * 60 * 1000;
 const LEADERBOARD_TOP = 15;
+export const HEADSHOT_RATE_MIN_KILLS = 50;
 
 function nowIso() { return new Date().toISOString(); }
 function accessActive(bot) {
@@ -357,7 +358,7 @@ export function combinedStatsSnapshot(bot, state = null) {
     { id: 'kd', label: '🎯 K/D (ab 100 Kills)', rows: players.filter((p) => p.kills >= 100).sort(sorter('kd')), format: (p) => formatNumber(p.kd, 2) },
     { id: 'playtime', label: '⏱️ Spielzeit', rows: players.slice().sort(sorter('totalSeconds')), format: (p) => formatHoursCompact(p.totalSeconds) },
     { id: 'killrecord', label: '💥 Kill-Rekord / Match', rows: players.slice().sort(sorter('killRecord')), format: (p) => formatNumber(p.killRecord) },
-    { id: 'headshots', label: '🎯 Headshot-Rate', rows: players.filter((p) => p.kills > 0).sort(sorter('headshotRate')), format: (p) => `${formatNumber(p.headshotRate * 100, 1)}%` },
+    { id: 'headshots', label: `🎯 Headshot-Rate (ab ${HEADSHOT_RATE_MIN_KILLS} Kills)`, rows: players.filter((p) => p.kills >= HEADSHOT_RATE_MIN_KILLS).sort(sorter('headshotRate')), format: (p) => `${formatNumber(p.headshotRate * 100, 1)}%` },
     { id: 'wins', label: '🏆 Match-Siege', rows: players.slice().sort(sorter('matchWins')), format: (p) => `${formatNumber(p.matchWins)} (${formatNumber(p.winRate * 100, 0)}%)` },
     { id: 'matches', label: '🎮 Matches gespielt', rows: players.slice().sort(sorter('matchesPlayed')), format: (p) => formatNumber(p.matchesPlayed) },
     { id: 'seeding', label: '🌱 Seeding-Zeit (1–20)', rows: players.slice().sort(sorter('seedingSeconds')), format: (p) => formatHoursCompact(p.seedingSeconds) }
@@ -392,28 +393,33 @@ function playerStatsEmbed(bot, player, snapshot, { showIdentity = false, discord
   const ranks = leaderboardPositions(snapshot, player?.steamId);
   const lastSeen = player?.lastSeenAt ? `<t:${Math.floor(Date.parse(player.lastSeenAt) / 1000)}:R>` : '—';
   const titleName = cleanDisplayName(player?.name || player?.steamId);
+  const kills = Math.max(0, Number(player?.kills) || 0);
+  const headshotRateValue = kills >= HEADSHOT_RATE_MIN_KILLS
+    ? `${formatNumber(Number(player?.headshotRate || 0) * 100, 1)}%`
+    : `🔒 ab ${HEADSHOT_RATE_MIN_KILLS} Kills (${formatNumber(kills)}/${HEADSHOT_RATE_MIN_KILLS})`;
   const identity = [discordUser ? `Discord: <@${discordUser.id}>` : '', showIdentity ? `Ingame: **${titleName}**` : '', showIdentity ? `SteamID64: \`${player?.steamId || '—'}\`` : ''].filter(Boolean).join('\n');
   const rankText = [
     ['Kills', ranks.kills], ['Tode', ranks.deaths], ['K/D', ranks.kd], ['Spielzeit', ranks.playtime],
-    ['Kill-Rekord', ranks.killrecord], ['Headshots', ranks.headshots], ['Siege', ranks.wins],
+    ['Kill-Rekord', ranks.killrecord], ['Headshot-Rate', ranks.headshots], ['Siege', ranks.wins],
     ['Matches', ranks.matches], ['Seeding', ranks.seeding]
   ].map(([label, rank]) => `${label}: ${rank ? `#${rank}` : '—'}`).join(' · ');
   const embed = new EmbedBuilder()
+    .setColor(0x34c6e8)
     .setTitle(`📊 ${titleName}`)
     .setDescription(identity || `Zuletzt gesehen: ${lastSeen}`)
     .addFields(
-      { name: 'Kills', value: formatNumber(player?.kills), inline: true },
+      { name: 'Kills', value: formatNumber(kills), inline: true },
       { name: 'Tode', value: formatNumber(player?.deaths), inline: true },
       { name: 'K/D', value: formatNumber(player?.kd, 2), inline: true },
+      { name: 'Matches', value: formatNumber(player?.matchesPlayed), inline: true },
+      { name: 'Siege', value: `${formatNumber(player?.matchWins)} (${formatNumber(Number(player?.winRate || 0) * 100, 0)}%)`, inline: true },
+      { name: 'Kill-Rekord', value: formatNumber(player?.killRecord), inline: true },
       { name: 'Spielzeit', value: formatHoursCompact(player?.totalSeconds), inline: true },
-      { name: 'Kill-Rekord / Match', value: formatNumber(player?.killRecord), inline: true },
-      { name: 'Headshot-Rate', value: `${formatNumber(Number(player?.headshotRate || 0) * 100, 1)}%`, inline: true },
-      { name: 'Match-Siege', value: `${formatNumber(player?.matchWins)} (${formatNumber(Number(player?.winRate || 0) * 100, 0)}%)`, inline: true },
-      { name: 'Matches gespielt', value: formatNumber(player?.matchesPlayed), inline: true },
-      { name: 'Seeding-Zeit', value: formatHoursCompact(player?.seedingSeconds), inline: true },
-      { name: 'Leaderboard-Position', value: rankText.slice(0, 1024), inline: false },
+      { name: 'Seeding', value: formatHoursCompact(player?.seedingSeconds), inline: true },
+      { name: 'Fraktion', value: String(player?.lastFaction || '—').slice(0, 80), inline: true },
+      { name: `Headshot-Rate (ab ${HEADSHOT_RATE_MIN_KILLS} Kills)`, value: headshotRateValue, inline: true },
       { name: 'Zuletzt gesehen', value: lastSeen, inline: true },
-      { name: 'Letzte Fraktion', value: String(player?.lastFaction || '—').slice(0, 80), inline: true }
+      { name: 'Leaderboard-Position', value: rankText.slice(0, 1024), inline: false }
     )
     .setFooter({ text: 'WARDOGS Status Bot · All-Time Stats über alle verbundenen Server' })
     .setTimestamp(new Date(player?.lastSeenAt || Date.now()));
@@ -433,9 +439,10 @@ export async function buildLeaderboardPayload(bot, state) {
   const embeds = groups.map((group, index) => {
     const embed = new EmbedBuilder().addFields(...group);
     if (index === 0) {
-      embed.setTitle('🏆 All-Time Leaderboard · Top 15 pro Kategorie')
-        .setDescription(`${snapshot.players.length} Spieler erfasst${snapshot.startedAt ? ` seit <t:${Math.floor(Date.parse(snapshot.startedAt) / 1000)}:D>` : ''}. Nutze die Suche darunter für die genaue Position eines Spielers.`);
-    }
+      embed.setColor(0xf1c40f)
+        .setTitle('🏆 ALL-TIME LEADERBOARD')
+        .setDescription(`**Top ${LEADERBOARD_TOP} pro Kategorie** · ${snapshot.players.length} Spieler erfasst${snapshot.startedAt ? ` seit <t:${Math.floor(Date.parse(snapshot.startedAt) / 1000)}:D>` : ''}.\nK/D wird ab **100 Kills** gewertet · Headshot-Rate ab **${HEADSHOT_RATE_MIN_KILLS} Kills**. Nutze **Spieler suchen** für die genaue Position außerhalb der Top ${LEADERBOARD_TOP}.`);
+    } else embed.setColor(0xf1c40f);
     if (index === groups.length - 1) embed.setFooter({ text: 'WARDOGS Status Bot · status-hub.lol · automatische Aktualisierung alle 6 Stunden' }).setTimestamp(new Date());
     return embed;
   });

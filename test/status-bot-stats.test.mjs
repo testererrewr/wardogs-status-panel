@@ -6,7 +6,8 @@ import {
   leaderboardPositions,
   finalizeTrackedMatch,
   updateServerStats,
-  buildLeaderboardPayload
+  buildLeaderboardPayload,
+  HEADSHOT_RATE_MIN_KILLS
 } from '../src/playtime-tracker.js';
 
 const SID = '76561198000000001';
@@ -67,6 +68,21 @@ test('combined Status Bot stats contain requested metrics', () => {
   assert.equal(p.lastFaction, 'Valkyra');
   assert.deepEqual(snap.categories.map((c) => c.id), ['kills','deaths','kd','playtime','killrecord','headshots','wins','matches','seeding']);
   assert.equal(snap.categories.find((c) => c.id === 'kd').rows.some((row) => row.steamId === SID), false, 'K/D leaderboard starts at 100 kills');
+  assert.equal(HEADSHOT_RATE_MIN_KILLS, 50);
+  assert.equal(snap.categories.find((c) => c.id === 'headshots').rows.some((row) => row.steamId === SID), true, '85-kill player is eligible for headshot rate');
+});
+
+test('headshot-rate leaderboard hides players below 50 total kills', () => {
+  const bot = baseBot();
+  const low = '76561198000000003';
+  const edge = '76561198000000004';
+  bot.killStats.players[low] = { steamId: low, name: 'LowKills', aliases: [], kills: 49, deaths: 1, headshots: 49, killRecord: 4, causes: {} };
+  bot.killStats.players[edge] = { steamId: edge, name: 'EdgeKills', aliases: [], kills: 50, deaths: 10, headshots: 25, killRecord: 5, causes: {} };
+  const snap = combinedStatsSnapshot(bot);
+  const rows = snap.categories.find((c) => c.id === 'headshots').rows;
+  assert.equal(rows.some((row) => row.steamId === low), false, '49 kills must not be ranked even with 100% headshots');
+  assert.equal(rows.some((row) => row.steamId === edge), true, '50 kills unlocks headshot-rate ranking');
+  assert.match(snap.categories.find((c) => c.id === 'headshots').label, /ab 50 Kills/);
 });
 
 test('player search keeps ambiguous matches for explicit selection and rank works outside Top 15', () => {
@@ -158,6 +174,8 @@ test('Top-15 category leaderboard stays within Discord embed character limit', a
     + (e.fields || []).reduce((fieldSum, f) => fieldSum + String(f.name || '').length + String(f.value || '').length, 0), 0);
   assert.ok(chars <= 6000, `leaderboard embeds use ${chars} characters`);
   assert.equal(embeds.reduce((sum, e) => sum + (e.fields || []).length, 0), 9);
-  assert.match(embeds[0].title, /Top 15/);
+  assert.match(embeds[0].title, /ALL-TIME LEADERBOARD/);
+  assert.match(embeds[0].description, /Top 15 pro Kategorie/);
+  assert.match(embeds[0].description, /Headshot-Rate ab \*\*50 Kills\*\*/);
   assert.equal(payload.components.length, 1);
 });

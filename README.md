@@ -1,9 +1,19 @@
-# status-hub.lol v3.12.47
+# status-hub.lol v3.12.49
 
 
 
 
 
+
+
+## v3.12.49 – Screenshot-Leaderboard + Headshot-Mindestkills
+
+- Das WARDOGS All-Time Leaderboard im Panel wurde optisch deutlich näher an die Referenz gebracht: große goldene `LEADERBOARD`-Überschrift, schwarzes Board mit gelber Seitenlinie, zweispaltige Kategorien, Medal-/Rang-Badges und kompakte Spieler/Wert-Zeilen.
+- Top 15 bleibt pro Kategorie bestehen; die Suche darunter zeigt weiterhin exakte Positionen außerhalb der Top 15.
+- Headshot-Rate wird erst ab **50 Gesamtkills** gewertet und angezeigt. Unter 50 Kills wird kein Prozentwert ausgegeben; im Spielerprofil erscheint stattdessen der Freischalt-Hinweis.
+- K/D bleibt wie bisher erst ab **100 Kills** in der Rangliste.
+- `/status`, `/whois`, `/whoisplayer` und `/playerstats` wurden in der Feldreihenfolge näher an die Stats-Karte aus der Referenz gebracht: Kills/Tode/KD, Matches/Siege/Rekord, Spielzeit/Seeding/Fraktion.
+- Discord `/leaderboard` nutzt dieselben Mindestgrenzen und hebt sie direkt in der Beschreibung hervor.
 
 
 ## v3.12.47 – WARDOGS Status Bot: Discord↔Game Linking + Advanced Stats
