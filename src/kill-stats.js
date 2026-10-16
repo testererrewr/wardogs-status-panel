@@ -91,6 +91,7 @@ function emptyStats(input = null) {
     totalEvents: Math.max(0, Math.floor(Number(source.totalEvents) || 0)),
     players: source.players && typeof source.players === 'object' && !Array.isArray(source.players) ? source.players : {},
     recentEvents: Array.isArray(source.recentEvents) ? source.recentEvents.slice(-500) : [],
+    daily: source.daily && typeof source.daily === 'object' && !Array.isArray(source.daily) ? source.daily : {},
     seenEventIds: [...new Set((Array.isArray(source.seenEventIds) ? source.seenEventIds : []).map((x)=>String(x||'')).filter(Boolean))].slice(-5000)
   };
   for (const [steamId, raw] of Object.entries(out.players)) {
@@ -98,6 +99,8 @@ function emptyStats(input = null) {
     out.players[steamId] = normalizePlayerStat(raw, steamId);
   }
   out.recentEvents = out.recentEvents.map(normalizeStoredEvent).filter(Boolean).slice(-500);
+  const oldest = new Date(Date.now() - 120 * 86400000).toISOString().slice(0,10);
+  out.daily = Object.fromEntries(Object.entries(out.daily).filter(([day]) => /^\d{4}-\d{2}-\d{2}$/.test(day) && day >= oldest));
   return out;
 }
 function normalizePlayerStat(raw, steamId) {
@@ -199,6 +202,22 @@ export function applyEventToStats(statsInput, event, { normalized = false } = {}
     killer.longestKillMeters = Math.max(killer.longestKillMeters, Number(event.distanceMeters) || 0);
     const cause = String(event.cause || '').trim();
     if (cause) killer.causes[cause] = Math.max(0, Number(killer.causes[cause]) || 0) + 1;
+  }
+  // Per-day delta ledger starts with this release; never backfill from totals.
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(String(at).slice(0,10)) ? String(at).slice(0,10) : nowIso().slice(0,10);
+  const ledger = stats.daily[day] || (stats.daily[day] = {});
+  const bucket = (id) => ledger[id] || (ledger[id] = { kills: 0, deaths: 0, headshots: 0, killRecord: 0, matchKills: {} });
+  bucket(event.victimSteamId).deaths += 1;
+  if (event.killerSteamId && !event.suicide) {
+    const row = bucket(event.killerSteamId);
+    row.kills += 1;
+    if (event.headshot) row.headshots += 1;
+    if (event.matchId) {
+      const key = String(event.matchId).slice(0,100);
+      row.matchKills[key] = Number(row.matchKills[key] || 0) + 1;
+      row.killRecord = Math.max(row.killRecord, row.matchKills[key]);
+      if (Object.keys(row.matchKills).length > 120) delete row.matchKills[Object.keys(row.matchKills)[0]];
+    }
   }
   stats.totalEvents += 1;
   stats.lastEventAt = at;

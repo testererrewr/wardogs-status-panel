@@ -19,6 +19,7 @@ import { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, 
 import { desiredDynamicServerName } from './managed-dynamic-name.js';
 import { normalizeManagedServers, managedServerContext, managedServerContexts, managedServerByChannel, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat } from './managed-chat.js';
+import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel } from './managed-level-policy.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
@@ -56,6 +57,13 @@ const DYNAMIC_BAN_LEAVE_CONFIRM_POLLS = 2;
 // WARDOGS is most reliable when a single request at a time targets one game
 // server. Background polling, the web dashboard and Discord actions used to race
 // each other here. Keep one promise lane per managed bot/server.
+// Shared read-through roster cache: Discord panel + web management reuse the
+// monitoring poll instead of issuing duplicate RCON calls on every refresh.
+const liveRosterCache = new Map();
+function cachedRoster(bot, maxAgeMs = 50_000) {
+  const row = liveRosterCache.get(`${String(bot?._managedParentBotId||bot?.id||'')}:${baseUrl(bot?.wardogsBaseUrl)}`);
+  return row && Date.now() - row.updatedAt < maxAgeMs ? row : null;
+}
 const wardogsLanes = new Map();
 function withWardogsLane(bot, task) {
   const key = String(baseUrl(bot?.wardogsBaseUrl) || bot?.id || 'wardogs');
@@ -1655,52 +1663,58 @@ export async function managedMapOptions(bot, map) {
   };
 }
 
-export async function managedDashboard(bot) {
-  const requests = {
-    status: '/v1/status',
-    health: '/v1/health',
-    players: '/v1/players',
-    bans: '/v1/bans',
-    capabilities: '/v1/capabilities',
-    serverId: '/v1/server-id',
-    reserved: '/v1/reserved-slots',
-    rotation: '/v1/rotation',
-    maps: '/v1/catalog/maps',
-    lightings: '/v1/catalog/lightings',
-    experiences: '/v1/catalog/experiences',
-    audit: '/v1/audit?limit=40'
-  };
-  const out = { errors: {} };
-  // Authenticate with one guarded request before starting parallel dashboard reads.
-  // This keeps the fast read pool from firing several bad-login requests at once.
-  try { out.status = await wardogsRequest(bot, '/v1/status', { timeoutMs: 4000 }); }
-  catch (error) {
-    out.status = null;
-    out.errors.status = String(error?.message || error || 'Error');
-    if (error?.wardogsAuthLocked || isWardogsAuthFailure(error)) throw error;
+// Dashboard is read-only and non-critical. Never block HTML on ten optional endpoints.
+const dashboardCache = new Map();
+export async function managedDashboard(bot, { force = false } = {}) {
+  const key = `${bot.id}:${baseUrl(bot.wardogsBaseUrl)}`;
+  let record = dashboardCache.get(key);
+  const now = Date.now();
+  const roster = cachedRoster(bot);
+  if (!record && roster?.status && roster?.players) {
+    record = { value: { status: roster.status, players: roster.players, errors: {} }, updatedAt: roster.updatedAt, pending: null };
+    dashboardCache.set(key, record);
   }
-  const entries = Object.entries(requests).filter(([key]) => key !== 'status');
-  let cursor = 0;
-
-  // After the guarded authentication probe succeeds, the remaining GET-only
-  // dashboard calls can use a small bounded read pool for fast server switching.
-  // Actions/writes stay serialized.
-  const worker = async () => {
-    while (true) {
-      const index = cursor++;
-      if (index >= entries.length) return;
-      const [key, pathname] = entries[index];
-      try {
-        const critical = key === 'status' || key === 'players' || key === 'bans';
-        out[key] = await wardogsRequestDirect(bot, pathname, { timeoutMs: critical ? 4000 : 2500 });
-      } catch (error) {
-        out[key] = null;
-        out.errors[key] = String(error?.message || error || 'Error');
-      }
+  if (!record) { record = { value: { errors: {} }, updatedAt: 0, pending: null }; dashboardCache.set(key, record); }
+  if (!force && record.updatedAt && now - record.updatedAt < 15_000) return { ...record.value, cachedAt: new Date(record.updatedAt).toISOString() };
+  if (record.pending) return { ...record.value, cachedAt: record.updatedAt ? new Date(record.updatedAt).toISOString() : null, refreshing: true };
+  const refresh = async () => {
+    const out = { ...record.value, errors: {} };
+    try {
+      // Authenticate once, avoid bursting incorrect-password requests.
+      out.status = await wardogsRequest(bot, '/v1/status', { timeoutMs: 2400 });
+      // Prioritize player management and bans. Everything else is loaded lazily.
+      const core = [['players','/v1/players'], ['bans','/v1/bans']];
+      await Promise.all(core.map(async ([name, path]) => {
+        try { out[name] = await wardogsRequestDirect(bot, path, { timeoutMs: 2200 }); }
+        catch (error) { out.errors[name] = String(error.message || error); }
+      }));
+      record.value = out;
+      record.updatedAt = Date.now();
+      const optional = { health:'/v1/health',capabilities:'/v1/capabilities',serverId:'/v1/server-id',reserved:'/v1/reserved-slots',rotation:'/v1/rotation',maps:'/v1/catalog/maps',lightings:'/v1/catalog/lightings',experiences:'/v1/catalog/experiences',audit:'/v1/audit?limit=40' };
+      // Optional catalog and audit data change infrequently; do not requeue
+      // nine requests every 15 seconds (they share the WARDOGS request lane).
+      if (Date.now() - Number(record.optionalRequestedAt||0) < 180_000) return;
+      record.optionalRequestedAt = Date.now();
+      // Background enrichment, bounded and not awaited by the web request.
+      void (async()=>{
+        const items = Object.entries(optional); let cursor = 0;
+        const worker = async () => { while (cursor < items.length) {
+          const [name,path] = items[cursor++];
+          try { out[name] = await wardogsRequestDirect(bot, path, { timeoutMs: 1800 }); }
+          catch (error) { out.errors[name] = String(error.message || error); }
+        }};
+        await Promise.all([worker(),worker(),worker()]);
+        record.value = out; record.updatedAt = Date.now();
+      })().catch(()=>{});
+    } catch (error) {
+      out.errors.status = String(error.message || error);
+      record.value = out; record.updatedAt = Date.now();
     }
   };
-  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => worker()));
-  return out;
+  record.pending = refresh().finally(()=>{record.pending=null;});
+  if (record.updatedAt && !force) return { ...record.value, cachedAt: new Date(record.updatedAt).toISOString(), refreshing: true };
+  await record.pending;
+  return { ...record.value, cachedAt: record.updatedAt ? new Date(record.updatedAt).toISOString() : null };
 }
 
 function detectionActionForRules(bot, matchedRules) {
@@ -1842,11 +1856,13 @@ function controlPanelComponents(bot) {
 }
 
 async function controlPanelPayload(bot) {
-  let status = null;
-  let players = null;
-  try {
-    [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]);
-  } catch {}
+  const recent = cachedRoster(bot);
+  let status = recent?.status || null;
+  let players = recent?.players || null;
+  if (!status || !players) {
+    try { [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]); }
+    catch {}
+  }
   const playerList = wardogsPlayerRows(players);
   const scores = Array.isArray(status?.factionScores) ? status.factionScores : [];
   const scoreText = scores.length ? scores.slice(0, 6).map((x) => `${cut(x.name, 40)}: ${Number.isFinite(Number(x.score)) ? x.score : '—'}`).join(' · ') : '—';
@@ -1978,6 +1994,58 @@ async function pollManagedDynamicBans(bot, state) {
   }
 }
 
+async function syncManagedLevelCap(bot, state, playerCount) {
+  // Never act from an incomplete roster. Caller passes official /v1/status occupancy.
+  const fresh = getManagedBot(bot.id) || bot;
+  const server = managedServerContext(fresh, bot._managedServerId);
+  if (!server || !Number.isInteger(playerCount)) return;
+  const now = Date.now();
+  const old = { lowSince: state.levelCapLowSince, capped: server.autoLevelCapApplied === true };
+  const decision = levelCapDecision(old, playerCount, now, server.autoLevelCapEnabled === true);
+  state.levelCapLowSince = decision.lowSince;
+  setServerRuntime(bot, { autoLevelCapLowSince: decision.lowSince ? new Date(decision.lowSince).toISOString() : null,
+    autoLevelCapMode: server.autoLevelCapApplied ? 'level-30' : 'unlimited', autoLevelCapLastPlayerCount: playerCount });
+  if (!decision.action || now < Number(state.levelCapRetryAfter || 0)) return;
+  state.levelCapRetryAfter = now + 5 * 60_000; // retry conservatively, never spam config writes
+  try {
+    let updated = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const config = await wardogsRequest(bot, '/v1/config');
+      if (config?.writable === false) throw new Error('WARDOGS config is read-only');
+      const sections = Array.isArray(config?.sections) ? config.sections : [];
+      const session = sections.find((row) => String(row?.section || '').includes('/Script/WDGame.WDGameSession'));
+      const override = (session?.keyOverrides || []).find((x) => String(x?.key || '').toLowerCase() === 'servermaxplayerlevel');
+      if (override?.writable === false) throw new Error(`ServerMaxPlayerLevel is locked: ${override.lockedBy || 'hosting provider'}`);
+      if (typeof config.text !== 'string') throw new Error('Config text unavailable');
+      const existing = configMaxPlayerLevel(config.text);
+      // If somebody adjusted the value manually, do not overwrite their settings.
+      if (server.autoLevelCapApplied && existing !== 30) {
+        persistManagedServerState(bot, { autoLevelCapApplied: false });
+        setServerRuntime(bot, { autoLevelCapLastError: 'Level cap changed externally; automation suspended until next low-count interval.' });
+        state.levelCapLowSince = 0;
+        return;
+      }
+      const target = decision.action === 'cap' ? 30 : decision.action === 'uncap' ? 0 : server.autoLevelCapOriginal;
+      const text = patchMaxPlayerLevel(config.text, target);
+      if (text !== config.text) {
+        const revision = String(config.revision || '').replace(/^"|"$/g, '');
+        const headers = { 'Content-Type': 'text/plain; charset=utf-8' };
+        if (revision) headers['If-Match'] = `"${revision}"`;
+        try { await wardogsTextRequest(bot, '/v1/config?fullApply=true', { method: 'PUT', textBody: text, headers }); }
+        catch (error) { if (Number(error.status) === 412 && attempt === 0) continue; throw error; }
+      }
+      persistManagedServerState(bot, { autoLevelCapApplied: decision.action === 'cap', autoLevelCapOriginal: decision.action === 'cap' ? existing : 0 });
+      appendManagedAudit(bot, { actor: 'auto-level-cap', action: decision.action, detail: `${playerCount} online, ServerMaxPlayerLevel=${target}; game-server restart may be required` });
+      setServerRuntime(bot, { autoLevelCapMode: decision.action === 'cap' ? 'level-30' : 'unlimited', autoLevelCapLastAppliedAt: nowIso(), autoLevelCapLastError: null, autoLevelCapNeedsRestart: true });
+      updated = true;
+      break;
+    }
+    if (!updated) throw new Error('Config revision conflict');
+  } catch (error) {
+    setServerRuntime(bot, { autoLevelCapLastError: String(error.message || error).slice(0, 250) });
+  }
+}
+
 async function pollPlayers(bot, state, client) {
   // Never allow overlapping poll cycles. Slow Steam/RCON requests must not create
   // a second concurrent detection pass for the same join.
@@ -2001,6 +2069,12 @@ async function pollPlayers(bot, state, client) {
       }
     }
     const players = wardogsPlayerRows(data);
+    const previousCache = cachedRoster(bot, 90_000);
+    liveRosterCache.set(`${String(bot?._managedParentBotId||bot?.id||'')}:${baseUrl(bot.wardogsBaseUrl)}`, { status: status || previousCache?.status || null, players: data, updatedAt: Date.now() });
+    if (status) {
+      // Queue the optional config edit after the ordinary roster response.
+      await syncManagedLevelCap(bot, state, wardogsReportedPlayerCount(status, data));
+    } else state.levelCapLowSince = 0;
     if (bot.dynamicNameEnabled === true && status) await syncManagedDynamicServerName(bot, state, status, wardogsReportedPlayerCount(status, data));
     const rules = parseManagedRules(bot.rulesText || '');
     const ignored = ignoredSteamIds(bot);

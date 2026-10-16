@@ -22,6 +22,9 @@ export function normalizeManagedServers(bot) {
     controlPanelMessageChannelId: snowflake(row?.controlPanelMessageChannelId),
     dynamicNameOriginalName: String(row?.dynamicNameOriginalName || '').replace(/[\r\n\0]/g, ' ').trim().slice(0, 96),
     dynamicNameLastAppliedName: String(row?.dynamicNameLastAppliedName || '').replace(/[\r\n\0]/g, ' ').trim().slice(0, 96),
+    autoLevelCapEnabled: row?.autoLevelCapEnabled === true,
+    autoLevelCapApplied: row?.autoLevelCapApplied === true,
+    autoLevelCapOriginal: Math.max(0, Math.min(600, Number(row?.autoLevelCapOriginal) || 0)),
     killFeedTokenEnc: String(row?.killFeedTokenEnc || ''),
     killFeedConfiguredAt: row?.killFeedConfiguredAt || null,
     killFeedPublicUrl: String(row?.killFeedPublicUrl || '').slice(0, 300),
@@ -45,6 +48,9 @@ export function normalizeManagedServers(bot) {
     controlPanelMessageChannelId: snowflake(bot?.controlPanelMessageChannelId),
     dynamicNameOriginalName: String(bot?.dynamicNameOriginalName || '').replace(/[\r\n\0]/g, ' ').trim().slice(0, 96),
     dynamicNameLastAppliedName: String(bot?.dynamicNameLastAppliedName || '').replace(/[\r\n\0]/g, ' ').trim().slice(0, 96),
+    autoLevelCapEnabled: bot?.autoLevelCapEnabled === true,
+    autoLevelCapApplied: bot?.autoLevelCapApplied === true,
+    autoLevelCapOriginal: Math.max(0, Math.min(600, Number(bot?.autoLevelCapOriginal) || 0)),
     killFeedTokenEnc: String(bot?.killFeedTokenEnc || ''),
     killFeedConfiguredAt: bot?.killFeedConfiguredAt || null,
     killFeedPublicUrl: String(bot?.killFeedPublicUrl || '').slice(0, 300),
@@ -74,6 +80,9 @@ export function managedServerContext(bot, serverOrId) {
     controlPanelMessageChannelId: server.controlPanelMessageChannelId,
     dynamicNameOriginalName: server.dynamicNameOriginalName,
     dynamicNameLastAppliedName: server.dynamicNameLastAppliedName,
+    autoLevelCapEnabled: server.autoLevelCapEnabled,
+    autoLevelCapApplied: server.autoLevelCapApplied,
+    autoLevelCapOriginal: server.autoLevelCapOriginal,
     killFeedTokenEnc: server.killFeedTokenEnc,
     killFeedConfiguredAt: server.killFeedConfiguredAt,
     killFeedPublicUrl: server.killFeedPublicUrl,
@@ -101,5 +110,5 @@ export function managedServerPatch(bot, serverId, patch = {}) {
 }
 
 export function newManagedServerRow(index = 0) {
-  return { id: crypto.randomUUID(), label: `Server ${index + 1}`, baseUrl: '', secretEnc: '', alertChannelId: '', controlPanelEnabled: false, controlPanelChannelId: '', controlPanelMessageId: '', controlPanelMessageChannelId: '', dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedEvents: [] };
+  return { id: crypto.randomUUID(), label: `Server ${index + 1}`, baseUrl: '', secretEnc: '', alertChannelId: '', controlPanelEnabled: false, controlPanelChannelId: '', controlPanelMessageId: '', controlPanelMessageChannelId: '', dynamicNameOriginalName: '', dynamicNameLastAppliedName: '', autoLevelCapEnabled: false, autoLevelCapApplied: false, autoLevelCapOriginal: 0, killFeedTokenEnc: '', killFeedConfiguredAt: null, killFeedPublicUrl: '', killFeedNeedsGameRestart: false, killFeedLastEventAt: null, killFeedEvents: [] };
 }

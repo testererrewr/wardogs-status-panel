@@ -1,4 +1,12 @@
-# status-hub.lol v3.12.52
+# status-hub.lol v3.12.53
+
+## v3.12.53 – Management-Speed, Leaderboard-Zeiträume, BOT-Monitoring, Level-Automatik
+
+- Management-Bot: schnelleres Dashboard durch Status-/Roster-Cache und asynchrone Katalogdaten mit dreiminütiger Abfragebegrenzung.
+- Stats-Bot: All-Time / Heute / 7 Tage / 30 Tage / Season im Webpanel und Discord `/leaderboard zeitraum:`. Saison-Startdatum konfigurierbar. Tageszähler ab v3.12.53, keine automatische historische Rekonstruktion.
+- `/bot-health`: zentrale Live-/Runtime-Übersicht über Service-, Status- und Custom-Bots; unbekannter Docker-Status ist gekennzeichnet, um die Seite schnell zu halten.
+- WARDOGS Management: pro Server optionaler Auto-Level-Limiter: unter 20 Spielern für 30 Minuten → ServerMaxPlayerLevel=30; ab 25 → 0 (unbegrenzt). Ausschalten stellt die ursprüngliche Konfiguration nach einem erfolgreichen Poll wieder her. Gameserver-Neustart kann nötig sein; wird nicht automatisch ausgeführt.
+- Ausführliche Hinweise: [UPDATE-v3.12.53.md](UPDATE-v3.12.53.md).
 
 ## v3.12.52 – Custom-Bot-Performance, WARDOGS-Spielerzähler und Stats-Diagnose
 

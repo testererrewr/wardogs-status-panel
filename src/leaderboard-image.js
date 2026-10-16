@@ -170,7 +170,7 @@ export function buildLeaderboardPageSvg(snapshot, { page = 0, timeZone = 'Europe
     text(WIDTH / 2, 84, 'LEADERBOARD', { size: 64, weight: 950, fill: GOLD, anchor: 'middle', letterSpacing: 2.5 }),
     `<rect x="${BOARD_X}" y="${BOARD_Y}" width="${BOARD_W}" height="${BOARD_H}" rx="12" fill="${BOARD}" stroke="${BOARD_BORDER}" stroke-width="1.5" filter="url(#shadow)"/>`,
     `<rect x="${BOARD_X}" y="${BOARD_Y}" width="7" height="${BOARD_H}" rx="3" fill="#f2df00"/>`,
-    text(innerX, 180, 'ALL-TIME LEADERBOARD', { size: 24, weight: 950 }),
+    text(innerX, 180, `${snapshot?.periodLabel || 'ALL-TIME'} LEADERBOARD`, { size: 24, weight: 950 }),
     text(innerX, 222, 'TOP 15 PRO KATEGORIE', { size: 23, weight: 900 }),
     text(innerX, 260, `${playerCount.toLocaleString('de-DE')} Spieler erfasst seit ${since}`, { size: 15, weight: 550, fill: MUTED }),
     roundedRect(1030, 157, 178, 42, RULE_BG, RULE_BORDER, 8, 1),

@@ -170,6 +170,8 @@ function normalizeServerStats(input) {
       faction: String(row?.faction || '').slice(0, 80)
     }]).filter(([steamId]) => normalizeSteamId64(steamId)))
   };
+  const oldest = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
+  stats.daily = Object.fromEntries(Object.entries(stats.daily && typeof stats.daily === 'object' ? stats.daily : {}).filter(([day])=>/^\d{4}-\d{2}-\d{2}$/.test(day) && day >= oldest));
   const sourceHours = Array.isArray(stats.hours) ? stats.hours : [];
   stats.hours = emptyHours().map((base, hour) => {
     const row = sourceHours.find((x) => Number(x?.hour) === hour) || sourceHours[hour] || {};
@@ -316,7 +318,15 @@ function formatNumber(value, digits = 0) {
 function formatHoursCompact(seconds) {
   return `${formatNumber(Math.max(0, Number(seconds) || 0) / 3600, 1)} Std`;
 }
-export function combinedStatsSnapshot(bot, state = null) {
+export const LEADERBOARD_PERIODS = Object.freeze(['all', 'today', '7d', '30d', 'season']);
+export function periodDays(period, now = Date.now(), seasonStart = '') {
+  const end = new Date(now).toISOString().slice(0,10);
+  if (period === 'all') return { start: '', end };
+  if (period === 'season') return { start: /^\d{4}-\d{2}-\d{2}$/.test(seasonStart) ? seasonStart : end, end };
+  const days = period === 'today' ? 1 : period === '7d' ? 7 : 30;
+  return { start: new Date(Date.parse(end + 'T00:00:00Z') - (days-1)*86400000).toISOString().slice(0,10), end };
+}
+export function combinedStatsSnapshot(bot, state = null, period = 'all') {
   const servers = playtimeTrackerServers(bot);
   const playStats = state?.stats || normalizeStats(bot?.playtimeStats, servers);
   const play = snapshotFromStats(playStats, servers, state?.onlineByServer || new Map());
@@ -347,25 +357,50 @@ export function combinedStatsSnapshot(bot, state = null) {
     if (!current.lastSeenAt || (row.lastSeenAt && String(row.lastSeenAt) > String(current.lastSeenAt))) current.lastSeenAt = row.lastSeenAt;
     byId.set(row.steamId, current);
   }
-  const players = [...byId.values()].map((row) => ({
+  const selectedPeriod = LEADERBOARD_PERIODS.includes(period) ? period : 'all';
+  const { start: periodStart, end: periodEnd } = periodDays(selectedPeriod, Date.now(), String(bot?.statsSeasonStartedAt || ''));
+  let players = [...byId.values()].map((row) => ({
     ...row,
+    // Eligibility means 50 TOTAL kills, not necessarily 50 in this week/season.
+    careerKills: Number(row.kills || 0),
     winRate: Number(row.matchesPlayed || 0) > 0 ? Number(row.matchWins || 0) / Number(row.matchesPlayed || 0) : 0
   }));
+  if (selectedPeriod !== 'all') {
+    const windowStats = new Map();
+    const stat = id => { if (!windowStats.has(id)) windowStats.set(id, { kills: 0, deaths: 0, headshots: 0, killRecord: 0, totalSeconds: 0, seedingSeconds: 0, matchesPlayed: 0, matchWins: 0 }); return windowStats.get(id); };
+    const active = day => day >= periodStart && day <= periodEnd;
+    for (const [day, rows] of Object.entries(bot?.killStats?.daily || {})) {
+      if (!active(day)) continue;
+      for (const [id, row] of Object.entries(rows || {})) { const target = stat(id); for (const k of ['kills','deaths','headshots']) target[k] += Number(row?.[k]) || 0; target.killRecord = Math.max(target.killRecord, Number(row?.killRecord) || 0); }
+    }
+    for (const data of Object.values(playStats.servers || {})) for (const [day, rows] of Object.entries(data?.daily || {})) {
+      if (!active(day)) continue;
+      for (const [id, row] of Object.entries(rows || {})) { const target = stat(id); for (const k of ['totalSeconds','seedingSeconds','matchesPlayed','matchWins']) target[k] += Number(row?.[k]) || 0; }
+    }
+    players = players.filter(p => windowStats.has(p.steamId)).map(p => {
+      const delta = windowStats.get(p.steamId);
+      const n = { ...p, ...delta };
+      n.kd = n.deaths > 0 ? n.kills/n.deaths : n.kills;
+      n.headshotRate = n.kills > 0 ? n.headshots/n.kills : 0;
+      n.winRate = n.matchesPlayed > 0 ? n.matchWins/n.matchesPlayed : 0;
+      return n;
+    });
+  }
   const sorter = (metric, secondary = 'kills') => (a, b) => Number(b?.[metric] || 0) - Number(a?.[metric] || 0)
     || Number(b?.[secondary] || 0) - Number(a?.[secondary] || 0)
     || cleanDisplayName(a?.name).localeCompare(cleanDisplayName(b?.name), 'de');
   const categories = [
     { id: 'kills', label: '🗡️ Kills', rows: players.slice().sort(sorter('kills')), format: (p) => formatNumber(p.kills) },
     { id: 'deaths', label: '☠️ Tode', rows: players.slice().sort(sorter('deaths')), format: (p) => formatNumber(p.deaths) },
-    { id: 'kd', label: `🎯 K/D (ab ${KD_MIN_KILLS} Kills)`, rows: players.filter((p) => p.kills >= KD_MIN_KILLS).sort(sorter('kd')), format: (p) => formatNumber(p.kd, 2) },
+    { id: 'kd', label: `🎯 K/D (ab ${KD_MIN_KILLS} Kills)`, rows: players.filter((p) => p.careerKills >= KD_MIN_KILLS).sort(sorter('kd')), format: (p) => formatNumber(p.kd, 2) },
     { id: 'playtime', label: '⏱️ Spielzeit', rows: players.slice().sort(sorter('totalSeconds')), format: (p) => formatHoursCompact(p.totalSeconds) },
     { id: 'killrecord', label: '💥 Kill-Rekord / Match', rows: players.slice().sort(sorter('killRecord')), format: (p) => formatNumber(p.killRecord) },
-    { id: 'headshots', label: `🎯 Headshot-Rate (ab ${HEADSHOT_RATE_MIN_KILLS} Kills)`, rows: players.filter((p) => p.kills >= HEADSHOT_RATE_MIN_KILLS).sort(sorter('headshotRate')), format: (p) => `${formatNumber(p.headshotRate * 100, 1)}%` },
+    { id: 'headshots', label: `🎯 Headshot-Rate (ab ${HEADSHOT_RATE_MIN_KILLS} Kills)`, rows: players.filter((p) => p.careerKills >= HEADSHOT_RATE_MIN_KILLS && p.kills > 0).sort(sorter('headshotRate')), format: (p) => `${formatNumber(p.headshotRate * 100, 1)}%` },
     { id: 'wins', label: '🏆 Match-Siege', rows: players.slice().sort(sorter('matchWins')), format: (p) => `${formatNumber(p.matchWins)} (${formatNumber(p.winRate * 100, 0)}%)` },
     { id: 'matches', label: '🎮 Matches gespielt', rows: players.slice().sort(sorter('matchesPlayed')), format: (p) => formatNumber(p.matchesPlayed) },
     { id: 'seeding', label: '🌱 Seeding-Zeit (1–20)', rows: players.slice().sort(sorter('seedingSeconds')), format: (p) => formatHoursCompact(p.seedingSeconds) }
   ];
-  return { players, play, kill, categories, startedAt: play.startedAt || kill.startedAt || null };
+  return { players, play, kill, categories, startedAt: selectedPeriod === 'all' ? (play.startedAt || kill.startedAt || null) : `${periodStart}T00:00:00Z`, period: selectedPeriod, periodLabel: {all:'ALL-TIME',today:'HEUTE', '7d':'7 TAGE','30d':'30 TAGE',season:'SEASON'}[selectedPeriod] };
 }
 export function searchCombinedPlayers(snapshot, query) {
   const q = String(query || '').trim().toLowerCase();
@@ -446,14 +481,15 @@ function leaderboardPageCategories(snapshot, page) {
   const byId = new Map(categories.map((category) => [category.id, category]));
   return ids.map((id) => byId.get(id)).filter(Boolean);
 }
-function leaderboardControls(bot, page) {
+function leaderboardControls(bot, page, period = 'all') {
   const pageCount = leaderboardPageCount();
   const current = normalizedLeaderboardPage(page);
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.max(0, current - 1)}:${bot.id}`).setLabel('◀ Zurück').setStyle(ButtonStyle.Secondary).setDisabled(current <= 0),
+    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.max(0, current - 1)}:${period}:${bot.id}`).setLabel('◀ Zurück').setStyle(ButtonStyle.Secondary).setDisabled(current <= 0),
     new ButtonBuilder().setCustomId(`wdstatus:lbpage:${current}:${bot.id}`).setLabel(`${current + 1}/${pageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.min(pageCount - 1, current + 1)}:${bot.id}`).setLabel('Weiter ▶').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1),
-    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.min(pageCount - 1, current + 1)}:${period}:${bot.id}`).setLabel('Weiter ▶').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1),
+    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`wdstatus:period:${LEADERBOARD_PERIODS[(LEADERBOARD_PERIODS.indexOf(period) + 1) % LEADERBOARD_PERIODS.length]}:${bot.id}`).setLabel({all:'All-Time',today:'Heute','7d':'7 Tage','30d':'30 Tage',season:'Season'}[period]+' ↻').setStyle(ButtonStyle.Success)
   );
 }
 function fallbackLeaderboardPayload(snapshot, bot, page = 0) {
@@ -462,15 +498,15 @@ function fallbackLeaderboardPayload(snapshot, bot, page = 0) {
   const fields = categories.map(leaderboardField);
   const embed = new EmbedBuilder()
     .setColor(0xf1c40f)
-    .setTitle(`🏆 ALL-TIME LEADERBOARD · Seite ${current + 1}/${leaderboardPageCount()}`)
+    .setTitle(`🏆 ${snapshot.periodLabel || 'ALL-TIME'} LEADERBOARD · Seite ${current + 1}/${leaderboardPageCount()}`)
     .setDescription(`**Top ${LEADERBOARD_TOP} pro Kategorie** · ${snapshot.players.length} Spieler erfasst${snapshot.startedAt ? ` seit <t:${Math.floor(Date.parse(snapshot.startedAt) / 1000)}:D>` : ''}.\nK/D wird ab **${KD_MIN_KILLS} Kills** gewertet · Headshot-Rate ab **${HEADSHOT_RATE_MIN_KILLS} Kills**.`)
     .addFields(...fields)
     .setFooter({ text: 'WARDOGS Status Bot · automatische Aktualisierung alle 6 Stunden' })
     .setTimestamp(new Date());
-  return { embeds: [embed], components: [leaderboardControls(bot, current)], allowedMentions: { parse: [] } };
+  return { embeds: [embed], components: [leaderboardControls(bot, current, snapshot.period || 'all')], allowedMentions: { parse: [] } };
 }
-export async function buildLeaderboardPayload(bot, state, page = 0) {
-  const snapshot = combinedStatsSnapshot(bot, state);
+export async function buildLeaderboardPayload(bot, state, page = 0, period = 'all') {
+  const snapshot = combinedStatsSnapshot(bot, state, period);
   const current = normalizedLeaderboardPage(page);
   try {
     const rendered = await renderLeaderboardPagePng(snapshot, { page: current, timeZone: timeZone(bot) });
@@ -478,8 +514,8 @@ export async function buildLeaderboardPayload(bot, state, page = 0) {
     return {
       content: null,
       embeds: [],
-      files: [{ attachment: rendered.png, name: `wardogs-leaderboard-${current + 1}.png`, description: `WARDOGS All-Time Leaderboard Seite ${current + 1}/${rendered.pageCount}` }],
-      components: [leaderboardControls(bot, current)],
+      files: [{ attachment: rendered.png, name: `wardogs-leaderboard-${current + 1}.png`, description: `WARDOGS ${snapshot.periodLabel} Leaderboard Seite ${current + 1}/${rendered.pageCount}` }],
+      components: [leaderboardControls(bot, current, snapshot.period || 'all')],
       allowedMentions: { parse: [] }
     };
   } catch (error) {
@@ -671,7 +707,7 @@ function slashCommands() {
     { name: 'whois', description: 'Zeigt Ingame-Account und Stats eines Discord-Users.', options: [{ type: 6, name: 'user', description: 'Discord-User; ohne Auswahl wird dein Account verwendet', required: false }] },
     { name: 'whoisplayer', description: 'Zeigt deinen verknüpften Ingame-Account und deine Stats.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
     { name: 'playerstats', description: 'Sucht Stats zu einem Ingame-Spieler, auch ohne Discord-Verknüpfung.', options: [{ type: 3, name: 'spieler', description: 'Ingame-Name, Alias oder SteamID64', required: true, maxLength: 100 }] },
-    { name: 'leaderboard', description: 'Zeigt das All-Time Top-15 Leaderboard pro Statistik-Kategorie.' }
+    { name: 'leaderboard', description: 'Zeigt Top-15-Ranglisten für verschiedene Zeiträume.', options: [{ type: 3, name: 'zeitraum', description: 'Zeitraum wählen', required: false, choices: [{name:'All-Time',value:'all'},{name:'Heute',value:'today'},{name:'7 Tage',value:'7d'},{name:'30 Tage',value:'30d'},{name:'Season',value:'season'}] }] }
   ];
 }
 async function registerSlashCommands(client, botId) {
@@ -707,7 +743,7 @@ async function handleStatusCommand(botId, interaction) {
   }
   if (command === 'leaderboard') {
     await interaction.deferReply();
-    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, 0);
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, 0, interaction.options.getString('zeitraum') || 'all');
     return interaction.editReply({ ...payload, allowedMentions: { parse: [] } });
   }
   if (command === 'playerstats') {
@@ -726,11 +762,17 @@ async function handleStatusInteraction(botId, interaction) {
   if (interaction.isChatInputCommand?.()) return handleStatusCommand(botId, interaction);
   const id = String(interaction.customId || '');
   if (id === `wdstatus:search:${botId}` && interaction.isButton()) return interaction.showModal(killStatsSearchModal(botId));
-  const pageMatch = id.match(/^wdstatus:lb:(\d+):(.+)$/);
-  if (pageMatch && pageMatch[2] === botId && interaction.isButton()) {
+  const pageMatch = id.match(/^wdstatus:lb:(\d+):(all|today|7d|30d|season):(.+)$/);
+  if (pageMatch && pageMatch[3] === botId && interaction.isButton()) {
     const page = normalizedLeaderboardPage(Number(pageMatch[1]));
     await interaction.deferUpdate();
-    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, page);
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, page, pageMatch[2]);
+    return interaction.editReply({ ...payload, attachments: [], allowedMentions: { parse: [] } });
+  }
+  const periodMatch = id.match(/^wdstatus:period:(all|today|7d|30d|season):(.+)$/);
+  if (periodMatch && periodMatch[2] === botId && interaction.isButton()) {
+    await interaction.deferUpdate();
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, 0, periodMatch[1]);
     return interaction.editReply({ ...payload, attachments: [], allowedMentions: { parse: [] } });
   }
   if (id === `wdstatus:top:${botId}` && interaction.isButton()) {
@@ -803,6 +845,11 @@ async function publishAllKillfeeds(bot, state, force = false) {
   setRuntime(bot.id, { lastKillfeedError: errors.length ? errors.join(' · ').slice(0, 500) : null, lastKillfeedCheckAt: nowIso() });
 }
 
+function dailyPlayRow(serverStats, steamId, day = new Date().toISOString().slice(0,10)) {
+  const ledger = serverStats.daily || (serverStats.daily = {});
+  const date = ledger[day] || (ledger[day] = {});
+  return date[steamId] || (date[steamId] = { totalSeconds: 0, seedingSeconds: 0, matchesPlayed: 0, matchWins: 0 });
+}
 export function finalizeTrackedMatch(serverStats, tracker) {
   const participants = tracker?.participants && typeof tracker.participants === 'object' ? tracker.participants : {};
   const ids = Object.keys(participants).filter((steamId) => normalizeSteamId64(steamId));
@@ -819,8 +866,9 @@ export function finalizeTrackedMatch(serverStats, tracker) {
     const record = serverStats.players[steamId];
     if (!record) continue;
     record.matchesPlayed = Math.max(0, Number(record.matchesPlayed) || 0) + 1;
+    dailyPlayRow(serverStats, steamId).matchesPlayed += 1;
     const faction = normalizeFactionKey(participants[steamId]?.faction || record.lastFaction || '');
-    if (winner && faction && faction === winner) record.matchWins = Math.max(0, Number(record.matchWins) || 0) + 1;
+    if (winner && faction && faction === winner) { record.matchWins = Math.max(0, Number(record.matchWins) || 0) + 1; dailyPlayRow(serverStats, steamId).matchWins += 1; }
     updated += 1;
   }
   return updated;
@@ -854,6 +902,9 @@ export function updateServerStats(bot, server, serverStats, previous, current, l
       const record = serverStats.players[steamId] || { totalSeconds: 0 };
       record.totalSeconds = Math.max(0, Number(record.totalSeconds) || 0) + elapsed;
       if (seedingActive) record.seedingSeconds = Math.max(0, Number(record.seedingSeconds) || 0) + elapsed;
+      const day = new Date(now).toISOString().slice(0,10);
+      const daily = dailyPlayRow(serverStats, steamId, day); daily.totalSeconds += elapsed;
+      if (seedingActive) daily.seedingSeconds += elapsed;
       serverStats.players[steamId] = record;
     }
   }
