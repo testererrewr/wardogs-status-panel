@@ -154,6 +154,29 @@ app.post('/delete', async (req, res) => {
   try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container, image, network } = names(id); await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 }); await run('docker', ['image', 'rm', '-f', image], { allowFailure: true, timeout: 30000 }); await run('docker', ['network', 'rm', network], { allowFailure: true, timeout: 20000 }); res.json({ ok: true }); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
+// Query all custom containers with one Docker invocation instead of 2 calls per bot.
+// The caller still enforces ownership; runner validates identifiers and exposes
+// nothing outside the requested custom-bot container names.
+app.post('/statuses', async (req, res) => {
+  try {
+    const ids = req.body?.ids;
+    if (!Array.isArray(ids) || ids.length > 250 || ids.some((id) => !validId(id))) throw new Error('invalid bot ids');
+    const unique = [...new Set(ids)];
+    const statuses = Object.fromEntries(unique.map((id) => [id, { exists: false, running: false }]));
+    if (!unique.length) return res.json({ ok: true, statuses });
+    const byContainer = new Map(unique.map((id) => [names(id).container, id]));
+    const result = await run('docker', ['ps', '--all', '--format', '{{.Names}}|{{.State}}'], { timeout: 5500 });
+    for (const line of result.out.split(/\r?\n/)) {
+      const separator = line.lastIndexOf('|');
+      if (separator < 0) continue;
+      const id = byContainer.get(line.slice(0, separator));
+      if (!id) continue;
+      statuses[id] = { exists: true, running: line.slice(separator + 1).trim() === 'running' };
+    }
+    res.json({ ok: true, statuses });
+  } catch (e) { res.status(503).json({ error: e.message }); }
+});
+
 app.post('/status', async (req, res) => {
   try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container } = names(id); const exists = await existsContainer(container); res.json({ ok: true, exists, running: exists ? await isRunning(container) : false }); }
   catch (e) { res.status(400).json({ error: e.message }); }

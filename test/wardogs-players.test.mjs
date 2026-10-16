@@ -7,7 +7,8 @@ import {
   playerHasPlayableFaction,
   playerSteamId,
   playerWardogsApiId,
-  wardogsPlayerRows
+  wardogsPlayerRows,
+  wardogsReportedPlayerCount
 } from '../src/wardogs-players.js';
 
 test('keeps the exact roster identifier for per-player WARDOGS routes', () => {
@@ -37,4 +38,12 @@ test('player rows accept the official object wrapper and direct mocks', () => {
   const rows = [{ steamId: '76561198000000001' }];
   assert.equal(wardogsPlayerRows({ players: rows }), rows);
   assert.equal(wardogsPlayerRows(rows), rows);
+});
+
+test('authoritative WARDOGS occupancy is not undercounted by a partial roster', () => {
+  const partialRoster = { players: Array.from({ length: 55 }, (_, i) => ({ name: `Player${i}` })) };
+  assert.equal(wardogsReportedPlayerCount({ players: { current: 60, max: 60 } }, partialRoster), 60);
+  assert.equal(wardogsReportedPlayerCount({}, { count: 60, players: partialRoster.players }), 60);
+  assert.equal(wardogsReportedPlayerCount({}, partialRoster), 55);
+  assert.equal(wardogsReportedPlayerCount({ players: { current: 0 } }, partialRoster), 0);
 });

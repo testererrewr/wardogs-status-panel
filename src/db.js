@@ -819,14 +819,39 @@ function ensure() {
   if (!fs.existsSync(DB_FILE)) writeDb(emptyDb());
 }
 
+// Decrypting, parsing, and running the entire migration on every getter made
+// page loads increasingly slow as playtime/killfeed history grew. Cache only the
+// already-migrated snapshot; return a clone so callers cannot mutate the cache
+// without calling updateDb(). Stat metadata detects changes made by another
+// process or during a manual restore/backup deployment.
+let dbCache = null;
+let dbCacheMtime = null;
+let dbCacheSize = null;
+function dbFileSignature() {
+  const stat = fs.statSync(DB_FILE, { bigint: true });
+  return { mtime: stat.mtimeNs, size: stat.size };
+}
+function cacheSnapshot(value) {
+  const signature = dbFileSignature();
+  dbCache = structuredClone(value);
+  dbCacheMtime = signature.mtime;
+  dbCacheSize = signature.size;
+}
+
 export function readDb() {
   ensure();
   try {
+    const signature = dbFileSignature();
+    if (dbCache && dbCacheMtime === signature.mtime && dbCacheSize === signature.size) {
+      return structuredClone(dbCache);
+    }
     const stored = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     const parsed = stored?.format === 'encrypted-db-v1' && stored?.data
       ? JSON.parse(decryptSecret(stored.data))
       : stored;
-    return migrate(parsed);
+    const migrated = migrate(parsed);
+    cacheSnapshot(migrated);
+    return structuredClone(migrated);
   } catch (error) { throw new Error(`Datenbank konnte nicht gelesen werden: ${error.message}`); }
 }
 
@@ -836,6 +861,7 @@ export function writeDb(db) {
   fs.writeFileSync(TMP_FILE, JSON.stringify(payload), { mode: 0o600 });
   fs.renameSync(TMP_FILE, DB_FILE);
   try { fs.chmodSync(DB_FILE, 0o600); } catch {}
+  cacheSnapshot(db);
 }
 
 export function updateDb(mutator) {

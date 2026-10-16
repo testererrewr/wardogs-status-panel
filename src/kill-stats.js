@@ -9,6 +9,7 @@ import { safeHttpText } from './target-safety.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
 import { normalizeManagedServers, managedServerContext, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat, extractChatEvents } from './managed-chat.js';
+import { stableKillEventId, killEventSeenKey } from './kill-event-id.js';
 import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
 
 export const KILL_STATS_SERVICE_ID = 'wardogs-kill-stats';
@@ -144,8 +145,9 @@ function incomingEvent(payload, raw) {
   const tags = (Array.isArray(raw?.contextTags) ? raw.contextTags : []).map(String).filter(Boolean).slice(0, 30);
   const distanceCm = Math.max(0, Number(raw?.distance) || 0);
   const suicide = tagHas(tags, 'Suicide') || Boolean(killerSteamId && killerSteamId === victimSteamId);
+  const stableId = stableKillEventId(payload, raw);
   return normalizeStoredEvent({
-    id: raw?.eventId || crypto.randomUUID(), receivedAt: nowIso(), serverId: payload?.serverId, serverName: payload?.serverName,
+    id: stableId, receivedAt: nowIso(), serverId: payload?.serverId, serverName: payload?.serverName,
     matchId: raw?.matchId, mapName: raw?.mapName, eventTime: raw?.eventTime,
     killerName: raw?.killerName, killerSteamId, victimName: raw?.victimName, victimSteamId,
     cause: raw?.cause, distanceMeters: distanceCm / 100, tags,
@@ -170,9 +172,11 @@ function ensurePlayer(stats, steamId, name, at) {
   stats.players[steamId] = current;
   return current;
 }
-function applyEventToStats(statsInput, event) {
-  const stats = emptyStats(statsInput);
-  if (event.id && stats.seenEventIds.includes(event.id)) return { stats, duplicate: true };
+export function applyEventToStats(statsInput, event, { normalized = false } = {}) {
+  const stats = normalized ? statsInput : emptyStats(statsInput);
+  // IDs may repeat between servers; deduplicate within one server, not globally.
+  const eventKey = killEventSeenKey(event);
+  if (eventKey && stats.seenEventIds.includes(eventKey)) return { stats, duplicate: true };
   const at = event.receivedAt || nowIso();
   const victim = ensurePlayer(stats, event.victimSteamId, event.victimName, at);
   victim.deaths += 1;
@@ -200,7 +204,7 @@ function applyEventToStats(statsInput, event) {
   stats.lastEventAt = at;
   stats.recentEvents.push(event);
   stats.recentEvents = stats.recentEvents.slice(-500);
-  if (event.id) stats.seenEventIds = [...stats.seenEventIds, event.id].slice(-5000);
+  if (eventKey) stats.seenEventIds = [...stats.seenEventIds, eventKey].slice(-5000);
   return { stats, duplicate: false };
 }
 
@@ -566,7 +570,7 @@ function feedTargets(source, sourceKind) {
 
 function updatePlaytimeFeedTarget(bot, serverId, events) {
   let stats=emptyStats(bot.killStats);let changed=0;
-  for(const event of events){const applied=applyEventToStats(stats,event);stats=applied.stats;if(!applied.duplicate)changed+=1;}
+  for(const event of events){const applied=applyEventToStats(stats,event,{normalized:true});stats=applied.stats;if(!applied.duplicate)changed+=1;}
   const servers=(Array.isArray(bot.playtimeServers)?bot.playtimeServers:[]).map((server)=>{
     if(String(server?.id||'')!==String(serverId||''))return server;
     const existing=(Array.isArray(server.killFeedEvents)?server.killFeedEvents:[]).map(normalizeStoredEvent).filter(Boolean);
@@ -594,7 +598,7 @@ function updateManagedFeedTarget(bot, events) {
   }
   if(bot.serviceId===KILL_STATS_SERVICE_ID){
     let stats=emptyStats(bot.killStats);let changed=0;
-    for(const event of events){const applied=applyEventToStats(stats,event);stats=applied.stats;if(!applied.duplicate)changed+=1;}
+    for(const event of events){const applied=applyEventToStats(stats,event,{normalized:true});stats=applied.stats;if(!applied.duplicate)changed+=1;}
     if(changed){upsertManagedBot({id:bot.id,killStats:stats,killFeedLastEventAt:nowIso(),killFeedNeedsGameRestart:false});setRuntime(bot.id,{trackedEvents:stats.totalEvents,lastEventAt:stats.lastEventAt});schedulePublish(bot.id);}
     return changed;
   }

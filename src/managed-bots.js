@@ -14,7 +14,7 @@ import {
 } from 'discord.js';
 import { decryptSecret } from './crypto.js';
 import { safeHttpText } from './target-safety.js';
-import { factionMatches, normalizeSteamId64, playerFaction, playerHasPlayableFaction, playerSteamId, playerWardogsApiId, wardogsPlayerRows } from './wardogs-players.js';
+import { factionMatches, normalizeSteamId64, playerFaction, playerHasPlayableFaction, playerSteamId, playerWardogsApiId, wardogsPlayerRows , wardogsReportedPlayerCount } from './wardogs-players.js';
 import { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 import { desiredDynamicServerName } from './managed-dynamic-name.js';
 import { normalizeManagedServers, managedServerContext, managedServerContexts, managedServerByChannel, managedServerPatch } from './managed-servers.js';
@@ -436,7 +436,7 @@ async function syncManagedDynamicServerName(bot, state, status, playerCount) {
 
 export async function testManagedWardogs(bot) {
   const [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]);
-  return { status, playerCount: wardogsPlayerRows(players).length || Number(players?.count || 0) };
+  return { status, playerCount: wardogsReportedPlayerCount(status, players) };
 }
 
 export function normalizeManagedBanDiscordLink(value) {
@@ -1856,7 +1856,7 @@ async function controlPanelPayload(bot) {
     .addFields(
       { name: 'Server', value: cut(status?.serverName || 'Unreachable', 1024), inline: true },
       { name: 'Map', value: cut(status?.map || '—', 1024), inline: true },
-      { name: 'Players', value: `${status?.players?.current ?? playerList.length} / ${status?.players?.max ?? '—'}`, inline: true },
+      { name: 'Players', value: `${wardogsReportedPlayerCount(status, players)} / ${status?.players?.max ?? '—'}`, inline: true },
       { name: 'Scores', value: cut(scoreText, 1024), inline: false },
       { name: 'Auto-Ban', value: bot.autoBanEnabled === true ? 'ON' : 'OFF', inline: true },
       { name: 'Auto-Announcements', value: bot.announcementEnabled === true ? 'ON' : 'OFF', inline: true }
@@ -1986,13 +1986,22 @@ async function pollPlayers(bot, state, client) {
   try {
     let status = null;
     let data = null;
-    if (bot.dynamicNameEnabled === true) {
-      [data, status] = await Promise.all([wardogsRequest(bot, '/v1/players'), wardogsRequest(bot, '/v1/status')]);
-    } else {
-      data = await wardogsRequest(bot, '/v1/players');
+    data = await wardogsRequest(bot, '/v1/players');
+    // The authoritative occupancy may differ from the actionable roster.
+    // Query status at most once per minute unless dynamic-name needs it now.
+    if (bot.dynamicNameEnabled === true || Date.now() - Number(state.lastServerStatusAt || 0) >= 60_000) {
+      try {
+        status = await wardogsRequest(bot, '/v1/status');
+        state.lastServerStatusAt = Date.now();
+        state.lastServerStatusPlayerCount = wardogsReportedPlayerCount(status, data);
+      } catch (error) {
+        // Auth failures must not get hidden by the optional count refresh.
+        if (error?.wardogsAuthLocked) throw error;
+        state.lastServerStatusAt = Date.now();
+      }
     }
     const players = wardogsPlayerRows(data);
-    if (bot.dynamicNameEnabled === true && status) await syncManagedDynamicServerName(bot, state, status, players.length);
+    if (bot.dynamicNameEnabled === true && status) await syncManagedDynamicServerName(bot, state, status, wardogsReportedPlayerCount(status, data));
     const rules = parseManagedRules(bot.rulesText || '');
     const ignored = ignoredSteamIds(bot);
 
@@ -2086,7 +2095,7 @@ async function pollPlayers(bot, state, client) {
     if (bot.controlPanelEnabled && Date.now() - Number(state.lastPanelRefreshAt || 0) >= 30_000) {
       await ensureControlPanel(bot, client, state).catch((error) => setRuntime(bot.id, { lastPanelError: error.message }));
     }
-    setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: players.length, lastCheck: nowIso(), lastError: null });
+    setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: status ? wardogsReportedPlayerCount(status, data) : (Number.isInteger(state.lastServerStatusPlayerCount) ? state.lastServerStatusPlayerCount : players.length), rosterPlayers: players.length, lastCheck: nowIso(), lastError: null });
   } catch (error) {
     setRuntime(bot.id, { state: 'error', lastCheck: nowIso(), lastError: error.message });
   } finally {
@@ -2130,6 +2139,8 @@ function modal(customId, title, fields) {
 async function playerPage(bot, page = 0) {
   const data = await wardogsRequest(bot, '/v1/players');
   const players = wardogsPlayerRows(data).filter((p) => Boolean(playerSteamId(p)));
+  let reportedCount = players.length;
+  try { const status = await wardogsRequest(bot, '/v1/status'); reportedCount = wardogsReportedPlayerCount(status, data); } catch {}
   const pages = Math.max(1, Math.ceil(players.length / 25));
   const safePage = Math.max(0, Math.min(pages - 1, Number(page) || 0));
   const slice = players.slice(safePage * 25, safePage * 25 + 25);
@@ -2146,7 +2157,7 @@ async function playerPage(bot, page = 0) {
     new ButtonBuilder().setCustomId(`wd:playerpage:${bot.id}:${safePage - 1}`).setLabel('←').setStyle(ButtonStyle.Secondary).setDisabled(safePage <= 0),
     new ButtonBuilder().setCustomId(`wd:playerpage:${bot.id}:${safePage + 1}`).setLabel('→').setStyle(ButtonStyle.Secondary).setDisabled(safePage >= pages - 1)
   ));
-  return { content: `**Live Players** · ${players.length} online · Page ${safePage + 1}/${pages}`, components: rows, ephemeral: true };
+  return { content: `**Live Players** · ${reportedCount} online · ${players.length} mit Details · Page ${safePage + 1}/${pages}`, components: rows, ephemeral: true };
 }
 
 async function playerControl(bot, steamId) {

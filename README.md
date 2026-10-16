@@ -1,10 +1,22 @@
-# status-hub.lol v3.12.50
+# status-hub.lol v3.12.52
 
+## v3.12.52 – Custom-Bot-Performance, WARDOGS-Spielerzähler und Stats-Diagnose
 
+- **Schnellere Custom-Bots-Seite:** Bot-Karten werden ohne blockierende Docker-Statusabfragen geladen. Der Browser ruft Laufzeitinformationen nach dem Rendern im Hintergrund ab (alle 30 Sekunden nur bei sichtbarem Tab). Der Runner beantwortet die Anfragen mit einem `docker ps --all` für alle eigenen Bots statt einzelner `docker inspect`-Aufrufe pro Bot. Die Seite liest die lokalen Besitzerinformationen aus nur einem Datenbank-Snapshot.
+- **Datenbank-Performance:** Entschlüsselung, JSON-Parsing und Migration werden bei unveränderter DB-Datei nicht bei jedem Getter wiederholt. Der In-Memory-Snapshot wird kopiert, bevor er an Aufrufer geht. Änderungen durch `updateDb` und Datei-Restores invalidieren den Cache.
+- **WARDOGS Management Bot:** Spielerzahl bevorzugt die offizielle Belegung aus `/v1/status` und zeigt die Zahl einzeln verfügbarer `/v1/players`-Einträge getrennt. Beispiel: `60 online · 55 mit Details`, statt eine unvollständige Liste als Gesamtbelegung auszugeben. Gilt für Control-Panel, Management-Webseite, dynamischen Servernamen und Live-Spielerliste.
+- **WARDOGS Stats Bot:** Bei laufenden Polls wird die komplette Statistik nicht mehr jedes Mal tief kopiert; die Verarbeitung vieler Feed-Events vermeidet wiederholte komplette Statistik-Kopien. Events bekommen stabilere IDs bei Feed-Retry (sofern ein verlässlicher Event-Zeitstempel vorhanden ist) und sind pro Server getrennt dedupliziert. Im Bot-Service-Webpanel steht eine neue **Stats-Diagnose** mit letztem Spieler-Poll, Killfeed-Ereigniszahl und Feed-Konfiguration/Neustartstatus je Server.
+- **Wichtig:** Fehlende Kill-/Headshot-Events können nicht aus der WARDOGS-Spielerliste rekonstruiert werden; hierfür muss der Gameserver-Feed korrekt senden. Die Live-Situation auf deinem Gameserver bzw. Discord konnte nicht verifiziert werden.
+- Datenbankschema bleibt unverändert. Die vorhandenen Zugangsdaten und Statistiken bleiben bestehen.
 
+## v3.12.51 – Großes Discord-Leaderboard in 5 Seiten + K/D ab 50 Kills
 
-
-
+- Das Discord-Leaderboard wird nicht mehr als ein extrem hohes Gesamtbild ausgegeben. `/leaderboard` und die feste Leaderboard-Nachricht nutzen jetzt **5 große Seiten** mit einem Discord-freundlichen 1600×1010-Format.
+- Seitenaufteilung: **Kills/Tode**, **K/D/Headshot-Rate**, **Kill-Rekord/Spielzeit**, **Match-Siege/Matches**, **Seeding-Zeit**.
+- Unter jedem Discord-Panel stehen **Zurück**, **Seitenanzeige**, **Weiter** und **Spieler suchen**. Beim Blättern wird dieselbe Discord-Nachricht editiert und die alte Grafik sauber ersetzt.
+- K/D wird jetzt wie die Headshot-Rate erst ab **50 Gesamtkills** gewertet. Unter 50 Kills wird auch in Spielerprofilen kein K/D-Wert ausgegeben, sondern der Fortschritt bis 50 Kills angezeigt.
+- Webpanel, Discord-Grafik und Embed-Fallback verwenden dieselbe 50-Kill-Grenze.
+- Die Discord-Grafik behält den Webpanel-Look: goldener `LEADERBOARD`-Titel, schwarzes Board, gelbe Seitenlinie, zwei große Kategorien pro Seite, Medaillen und Rang-Badges.
 
 ## v3.12.50 – Discord-Leaderboard im Webpanel-Look
 

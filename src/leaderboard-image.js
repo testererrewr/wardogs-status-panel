@@ -1,19 +1,17 @@
 import { spawn } from 'node:child_process';
 
 const WIDTH = 1600;
-const BOARD_X = 110;
-const BOARD_Y = 150;
-const BOARD_W = 1380;
-const BOARD_PAD = 34;
-const COLUMN_GAP = 54;
-const COLUMN_W = Math.floor((BOARD_W - (BOARD_PAD * 2) - COLUMN_GAP) / 2);
-const CATEGORY_HEADER_H = 42;
-const ENTRY_H = 31;
+const HEIGHT = 1010;
+const BOARD_X = 70;
+const BOARD_Y = 125;
+const BOARD_W = 1460;
+const BOARD_H = 815;
+const BOARD_PAD = 40;
+const COLUMN_GAP = 58;
+const CATEGORY_START_Y = 330;
+const CATEGORY_HEADER_H = 46;
+const ENTRY_H = 34;
 const ENTRY_COUNT = 15;
-const CATEGORY_H = CATEGORY_HEADER_H + (ENTRY_H * ENTRY_COUNT);
-const CATEGORY_GAP = 46;
-const CATEGORY_START_Y = 365;
-const FOOTER_H = 92;
 const BG = '#0b1120';
 const BOARD = '#050506';
 const BOARD_BORDER = '#303035';
@@ -25,6 +23,14 @@ const RULE_BG = '#10162a';
 const RULE_BORDER = '#29324f';
 const BADGE_BG = '#111a36';
 const BADGE_BORDER = '#384465';
+
+export const LEADERBOARD_PAGE_GROUPS = Object.freeze([
+  Object.freeze(['kills', 'deaths']),
+  Object.freeze(['kd', 'headshots']),
+  Object.freeze(['killrecord', 'playtime']),
+  Object.freeze(['wins', 'matches']),
+  Object.freeze(['seeding'])
+]);
 
 function safeString(value) {
   return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -59,13 +65,13 @@ function titleFor(category) {
   const map = {
     kills: 'Kills',
     deaths: 'Tode',
-    kd: 'K/D (ab 100 Kills)',
+    kd: 'K/D (ab 50 Kills)',
     playtime: 'Spielzeit',
     killrecord: 'Kill-Rekord / Match',
     headshots: 'Headshot-Rate (ab 50 Kills)',
     wins: 'Match-Siege',
     matches: 'Matches gespielt',
-    seeding: 'Seeding-Zeit (1–20)'
+    seeding: 'Seeding-Zeit (1–20 Spieler)'
   };
   return map[category?.id] || safeString(category?.label).replace(/^[^A-Za-z0-9ÄÖÜäöü]+\s*/, '') || 'Kategorie';
 }
@@ -100,21 +106,21 @@ function medal(x, y, rank) {
 function rankBadge(x, y, rank) {
   if (rank <= 3) return medal(x, y + 1, rank);
   return [
-    roundedRect(x, y + 2, 42, 26, BADGE_BG, BADGE_BORDER, 6, 1),
-    text(x + 21, y + 21, `${rank}.`, { size: 13, weight: 950, anchor: 'middle' })
+    roundedRect(x, y + 2, 44, 28, BADGE_BG, BADGE_BORDER, 6, 1),
+    text(x + 22, y + 22, `${rank}.`, { size: 14, weight: 950, anchor: 'middle' })
   ].join('');
 }
 
-function categorySvg(category, x, y) {
+function categorySvg(category, x, y, width) {
   const rows = Array.isArray(category?.rows) ? category.rows.slice(0, ENTRY_COUNT) : [];
   const parts = [];
-  parts.push(roundedRect(x, y + 7, 26, 26, '#17191f', '#262a33', 7, 1));
-  parts.push(text(x + 13, y + 26, accentFor(category), { size: accentFor(category).length > 1 ? 10 : 13, weight: 950, fill: GOLD, anchor: 'middle' }));
-  parts.push(text(x + 38, y + 29, titleFor(category), { size: 20, weight: 900 }));
-  parts.push(text(x + COLUMN_W, y + 27, 'TOP 15', { size: 11, weight: 900, fill: DIM, anchor: 'end', letterSpacing: 1.2 }));
+  parts.push(roundedRect(x, y + 7, 29, 29, '#17191f', '#262a33', 7, 1));
+  parts.push(text(x + 14.5, y + 28, accentFor(category), { size: accentFor(category).length > 1 ? 10 : 14, weight: 950, fill: GOLD, anchor: 'middle' }));
+  parts.push(text(x + 43, y + 31, titleFor(category), { size: 23, weight: 900 }));
+  parts.push(text(x + width, y + 29, 'TOP 15', { size: 12, weight: 900, fill: DIM, anchor: 'end', letterSpacing: 1.2 }));
 
   if (!rows.length) {
-    parts.push(text(x, y + CATEGORY_HEADER_H + 31, 'Noch keine Daten erfasst.', { size: 14, weight: 650, fill: DIM }));
+    parts.push(text(x, y + CATEGORY_HEADER_H + 34, 'Noch keine Daten erfasst.', { size: 16, weight: 650, fill: DIM }));
     return parts.join('');
   }
 
@@ -123,23 +129,33 @@ function categorySvg(category, x, y) {
     if (!row) break;
     const rowY = y + CATEGORY_HEADER_H + (i * ENTRY_H);
     parts.push(rankBadge(x, rowY, i + 1));
-    const player = truncate(row?.name || row?.steamId || 'Unbekannt', 32);
-    parts.push(text(x + 58, rowY + 22, player, { size: 16, weight: 850 }));
+    const player = truncate(row?.name || row?.steamId || 'Unbekannt', width > 900 ? 50 : 31);
+    parts.push(text(x + 62, rowY + 23, player, { size: 18, weight: 850 }));
     let value = '—';
     try { value = category?.format ? safeString(category.format(row)) : '—'; } catch { value = '—'; }
-    parts.push(text(x + COLUMN_W, rowY + 22, truncate(value, 18), { size: 15, weight: 900, anchor: 'end' }));
+    parts.push(text(x + width, rowY + 23, truncate(value, 19), { size: 17, weight: 900, anchor: 'end' }));
   }
   return parts.join('');
 }
 
-export function buildLeaderboardSvg(snapshot, { timeZone = 'Europe/Vienna', generatedAt = new Date() } = {}) {
+function pageCategories(snapshot, page = 0) {
   const categories = Array.isArray(snapshot?.categories) ? snapshot.categories : [];
-  const rows = Math.max(1, Math.ceil(categories.length / 2));
-  const categoriesHeight = (rows * CATEGORY_H) + (Math.max(0, rows - 1) * CATEGORY_GAP);
-  const boardBottom = CATEGORY_START_Y + categoriesHeight + FOOTER_H;
-  const height = Math.max(1040, boardBottom + 70);
+  const byId = new Map(categories.map((category) => [category.id, category]));
+  const normalizedPage = Math.max(0, Math.min(LEADERBOARD_PAGE_GROUPS.length - 1, Number(page) || 0));
+  return LEADERBOARD_PAGE_GROUPS[normalizedPage].map((id) => byId.get(id)).filter(Boolean);
+}
+
+export function leaderboardPageCount() {
+  return LEADERBOARD_PAGE_GROUPS.length;
+}
+
+export function buildLeaderboardPageSvg(snapshot, { page = 0, timeZone = 'Europe/Vienna', generatedAt = new Date() } = {}) {
+  const pageCount = leaderboardPageCount();
+  const normalizedPage = Math.max(0, Math.min(pageCount - 1, Number(page) || 0));
+  const categories = pageCategories(snapshot, normalizedPage);
   const innerX = BOARD_X + BOARD_PAD;
-  const rightX = innerX + COLUMN_W + COLUMN_GAP;
+  const innerW = BOARD_W - (BOARD_PAD * 2);
+  const columnW = Math.floor((innerW - COLUMN_GAP) / 2);
   const playerCount = Array.isArray(snapshot?.players) ? snapshot.players.length : 0;
   const since = formatDate(snapshot?.startedAt, timeZone);
   const generated = (() => {
@@ -148,36 +164,44 @@ export function buildLeaderboardSvg(snapshot, { timeZone = 'Europe/Vienna', gene
   })();
 
   const parts = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}">`,
-    `<rect width="${WIDTH}" height="${height}" fill="${BG}"/>`,
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}">`,
+    `<rect width="${WIDTH}" height="${HEIGHT}" fill="${BG}"/>`,
     `<defs><filter id="shadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#000" flood-opacity="0.45"/></filter></defs>`,
-    text(WIDTH / 2, 92, 'LEADERBOARD', { size: 62, weight: 950, fill: GOLD, anchor: 'middle', letterSpacing: 2.5 }),
-    `<rect x="${BOARD_X}" y="${BOARD_Y}" width="${BOARD_W}" height="${boardBottom - BOARD_Y}" rx="12" fill="${BOARD}" stroke="${BOARD_BORDER}" stroke-width="1.5" filter="url(#shadow)"/>`,
-    `<rect x="${BOARD_X}" y="${BOARD_Y}" width="6" height="${boardBottom - BOARD_Y}" rx="3" fill="#f2df00"/>`,
-    text(innerX, 206, '🏆  All-Time Leaderboard', { size: 22, weight: 900 }),
-    text(innerX, 248, 'TOP 15 PRO KATEGORIE', { size: 22, weight: 900 }),
-    text(innerX, 286, `${playerCount.toLocaleString('de-DE')} Spieler erfasst seit ${since}`, { size: 14, weight: 550, fill: MUTED }),
-    roundedRect(1095, 184, 166, 38, RULE_BG, RULE_BORDER, 8, 1),
-    text(1178, 209, 'K/D: ab 100 Kills', { size: 12, weight: 850, fill: '#e8ebf3', anchor: 'middle' }),
-    roundedRect(1272, 184, 184, 38, RULE_BG, RULE_BORDER, 8, 1),
-    text(1364, 209, 'Headshot: ab 50 Kills', { size: 12, weight: 850, fill: '#e8ebf3', anchor: 'middle' }),
-    `<line x1="${innerX}" y1="326" x2="${BOARD_X + BOARD_W - BOARD_PAD}" y2="326" stroke="#22242a" stroke-width="1"/>`
+    text(WIDTH / 2, 84, 'LEADERBOARD', { size: 64, weight: 950, fill: GOLD, anchor: 'middle', letterSpacing: 2.5 }),
+    `<rect x="${BOARD_X}" y="${BOARD_Y}" width="${BOARD_W}" height="${BOARD_H}" rx="12" fill="${BOARD}" stroke="${BOARD_BORDER}" stroke-width="1.5" filter="url(#shadow)"/>`,
+    `<rect x="${BOARD_X}" y="${BOARD_Y}" width="7" height="${BOARD_H}" rx="3" fill="#f2df00"/>`,
+    text(innerX, 180, 'ALL-TIME LEADERBOARD', { size: 24, weight: 950 }),
+    text(innerX, 222, 'TOP 15 PRO KATEGORIE', { size: 23, weight: 900 }),
+    text(innerX, 260, `${playerCount.toLocaleString('de-DE')} Spieler erfasst seit ${since}`, { size: 15, weight: 550, fill: MUTED }),
+    roundedRect(1030, 157, 178, 42, RULE_BG, RULE_BORDER, 8, 1),
+    text(1119, 184, 'K/D: ab 50 Kills', { size: 13, weight: 850, fill: '#e8ebf3', anchor: 'middle' }),
+    roundedRect(1220, 157, 207, 42, RULE_BG, RULE_BORDER, 8, 1),
+    text(1323.5, 184, 'Headshot: ab 50 Kills', { size: 13, weight: 850, fill: '#e8ebf3', anchor: 'middle' }),
+    roundedRect(1290, 220, 137, 38, '#17191f', '#2c2f38', 8, 1),
+    text(1358.5, 245, `SEITE ${normalizedPage + 1}/${pageCount}`, { size: 13, weight: 900, fill: GOLD, anchor: 'middle', letterSpacing: 0.8 }),
+    `<line x1="${innerX}" y1="295" x2="${BOARD_X + BOARD_W - BOARD_PAD}" y2="295" stroke="#22242a" stroke-width="1"/>`
   ];
 
-  for (let i = 0; i < categories.length; i += 1) {
-    const row = Math.floor(i / 2);
-    const col = i % 2;
-    const x = col === 0 ? innerX : rightX;
-    const y = CATEGORY_START_Y + (row * (CATEGORY_H + CATEGORY_GAP));
-    parts.push(categorySvg(categories[i], x, y));
+  if (categories.length === 1) {
+    const singleW = 980;
+    const singleX = Math.round((WIDTH - singleW) / 2);
+    parts.push(categorySvg(categories[0], singleX, CATEGORY_START_Y, singleW));
+  } else {
+    parts.push(categorySvg(categories[0], innerX, CATEGORY_START_Y, columnW));
+    if (categories[1]) parts.push(categorySvg(categories[1], innerX + columnW + COLUMN_GAP, CATEGORY_START_Y, columnW));
   }
 
-  const footerY = boardBottom - 54;
-  parts.push(`<line x1="${innerX}" y1="${footerY - 26}" x2="${BOARD_X + BOARD_W - BOARD_PAD}" y2="${footerY - 26}" stroke="#202228" stroke-width="1"/>`);
-  parts.push(text(innerX, footerY, 'Spieler suchen: Button direkt unter dem Discord-Panel · genaue Position auch außerhalb der Top 15', { size: 13, weight: 650, fill: MUTED }));
-  parts.push(text(BOARD_X + BOARD_W - BOARD_PAD, footerY, `Aktualisiert ${generated}`, { size: 12, weight: 650, fill: DIM, anchor: 'end' }));
+  const footerY = BOARD_Y + BOARD_H - 31;
+  parts.push(`<line x1="${innerX}" y1="${footerY - 30}" x2="${BOARD_X + BOARD_W - BOARD_PAD}" y2="${footerY - 30}" stroke="#202228" stroke-width="1"/>`);
+  parts.push(text(innerX, footerY, 'Spieler suchen: Button unter dem Discord-Panel · exakte Position auch außerhalb der Top 15', { size: 14, weight: 650, fill: MUTED }));
+  parts.push(text(BOARD_X + BOARD_W - BOARD_PAD, footerY, `Aktualisiert ${generated}`, { size: 13, weight: 650, fill: DIM, anchor: 'end' }));
   parts.push('</svg>');
-  return { svg: parts.join(''), width: WIDTH, height };
+  return { svg: parts.join(''), width: WIDTH, height: HEIGHT, page: normalizedPage, pageCount };
+}
+
+// Backwards-compatible API: callers that do not specify a page receive page 1.
+export function buildLeaderboardSvg(snapshot, options = {}) {
+  return buildLeaderboardPageSvg(snapshot, options);
 }
 
 function runRenderer(command, args, svg, timeoutMs = 15000) {
@@ -223,8 +247,8 @@ function runRenderer(command, args, svg, timeoutMs = 15000) {
   });
 }
 
-export async function renderLeaderboardPng(snapshot, options = {}) {
-  const { svg, width, height } = buildLeaderboardSvg(snapshot, options);
+export async function renderLeaderboardPagePng(snapshot, options = {}) {
+  const { svg, width, height, page, pageCount } = buildLeaderboardPageSvg(snapshot, options);
   const candidates = [
     ['rsvg-convert', ['-f', 'png']],
     ['/usr/bin/rsvg-convert', ['-f', 'png']],
@@ -236,10 +260,14 @@ export async function renderLeaderboardPng(snapshot, options = {}) {
   for (const [command, args] of candidates) {
     try {
       const png = await runRenderer(command, args, svg);
-      return { png, width, height, svg };
+      return { png, width, height, svg, page, pageCount };
     } catch (error) {
       errors.push(`${command}: ${String(error?.message || error).slice(0, 180)}`);
     }
   }
   throw new Error(`Leaderboard image renderer unavailable: ${errors.join(' · ').slice(0, 900)}`);
+}
+
+export async function renderLeaderboardPng(snapshot, options = {}) {
+  return renderLeaderboardPagePng(snapshot, options);
 }

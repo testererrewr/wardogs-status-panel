@@ -7,7 +7,7 @@ import { normalizeFactionKey, normalizeSteamId64, playerFaction, playerSteamId a
 import { managedMatchBoundary } from './managed-welcome.js';
 import { killStatsSnapshotFromStats, prettyCause } from './kill-stats.js';
 import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
-import { renderLeaderboardPng } from './leaderboard-image.js';
+import { LEADERBOARD_PAGE_GROUPS, leaderboardPageCount, renderLeaderboardPagePng } from './leaderboard-image.js';
 
 export const PLAYTIME_SERVICE_ID = 'wardogs-playtime-tracker';
 const instances = new Map();
@@ -20,6 +20,7 @@ const LEADERBOARD_MS = 6 * 60 * 60 * 1000;
 const SAVE_MS = 60 * 1000;
 const LINK_CODE_TTL_MS = 10 * 60 * 1000;
 const LEADERBOARD_TOP = 15;
+export const KD_MIN_KILLS = 50;
 export const HEADSHOT_RATE_MIN_KILLS = 50;
 
 function nowIso() { return new Date().toISOString(); }
@@ -356,7 +357,7 @@ export function combinedStatsSnapshot(bot, state = null) {
   const categories = [
     { id: 'kills', label: '🗡️ Kills', rows: players.slice().sort(sorter('kills')), format: (p) => formatNumber(p.kills) },
     { id: 'deaths', label: '☠️ Tode', rows: players.slice().sort(sorter('deaths')), format: (p) => formatNumber(p.deaths) },
-    { id: 'kd', label: '🎯 K/D (ab 100 Kills)', rows: players.filter((p) => p.kills >= 100).sort(sorter('kd')), format: (p) => formatNumber(p.kd, 2) },
+    { id: 'kd', label: `🎯 K/D (ab ${KD_MIN_KILLS} Kills)`, rows: players.filter((p) => p.kills >= KD_MIN_KILLS).sort(sorter('kd')), format: (p) => formatNumber(p.kd, 2) },
     { id: 'playtime', label: '⏱️ Spielzeit', rows: players.slice().sort(sorter('totalSeconds')), format: (p) => formatHoursCompact(p.totalSeconds) },
     { id: 'killrecord', label: '💥 Kill-Rekord / Match', rows: players.slice().sort(sorter('killRecord')), format: (p) => formatNumber(p.killRecord) },
     { id: 'headshots', label: `🎯 Headshot-Rate (ab ${HEADSHOT_RATE_MIN_KILLS} Kills)`, rows: players.filter((p) => p.kills >= HEADSHOT_RATE_MIN_KILLS).sort(sorter('headshotRate')), format: (p) => `${formatNumber(p.headshotRate * 100, 1)}%` },
@@ -395,6 +396,9 @@ function playerStatsEmbed(bot, player, snapshot, { showIdentity = false, discord
   const lastSeen = player?.lastSeenAt ? `<t:${Math.floor(Date.parse(player.lastSeenAt) / 1000)}:R>` : '—';
   const titleName = cleanDisplayName(player?.name || player?.steamId);
   const kills = Math.max(0, Number(player?.kills) || 0);
+  const kdValue = kills >= KD_MIN_KILLS
+    ? formatNumber(player?.kd, 2)
+    : `🔒 ab ${KD_MIN_KILLS} Kills (${formatNumber(kills)}/${KD_MIN_KILLS})`;
   const headshotRateValue = kills >= HEADSHOT_RATE_MIN_KILLS
     ? `${formatNumber(Number(player?.headshotRate || 0) * 100, 1)}%`
     : `🔒 ab ${HEADSHOT_RATE_MIN_KILLS} Kills (${formatNumber(kills)}/${HEADSHOT_RATE_MIN_KILLS})`;
@@ -411,7 +415,7 @@ function playerStatsEmbed(bot, player, snapshot, { showIdentity = false, discord
     .addFields(
       { name: 'Kills', value: formatNumber(kills), inline: true },
       { name: 'Tode', value: formatNumber(player?.deaths), inline: true },
-      { name: 'K/D', value: formatNumber(player?.kd, 2), inline: true },
+      { name: `K/D (ab ${KD_MIN_KILLS} Kills)`, value: kdValue, inline: true },
       { name: 'Matches', value: formatNumber(player?.matchesPlayed), inline: true },
       { name: 'Siege', value: `${formatNumber(player?.matchWins)} (${formatNumber(Number(player?.winRate || 0) * 100, 0)}%)`, inline: true },
       { name: 'Kill-Rekord', value: formatNumber(player?.killRecord), inline: true },
@@ -429,46 +433,58 @@ function playerStatsEmbed(bot, player, snapshot, { showIdentity = false, discord
 function leaderboardField(category) {
   const medals = ['🥇', '🥈', '🥉'];
   const rows = category.rows.slice(0, LEADERBOARD_TOP);
-  const value = rows.length ? rows.map((p, index) => `${medals[index] || `**${index + 1}.**`} ${cleanDisplayName(p.name, p.steamId).slice(0, 18)} — **${category.format(p)}**`).join('\n') : 'Noch keine Daten.';
+  const value = rows.length ? rows.map((p, index) => `${medals[index] || `**${index + 1}.**`} ${cleanDisplayName(p.name, p.steamId).slice(0, 22)} — **${category.format(p)}**`).join('\n') : 'Noch keine Daten.';
   return { name: category.label, value: value.slice(0, 1024), inline: true };
 }
-function fallbackLeaderboardPayload(snapshot, bot) {
-  const fields = snapshot.categories.map(leaderboardField);
-  const groups = [];
-  for (let i = 0; i < fields.length; i += 2) groups.push(fields.slice(i, i + 2));
-  const embeds = groups.map((group, index) => {
-    const embed = new EmbedBuilder().addFields(...group);
-    if (index === 0) {
-      embed.setColor(0xf1c40f)
-        .setTitle('🏆 ALL-TIME LEADERBOARD')
-        .setDescription(`**Top ${LEADERBOARD_TOP} pro Kategorie** · ${snapshot.players.length} Spieler erfasst${snapshot.startedAt ? ` seit <t:${Math.floor(Date.parse(snapshot.startedAt) / 1000)}:D>` : ''}.\nK/D wird ab **100 Kills** gewertet · Headshot-Rate ab **${HEADSHOT_RATE_MIN_KILLS} Kills**. Nutze **Spieler suchen** für die genaue Position außerhalb der Top ${LEADERBOARD_TOP}.`);
-    } else embed.setColor(0xf1c40f);
-    if (index === groups.length - 1) embed.setFooter({ text: 'WARDOGS Status Bot · status-hub.lol · automatische Aktualisierung alle 6 Stunden' }).setTimestamp(new Date());
-    return embed;
-  });
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary)
-  );
-  return { embeds, components: [row], allowedMentions: { parse: [] } };
+function normalizedLeaderboardPage(page) {
+  const count = leaderboardPageCount();
+  return Math.max(0, Math.min(count - 1, Number(page) || 0));
 }
-export async function buildLeaderboardPayload(bot, state) {
-  const snapshot = combinedStatsSnapshot(bot, state);
-  const row = new ActionRowBuilder().addComponents(
+function leaderboardPageCategories(snapshot, page) {
+  const ids = LEADERBOARD_PAGE_GROUPS[normalizedLeaderboardPage(page)] || LEADERBOARD_PAGE_GROUPS[0];
+  const categories = Array.isArray(snapshot?.categories) ? snapshot.categories : [];
+  const byId = new Map(categories.map((category) => [category.id, category]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+function leaderboardControls(bot, page) {
+  const pageCount = leaderboardPageCount();
+  const current = normalizedLeaderboardPage(page);
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.max(0, current - 1)}:${bot.id}`).setLabel('◀ Zurück').setStyle(ButtonStyle.Secondary).setDisabled(current <= 0),
+    new ButtonBuilder().setCustomId(`wdstatus:lbpage:${current}:${bot.id}`).setLabel(`${current + 1}/${pageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`wdstatus:lb:${Math.min(pageCount - 1, current + 1)}:${bot.id}`).setLabel('Weiter ▶').setStyle(ButtonStyle.Secondary).setDisabled(current >= pageCount - 1),
     new ButtonBuilder().setCustomId(`wdstatus:search:${bot.id}`).setLabel('Spieler suchen').setStyle(ButtonStyle.Primary)
   );
+}
+function fallbackLeaderboardPayload(snapshot, bot, page = 0) {
+  const current = normalizedLeaderboardPage(page);
+  const categories = leaderboardPageCategories(snapshot, current);
+  const fields = categories.map(leaderboardField);
+  const embed = new EmbedBuilder()
+    .setColor(0xf1c40f)
+    .setTitle(`🏆 ALL-TIME LEADERBOARD · Seite ${current + 1}/${leaderboardPageCount()}`)
+    .setDescription(`**Top ${LEADERBOARD_TOP} pro Kategorie** · ${snapshot.players.length} Spieler erfasst${snapshot.startedAt ? ` seit <t:${Math.floor(Date.parse(snapshot.startedAt) / 1000)}:D>` : ''}.\nK/D wird ab **${KD_MIN_KILLS} Kills** gewertet · Headshot-Rate ab **${HEADSHOT_RATE_MIN_KILLS} Kills**.`)
+    .addFields(...fields)
+    .setFooter({ text: 'WARDOGS Status Bot · automatische Aktualisierung alle 6 Stunden' })
+    .setTimestamp(new Date());
+  return { embeds: [embed], components: [leaderboardControls(bot, current)], allowedMentions: { parse: [] } };
+}
+export async function buildLeaderboardPayload(bot, state, page = 0) {
+  const snapshot = combinedStatsSnapshot(bot, state);
+  const current = normalizedLeaderboardPage(page);
   try {
-    const rendered = await renderLeaderboardPng(snapshot, { timeZone: timeZone(bot) });
+    const rendered = await renderLeaderboardPagePng(snapshot, { page: current, timeZone: timeZone(bot) });
     setRuntime(bot.id, { leaderboardRenderError: null });
     return {
       content: null,
       embeds: [],
-      files: [{ attachment: rendered.png, name: 'wardogs-leaderboard.png', description: 'WARDOGS All-Time Leaderboard' }],
-      components: [row],
+      files: [{ attachment: rendered.png, name: `wardogs-leaderboard-${current + 1}.png`, description: `WARDOGS All-Time Leaderboard Seite ${current + 1}/${rendered.pageCount}` }],
+      components: [leaderboardControls(bot, current)],
       allowedMentions: { parse: [] }
     };
   } catch (error) {
     setRuntime(bot.id, { leaderboardRenderError: String(error?.message || error).slice(0, 500) });
-    return fallbackLeaderboardPayload(snapshot, bot);
+    return fallbackLeaderboardPayload(snapshot, bot, current);
   }
 }
 
@@ -690,8 +706,9 @@ async function handleStatusCommand(botId, interaction) {
     return interaction.reply({ embeds: [playerStatsEmbed(bot, player, snapshot, { showIdentity: command !== 'status', discordUser: command !== 'status' ? target : null })], allowedMentions: { users: [target.id] } });
   }
   if (command === 'leaderboard') {
-    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null);
-    return interaction.reply({ ...payload, allowedMentions: { parse: [] } });
+    await interaction.deferReply();
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, 0);
+    return interaction.editReply({ ...payload, allowedMentions: { parse: [] } });
   }
   if (command === 'playerstats') {
     const query = interaction.options.getString('spieler', true);
@@ -709,10 +726,18 @@ async function handleStatusInteraction(botId, interaction) {
   if (interaction.isChatInputCommand?.()) return handleStatusCommand(botId, interaction);
   const id = String(interaction.customId || '');
   if (id === `wdstatus:search:${botId}` && interaction.isButton()) return interaction.showModal(killStatsSearchModal(botId));
+  const pageMatch = id.match(/^wdstatus:lb:(\d+):(.+)$/);
+  if (pageMatch && pageMatch[2] === botId && interaction.isButton()) {
+    const page = normalizedLeaderboardPage(Number(pageMatch[1]));
+    await interaction.deferUpdate();
+    const payload = await buildLeaderboardPayload(bot, instances.get(botId)?.state || null, page);
+    return interaction.editReply({ ...payload, attachments: [], allowedMentions: { parse: [] } });
+  }
   if (id === `wdstatus:top:${botId}` && interaction.isButton()) {
+    await interaction.deferReply({ ephemeral: true });
     const active = instances.get(botId);
-    const payload = await buildLeaderboardPayload(bot, active?.state || null);
-    return interaction.reply({ ...payload, ephemeral: true });
+    const payload = await buildLeaderboardPayload(bot, active?.state || null, 0);
+    return interaction.editReply({ ...payload, allowedMentions: { parse: [] } });
   }
   if (id === `wdstatus:searchmodal:${botId}` && interaction.isModalSubmit()) {
     const query = interaction.fields.getTextInputValue('query');
@@ -863,7 +888,14 @@ async function pollOne(bot, state, { forceLeaderboard = false } = {}) {
     if (!servers.length) throw new Error('At least one WARDOGS server is required');
     // Keep runtime stats aligned when a server is added/removed without losing the
     // history of the remaining servers.
-    state.stats = normalizeStats(state.stats, servers);
+    // Do not deep-clone and normalize every recorded player on EVERY poll.
+    // Large servers accumulate thousands of records; normalize only when the
+    // configured server set changes (startOne already normalizes at startup).
+    const configured = new Set(servers.map((row) => row.id));
+    if (!state.stats?.servers || Object.keys(state.stats.servers).length !== configured.size ||
+        servers.some((row) => !Object.hasOwn(state.stats.servers, row.id))) {
+      state.stats = normalizeStats(state.stats, servers);
+    }
     const results = await Promise.allSettled(servers.map(async (server) => {
       const data = await wardogsRequest(bot, server, '/v1/players');
       let status = null; let statusError = null;

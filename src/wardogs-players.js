@@ -89,3 +89,19 @@ export function wardogsPlayerRows(data) {
   if (Array.isArray(data)) return data;
   return [];
 }
+
+// Player list /v1/players can temporarily omit entries while WARDOGS updates
+// its roster, or return a partial list. Keep the authoritative server occupancy
+// separate from the number of actionable player rows.
+export function wardogsReportedPlayerCount(status, roster = null) {
+  const official = status?.players?.current ?? status?.playerCount ?? status?.playersOnline;
+  const rosterRows = wardogsPlayerRows(roster);
+  const listed = rosterRows.length;
+  const responseCount = roster?.count ?? roster?.totalCount;
+  const candidates = [official, responseCount].filter((value) => value !== null && value !== undefined && value !== '');
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isSafeInteger(value) && value >= 0) return value;
+  }
+  return listed;
+}

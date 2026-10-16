@@ -7,6 +7,7 @@ import {
   finalizeTrackedMatch,
   updateServerStats,
   buildLeaderboardPayload,
+  KD_MIN_KILLS,
   HEADSHOT_RATE_MIN_KILLS
 } from '../src/playtime-tracker.js';
 
@@ -67,9 +68,23 @@ test('combined Status Bot stats contain requested metrics', () => {
   assert.equal(p.seedingSeconds, 1800);
   assert.equal(p.lastFaction, 'Valkyra');
   assert.deepEqual(snap.categories.map((c) => c.id), ['kills','deaths','kd','playtime','killrecord','headshots','wins','matches','seeding']);
-  assert.equal(snap.categories.find((c) => c.id === 'kd').rows.some((row) => row.steamId === SID), false, 'K/D leaderboard starts at 100 kills');
+  assert.equal(KD_MIN_KILLS, 50);
+  assert.equal(snap.categories.find((c) => c.id === 'kd').rows.some((row) => row.steamId === SID), true, '85-kill player is eligible for K/D after the 50-kill threshold');
   assert.equal(HEADSHOT_RATE_MIN_KILLS, 50);
   assert.equal(snap.categories.find((c) => c.id === 'headshots').rows.some((row) => row.steamId === SID), true, '85-kill player is eligible for headshot rate');
+});
+
+test('K/D leaderboard hides players below 50 total kills', () => {
+  const bot = baseBot();
+  const low = '76561198000000005';
+  const edge = '76561198000000006';
+  bot.killStats.players[low] = { steamId: low, name: 'LowKd', aliases: [], kills: 49, deaths: 1, headshots: 1, killRecord: 4, causes: {} };
+  bot.killStats.players[edge] = { steamId: edge, name: 'EdgeKd', aliases: [], kills: 50, deaths: 10, headshots: 1, killRecord: 5, causes: {} };
+  const snap = combinedStatsSnapshot(bot);
+  const rows = snap.categories.find((c) => c.id === 'kd').rows;
+  assert.equal(rows.some((row) => row.steamId === low), false, '49 kills must not be ranked for K/D');
+  assert.equal(rows.some((row) => row.steamId === edge), true, '50 kills unlocks K/D ranking');
+  assert.match(snap.categories.find((c) => c.id === 'kd').label, /ab 50 Kills/);
 });
 
 test('headshot-rate leaderboard hides players below 50 total kills', () => {
@@ -150,7 +165,7 @@ test('seeding time is accumulated only while the current server population is 1-
   assert.equal(serverStats.players[String(76561198000002000n)].seedingSeconds, 60);
 });
 
-test('Top-15 category leaderboard stays within Discord embed character limit', async () => {
+test('Discord leaderboard payload is paged and exposes navigation plus player search', async () => {
   const bot = baseBot();
   bot.playtimeStats.servers.s1.players = {};
   bot.killStats.players = {};
@@ -166,16 +181,21 @@ test('Top-15 category leaderboard stays within Discord embed character limit', a
       killRecord: 100 - i, causes: {}, firstSeenAt: null, lastSeenAt: null
     };
   }
-  const payload = await buildLeaderboardPayload(bot, null);
-  const embeds = payload.embeds.map((e) => e.toJSON());
-  const chars = embeds.reduce((sum, e) => sum
-    + String(e.title || '').length + String(e.description || '').length
-    + String(e.footer?.text || '').length
-    + (e.fields || []).reduce((fieldSum, f) => fieldSum + String(f.name || '').length + String(f.value || '').length, 0), 0);
-  assert.ok(chars <= 6000, `leaderboard embeds use ${chars} characters`);
-  assert.equal(embeds.reduce((sum, e) => sum + (e.fields || []).length, 0), 9);
-  assert.match(embeds[0].title, /ALL-TIME LEADERBOARD/);
-  assert.match(embeds[0].description, /Top 15 pro Kategorie/);
-  assert.match(embeds[0].description, /Headshot-Rate ab \*\*50 Kills\*\*/);
+  const payload = await buildLeaderboardPayload(bot, null, 1);
   assert.equal(payload.components.length, 1);
+  const row = payload.components[0].toJSON();
+  assert.equal(row.components.length, 4);
+  assert.equal(row.components[0].label, '◀ Zurück');
+  assert.equal(row.components[1].label, '2/5');
+  assert.equal(row.components[2].label, 'Weiter ▶');
+  assert.equal(row.components[3].label, 'Spieler suchen');
+  if (payload.files?.length) {
+    assert.match(payload.files[0].name, /wardogs-leaderboard-2\.png/);
+    assert.ok(Buffer.isBuffer(payload.files[0].attachment));
+  } else {
+    const embed = payload.embeds[0].toJSON();
+    assert.match(embed.title, /Seite 2\/5/);
+    assert.match(embed.description, /K\/D wird ab \*\*50 Kills\*\*/);
+    assert.equal(embed.fields.length, 2);
+  }
 });
