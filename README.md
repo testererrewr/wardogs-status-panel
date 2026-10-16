@@ -1,4 +1,13 @@
-# status-hub.lol v3.12.54
+# status-hub.lol v3.12.55
+
+## v3.12.55 – Live-Management- und Stats-Ansicht im Browser repariert
+
+- Behebt den grauen, leeren `Live server management`-Bereich nach v3.12.54: Helmet blockierte die eigene eingebettete Detailansicht durch `frame-ancestors 'none'` und `X-Frame-Options: DENY`.
+- Ausschließlich die sessiongeschützten Live-/Stats-Teilansichten erlauben nun Einbettung **derselben Origin** (`frame-ancestors 'self'`, `X-Frame-Options: SAMEORIGIN`). Alle anderen Seiten behalten das Einbettungsverbot.
+- Performance-Vorteile aus v3.12.54 bleiben erhalten: Bot-Konfiguration lädt ohne Warten auf WARDOGS; Live-Daten und Stats werden separat abgerufen.
+- Falls eingebettete Ansichten durch zusätzliche Proxy-/Browser-Regeln nicht angezeigt werden, gibt es einen Link **Separat öffnen** im betreffenden Abschnitt.
+- Details: [UPDATE-v3.12.55.md](UPDATE-v3.12.55.md).
+
 
 ## v3.12.54 – Bot Services laden unabhängig von Live-Daten
 
