@@ -6,7 +6,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import { rateLimit } from 'express-rate-limit';
 import {
-  readDb, findUser, upsertUser, deleteUser, getServer, listServersFor, upsertServer, deleteServer,
+  readDb, readDbFields, listManagedBotServiceSummariesForUser, listManagedBotConfigsAccessibleToUserService, findUser, upsertUser, deleteUser, getServer, listServersFor, upsertServer, deleteServer,
   getCustomBot, listCustomBotsFor, upsertCustomBot, deleteCustomBot, assignLegacyOwnership,
   getManagedBot, getManagedBotForUserService, getManagedBotByAccessRecord, listManagedBotsForUserService, listManagedBotsAccessibleToUserService, listManagedBotsFor, listManagedBotsAccessibleFor, upsertManagedBot, deleteManagedBot, listBanSyncServers, getBanSyncServer,
   listStatusNodes, getStatusNode, upsertStatusNode, deleteStatusNode, getSiteSettings, updateSiteSettings,
@@ -206,11 +206,12 @@ function checkCsrf(req, res, next) {
 function flash(req, type, message) { req.session.flash = { type, message }; }
 function takeFlash(req) { const f = req.session.flash; delete req.session.flash; return f; }
 function currentUser(req) {
+  if (Object.hasOwn(req, '_requestUser')) return req._requestUser;
   const sessionUser = req.session.user;
-  if (!sessionUser) return null;
+  if (!sessionUser) return (req._requestUser = null);
   const dbUser = findUser(sessionUser.discordId);
-  if (!dbUser) return null;
-  return { ...dbUser, avatarUrl: sessionUser.avatarUrl || '' };
+  if (!dbUser) return (req._requestUser = null);
+  return (req._requestUser = { ...dbUser, avatarUrl: sessionUser.avatarUrl || '' });
 }
 function langOf(req) { return normalizeLang(req.session?.lang || currentUser(req)?.locale || 'de'); }
 function l(req, de, en) { return tr(langOf(req), de, en); }
@@ -829,8 +830,27 @@ app.get('/bot-health', requireLogin, (req,res) => {
   render(req,res,l(req,'BOT-Gesundheit','BOT Health'),`<div class="pagehead"><div><span class="eyebrow">Monitoring</span><h1>${l(req,'Zentrale BOT-Gesundheit','Central BOT health')}</h1><p>${l(req,'Schnelle Übersicht aus gespeicherten Runtime-Daten, ohne zusätzliche WARDOGS-API-Abfragen.','Fast overview from saved runtime data without extra WARDOGS API requests.')}</p></div><a class="button ghost" href="/bot-health">${l(req,'Aktualisieren','Refresh')}</a></div><section class="admin-stats"><article class="panel"><span class="eyebrow">OK</span><strong>${good}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Prüfen / Gestoppt','Review / stopped')}</span><strong>${warning}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Fehler','Errors')}</span><strong>${failed}</strong></article><article class="panel"><span class="eyebrow">${l(req,'Insgesamt','Total')}</span><strong>${totalBots}</strong></article></section><div class="panel tablewrap"><table><thead><tr><th>BOT</th><th>Status</th><th>${l(req,'Spieler / Server','Players / servers')}</th><th>${l(req,'Letzter Check','Last check')}</th><th>${l(req,'Letztes Kill-Event','Last kill event')}</th><th>Level-Limit</th><th>${l(req,'Letzter Fehler','Last error')}</th></tr></thead><tbody>${rows+statusRows+customRows||`<tr><td colspan="7">${l(req,'Keine BOTs gefunden','No bots found')}</td></tr>`}</tbody></table></div><p class="muted small">${l(req,'Gestoppte Bots und Bots ohne aktuellen Spieler-Poll werden separat angezeigt. Discord und WARDOGS können kurzzeitig getrennt sein.','Stopped bots and bots without a fresh player poll are shown separately. Discord and WARDOGS may disconnect independently.')}</p>`);
 });
 
+// Server-side latency trace for deployments with large encrypted DBs.
+app.use('/bot-services', (req, res, next) => {
+  const started = performance.now();
+  res.on('finish', () => {
+    const elapsed = Math.round(performance.now() - started);
+    if (elapsed > 700) console.warn(`[bot-services] slow ${req.method} ${req.path.replace(/[a-f0-9-]{20,}/gi, ':id')} ${res.statusCode} ${elapsed}ms`);
+  });
+  next();
+});
+
 app.get('/bot-services', (req, res) => {
-  const lang = langOf(req); const settings = getSiteSettings(); const allServices = listBotServices(true); const user = currentUser(req);
+  const lang = langOf(req); const user = currentUser(req);
+  const serviceData = readDbFields(['siteSettings','botServices','paypalServiceSubscriptions']);
+  const settings = serviceData.siteSettings || {};
+  const allServices = (serviceData.botServices || []).filter((x)=>x.visible!==false).sort((a,b)=>Number(Boolean(b.featured))-Number(Boolean(a.featured)) || Number(a.sortOrder||0)-Number(b.sortOrder||0) || String(a.nameEn||a.nameDe||'').localeCompare(String(b.nameEn||b.nameDe||'')));
+  const userBots = user ? listManagedBotServiceSummariesForUser(user.discordId) : [];
+  const pendingByService = new Map();
+  if (user) for (const record of serviceData.paypalServiceSubscriptions||[]) {
+    if (record.userDiscordId!==user.discordId || record.cancelledAt || !['CREATING','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(String(record.status||'').toUpperCase())) continue;
+    if (!pendingByService.has(record.serviceId)) pendingByService.set(record.serviceId,record);
+  }
   const categories=[...new Set(allServices.map((x)=>String(x.category||'wardogs').toLowerCase()))].sort();
   const requestedCategory=String(req.query.category||'all').toLowerCase();
   const activeCategory=requestedCategory==='all'||categories.includes(requestedCategory)?requestedCategory:'all';
@@ -845,9 +865,9 @@ app.get('/bot-services', (req, res) => {
     const statusClass = service.status === 'available' ? 'online' : service.status === 'paused' ? 'offline' : 'neutral';
     const purchaseUrl = /^https?:\/\//i.test(String(service.purchaseUrl || '')) ? service.purchaseUrl : '';
     const fallbackSupport = /^https?:\/\//i.test(String(service.supportUrl || '')) ? service.supportUrl : (/^https?:\/\//i.test(String(settings.supportUrl || '')) ? settings.supportUrl : '');
-    const instances = user ? managedServicesForUser(user.discordId, service.id) : [];
+    const instances = user ? userBots.filter((bot)=>bot.serviceId===service.id).sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||''))) : [];
     const activeInstances = instances.filter((instance) => managedAccessActive(instance) || user?.role === 'admin');
-    const pending = user ? pendingServiceSubscription(user.discordId, service.id) : null;
+    const pending = user ? pendingByService.get(service.id) || null : null;
     const pendingState = String(pending?.status || '').toUpperCase();
     let action = `<span class="button ghost disabled">${esc(status)}</span>`;
     if (supportedManagedService(service) && service.status === 'available') {
@@ -1472,7 +1492,7 @@ function managedOperationsPanel(req, bot, live) {
 }
 
 function managedInstancesPanel(req,service,bots,selectedBot,subscriptions){
-  const user=currentUser(req),settings=getSiteSettings(),lang=langOf(req);
+  const user=currentUser(req),lang=langOf(req);
   const pending=(subscriptions||[]).filter((x)=>['CREATING','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(String(x.status||'').toUpperCase())&&!x.cancelledAt);
   const cards=(bots||[]).map((item,index)=>{
     const shared=item.ownerDiscordId!==user.discordId&&user.role!=='admin';
@@ -1539,7 +1559,7 @@ function managedDeletePanel(req, service, bot, sub) {
 function managedPanelUsersPanel(req, bot) {
   const user=currentUser(req);
   if(!isManagedOwnerUser(user,bot))return '';
-  const db=readDb();
+  const db=readDbFields(['users']);
   const ids=[...new Set((Array.isArray(bot.sharedPanelUserIds)?bot.sharedPanelUserIds:[]).map(String).filter((id)=>/^\d{17,20}$/.test(id)&&id!==String(bot.ownerDiscordId||'')))].slice(0,20);
   const members=ids.map((id)=>db.users.find((row)=>row.discordId===id)).filter(Boolean);
   const candidates=db.users.filter((row)=>row.discordId!==bot.ownerDiscordId&&!ids.includes(row.discordId)).sort((a,b)=>String(a.globalName||a.username||a.discordId).localeCompare(String(b.globalName||b.username||b.discordId)));
@@ -1548,9 +1568,47 @@ function managedPanelUsersPanel(req, bot) {
   return `<section class="panel"><span class="eyebrow">Panel Access</span><h2>${l(req,'Service-BOT mit Panel-Usern teilen','Share service bot with panel users')}</h2><p>${l(req,'Mitbenutzer können diesen Service-BOT konfigurieren, starten, stoppen und bedienen. Abo, Löschen und die Benutzerfreigaben bleiben beim Eigentümer.','Shared users can configure, start, stop and operate this service bot. Subscription, deletion and user sharing remain with the owner.')}</p>${rows?`<div class="managed-pending-list">${rows}</div>`:`<p class="muted">${l(req,'Noch keine zusätzlichen Panel-User.','No additional panel users yet.')}</p>`}${add}</section>`;
 }
 
+function managedLazyFrame(req, endpoint, title) {
+  const url = endpoint.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+  return `<section class="panel managed-deferred"><div class="row between wrap"><div><span class="eyebrow">Live</span><h2>${esc(title)}</h2><p class="muted small">${l(req,'Die Detaildaten laden unabhängig von der Konfiguration.','Details load independently of the configuration.')}</p></div></div></section><iframe class="managed-lazy-frame" title="${esc(title)}" src="${url}" loading="lazy" referrerpolicy="same-origin" scrolling="no" style="display:block;width:100%;height:300px;border:0;background:transparent" data-managed-frame></iframe><script>(()=>{const frame=document.querySelector('iframe[data-managed-frame]');if(!frame)return;let observer;function fit(){try{const doc=frame.contentDocument;if(!doc)return;const h=Math.max(doc.documentElement.scrollHeight,doc.body.scrollHeight);frame.style.height=Math.min(65000,Math.max(240,h+24))+'px';}catch{}}frame.addEventListener('load',()=>{observer?.disconnect();fit();try{observer=new ResizeObserver(fit);observer.observe(frame.contentDocument.body);}catch{}})})();</script>`;
+}
+function managedEmbeddedPage(req,res, body) {
+  // This is a same-origin, session-protected part of the management page.
+  // All mutation forms navigate the top-level panel after their CSRF-checked POST.
+  res.set('Cache-Control','private, no-store');
+  return res.send(`<!doctype html><html lang="${esc(langOf(req))}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/style.css?v=3.12.54"><style>html,body{background:transparent;min-height:0}body{display:block;padding:0 2px 20px}.managed-live{margin:0}</style></head><body>${body}<script src="/managed.js?v=3.12.54" defer></script><script>document.addEventListener('DOMContentLoaded',()=>{for(const f of document.querySelectorAll('form'))f.target='_top';for(const a of document.querySelectorAll('a[href^="/bot-services/"]')){if(!a.hasAttribute('data-iframe-refresh'))a.target='_top';}});</script></body></html>`);
+}
+
+app.get('/bot-services/:id/live', requireLogin, async(req,res)=>{
+  const user=currentUser(req),service=getBotService(req.params.id);
+  if (!service || service.id!=='wardogs-warning-bot') return res.status(404).send('Not found');
+  const bot=getManagedBot(String(req.query.bot||''));
+  if (!bot || bot.serviceId!==service.id || !(user.role==='admin' || bot.ownerDiscordId===user.discordId || (Array.isArray(bot.sharedPanelUserIds)&&bot.sharedPanelUserIds.includes(user.discordId)))) return res.status(404).send('Not found');
+  if (!managedAccessActive(bot) && user.role!=='admin') return res.status(403).send('Access expired');
+  const servers=normalizeManagedServers(bot);
+  const chosen=managedServerContext(bot,String(req.query.server||servers[0]?.id||''));
+  if (!chosen) return managedEmbeddedPage(req,res,`<div class="panel empty">${l(req,'Kein Server konfiguriert.','No server configured.')}</div>`);
+  let live=null;
+  if(chosen.wardogsBaseUrl && chosen.wardogsSecretEnc){
+    try{live=await managedDashboard(chosen,{force:req.query.refresh==='1'});}catch(error){live={errors:{dashboard:String(error.message||error)}};}
+  }
+  const markup=managedOperationsPanel(req,chosen,live);
+  const refreshUrl=`/bot-services/${encodeURIComponent(service.id)}/live?bot=${encodeURIComponent(bot.id)}&server=${encodeURIComponent(chosen._managedServerId||'')}&refresh=1`;
+  return managedEmbeddedPage(req,res,markup.replace(/(<a class="button ghost" href=")[^"]+("[^>]*>)([^<]*(?:Aktualisieren|Refresh))(<\/a>)/,`$1${refreshUrl}$2$3$4`).replace(`href="${refreshUrl}"`, `data-iframe-refresh="1" href="${refreshUrl}"`));
+});
+
+app.get('/bot-services/:id/stats', requireLogin, (req,res)=>{
+  const user=currentUser(req),service=getBotService(req.params.id);
+  if (!service || ![PLAYTIME_SERVICE_ID,KILL_STATS_SERVICE_ID].includes(service.id)) return res.status(404).send('Not found');
+  const bot=getManagedBot(String(req.query.bot||''));
+  if (!bot || bot.serviceId!==service.id || !(user.role==='admin' || bot.ownerDiscordId===user.discordId || (Array.isArray(bot.sharedPanelUserIds)&&bot.sharedPanelUserIds.includes(user.discordId)))) return res.status(404).send('Not found');
+  if (!managedAccessActive(bot) && user.role!=='admin') return res.status(403).send('Access expired');
+  return managedEmbeddedPage(req,res,service.id===PLAYTIME_SERVICE_ID?playtimeStatsPanel(req,bot):killStatsPanel(req,bot));
+});
+
 app.get('/bot-services/:id/manage', requireLogin, async(req,res)=>{
   const service=getBotService(req.params.id),user=currentUser(req); if(!supportedManagedService(service))return res.status(404).send('Service not found');
-  const bots=managedServicesForUser(user.discordId,service.id),subscriptions=listPaypalServiceSubscriptionsForUser(user.discordId,service.id);
+  const bots=listManagedBotConfigsAccessibleToUserService(user.discordId,service.id),subscriptions=listPaypalServiceSubscriptionsForUser(user.discordId,service.id);
   const requested=String(req.query.bot||'');
   const bot=bots.find((x)=>x.id===requested)||(requested?'':bots.find((x)=>managedAccessActive(x)))||bots[0]||null;
   const selected=typeof bot==='object'?bot:null;
@@ -1570,21 +1628,19 @@ app.get('/bot-services/:id/manage', requireLogin, async(req,res)=>{
   const subHtml=!ownerAccess?`<article class="panel"><span class="eyebrow">Panel Access</span><h2>${l(req,'Geteilter Service-BOT','Shared service bot')}</h2><p>${l(req,'Du wurdest vom Eigentümer als Panel-User hinzugefügt. Abo, Löschen und Benutzerfreigaben bleiben beim Eigentümer.','The owner added you as a panel user. Subscription, deletion and user sharing remain with the owner.')}</p></article>`:sub?`<article class="panel"><span class="eyebrow">PayPal Service Abo</span><h2>${esc(selected.name||service.nameDe||service.nameEn)}</h2><p>Status: <strong>${esc(state||'—')}</strong></p>${selected.accessUntil?`<p>${l(req,'Zugang bis','Access until')}: ${esc(new Date(selected.accessUntil).toLocaleString(localeCode(langOf(req))))}</p>`:''}${sub.subscriptionId&&!sub.cancelledAt&&['ACTIVE','SUSPENDED','APPROVAL_PENDING','APPROVED','ACTIVE_PENDING_PAYMENT'].includes(state)?`<div class="warning small"><strong>${l(req,'Keine Rückerstattung','No refund')}:</strong> ${l(req,'Eine Kündigung stoppt nur zukünftige Abbuchungen. Bereits gezahlte Beträge werden nicht automatisch erstattet.','Cancellation only stops future billing. Amounts already paid are not automatically refunded.')}</div><form method="post" action="/bot-services/${esc(service.id)}/subscription/cancel" onsubmit="return confirm('${l(req,'Dieses Bot-Service-Abo wirklich kündigen? Es gibt keinen automatischen Refund. Nur diese Instanz ist betroffen.','Cancel this bot-service subscription? There is no automatic refund. Only this instance is affected.')}')"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="hidden" name="recordId" value="${esc(sub.id)}"><button class="button danger">${l(req,'Service-Abo kündigen','Cancel service subscription')}</button></form>`:''}</article>`:`<article class="panel"><span class="eyebrow">Access</span><h2>${esc(selected.name||l(req,'Managed Bot','Managed bot'))}</h2><p>${selected.adminGrant?l(req,'Für Admins kostenlos aktiviert.','Activated free for admins.'):l(req,'Servicezugang aktiv.','Service access active.')}</p></article>`;
   if(service.id===PLAYTIME_SERVICE_ID){
     const rt=playtimeBotRuntime(selected.id);
-    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">WARDOGS Status Bot</span><h2>${esc(rt.state||'stopped')}</h2><p>${l(req,'Mehrere Server, Playtime, eigener Killfeed je Server und globale Kill-Stats.','Multiple servers, playtime, one killfeed per server and global kill stats.')}</p></article></section>${panelUsersHtml}${playtimeTrackerForm(req,service,selected)}${playtimeStatsPanel(req,selected)}${deleteHtml}`);
+    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">WARDOGS Status Bot</span><h2>${esc(rt.state||'stopped')}</h2><p>${l(req,'Mehrere Server, Playtime, eigener Killfeed je Server und globale Kill-Stats.','Multiple servers, playtime, one killfeed per server and global kill stats.')}</p></article></section>${panelUsersHtml}${playtimeTrackerForm(req,service,selected)}${managedLazyFrame(req,`/bot-services/${encodeURIComponent(service.id)}/stats?bot=${encodeURIComponent(selected.id)}&period=${encodeURIComponent(String(req.query.period||'all'))}&playerq=${encodeURIComponent(String(req.query.playerq||''))}&playerid=${encodeURIComponent(String(req.query.playerid||''))}`,l(req,'Leaderboard & Spielerstats','Leaderboard & player stats'))}${deleteHtml}`);
   }
   if(service.id===KILL_STATS_SERVICE_ID){
     const rt=killStatsBotRuntime(selected.id);
-    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Killfeed & Stats</span><h2>${esc(rt.state||'stopped')}</h2><p>${l(req,'All-Time Killstatistiken und ein Discord-Killfeed, der als feste Nachricht im Channel bleibt.','All-time kill statistics and a Discord killfeed that stays in place as one fixed message.')}</p></article></section>${panelUsersHtml}${killStatsForm(req,service,selected)}${killStatsPanel(req,selected)}${deleteHtml}`);
+    return render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Killfeed & Stats</span><h2>${esc(rt.state||'stopped')}</h2><p>${l(req,'All-Time Killstatistiken und ein Discord-Killfeed, der als feste Nachricht im Channel bleibt.','All-time kill statistics and a Discord killfeed that stays in place as one fixed message.')}</p></article></section>${panelUsersHtml}${killStatsForm(req,service,selected)}${managedLazyFrame(req,`/bot-services/${encodeURIComponent(service.id)}/stats?bot=${encodeURIComponent(selected.id)}&period=${encodeURIComponent(String(req.query.period||'all'))}&playerq=${encodeURIComponent(String(req.query.playerq||''))}`,l(req,'Killfeed & Spielerstatistiken','Killfeed & player stats'))}${deleteHtml}`);
   }
   const managementServers=normalizeManagedServers(selected);
   const selectedServerId=String(req.query.server||managementServers[0]?.id||'');
   const selectedServer=managedServerContext(selected,selectedServerId)||managedServerContext(selected,managementServers[0]);
-  let live=null;
-  if(selectedServer?.wardogsBaseUrl&&selectedServer?.wardogsSecretEnc){try{live=await managedDashboard(selectedServer);}catch(error){live={errors:{dashboard:error.message}};}}
   const serverTabs=managementServers.length?`<section class="panel"><div class="row between wrap"><div><span class="eyebrow">${l(req,'Gameserver auswählen','Choose game server')}</span><h2>${esc(selectedServer?._managedServerLabel||'Server')}</h2></div><div class="actions wrap">${managementServers.map((row)=>`<a class="button ${String(row.id)===String(selectedServer?._managedServerId)?'primary':'ghost'} smallbtn" href="${esc(managedManageUrl(service.id,selected.id))}&server=${encodeURIComponent(row.id)}">${esc(row.label)}</a>`).join('')}</div></div></section>`:'';
   const freshParent=getManagedBot(selected.id)||selected;
   const freshSelected=selectedServer?managedServerContext(freshParent,selectedServer._managedServerId):null;
-  render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Auto-Ban</span><h2>${selected.autoBanEnabled?l(req,'AKTIV','ENABLED'):l(req,'AUS','OFF')}</h2><p>${l(req,'Auto-Ban ist standardmäßig AUS und muss ausdrücklich aktiviert werden.','Auto-ban is OFF by default and must be explicitly enabled.')}</p></article></section>${panelUsersHtml}${managedBotForm(req,service,freshParent)}${managedBanSyncPanel(req,freshParent)}${managedIgnoredPlayersPanel(req,freshParent)}${serverTabs}${freshSelected?managedOperationsPanel(req,freshSelected,live):''}${freshSelected?managedChatHistoryPanel(req,freshSelected):''}${freshSelected?managedKillFeedPanel(req,freshSelected):''}${managedAuditLogPanel(req,freshParent)}${deleteHtml}${managedChatModalHtml(req,freshParent,freshSelected)}`);
+  render(req,res,service.nameDe||service.nameEn,`<div class="pagehead"><div><h1>${esc(selected.name||service.nameDe||service.nameEn)}</h1></div><a class="button ghost" href="/bot-services">${l(req,'Zurück','Back')}</a></div>${overview}${authLockHtml}<section class="account-grid">${subHtml}<article class="panel"><span class="eyebrow">Auto-Ban</span><h2>${selected.autoBanEnabled?l(req,'AKTIV','ENABLED'):l(req,'AUS','OFF')}</h2><p>${l(req,'Auto-Ban ist standardmäßig AUS und muss ausdrücklich aktiviert werden.','Auto-ban is OFF by default and must be explicitly enabled.')}</p></article></section>${panelUsersHtml}${managedBotForm(req,service,freshParent)}${managedBanSyncPanel(req,freshParent)}${managedIgnoredPlayersPanel(req,freshParent)}${serverTabs}${freshSelected?managedLazyFrame(req,`/bot-services/${encodeURIComponent(service.id)}/live?bot=${encodeURIComponent(selected.id)}&server=${encodeURIComponent(freshSelected._managedServerId||'')}`,l(req,'Live Server Management','Live server management')):''}${freshSelected?managedChatHistoryPanel(req,freshSelected):''}${freshSelected?managedKillFeedPanel(req,freshSelected):''}${managedAuditLogPanel(req,freshParent)}${deleteHtml}${managedChatModalHtml(req,freshParent,freshSelected)}`);
 });
 
 app.post('/bot-services/:id/instances/:botId/delete', requireLogin, checkCsrf, rateLimit({windowMs:60_000,limit:5}), async(req,res)=>{

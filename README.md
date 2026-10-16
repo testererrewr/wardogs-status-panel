@@ -1,4 +1,13 @@
-# status-hub.lol v3.12.53
+# status-hub.lol v3.12.54
+
+## v3.12.54 – Bot Services laden unabhängig von Live-Daten
+
+- Bot-Services-Katalog: Nur benötigte Service-/Abo-Daten sowie leichte Bot-Zusammenfassungen werden gelesen; keine Kopie der kompletten Spieler- und Kill-Historie für jede Karte.
+- Management-Konfiguration: HTML wird ohne WARTEN auf WARDOGS-API ausgeliefert. Live-Management lädt separat mit unveränderten Berechtigungen und CSRF-geschützten Aktionen.
+- Status-/Stats-Bot: Umfangreiche Statistiken und Leaderboards laden als eigenständiger Bereich, wenn sie im Browser benötigt werden.
+- Sessions: Gewöhnliche Seitenansichten schreiben nicht mehr bei jedem Aufruf die komplette verschlüsselte Sessions-Datei; Session-Änderungen werden weiterhin unmittelbar gesichert, reine Ablaufzeit-Touches nach spätestens ca. 15 Sekunden.
+- Langsame Bot-Services-Anfragen über 700 ms werden serverseitig mit Laufzeit protokolliert (`docker compose logs server-status-hub`).
+- Mehr dazu: [UPDATE-v3.12.54.md](UPDATE-v3.12.54.md).
 
 ## v3.12.53 – Management-Speed, Leaderboard-Zeiträume, BOT-Monitoring, Level-Automatik
 

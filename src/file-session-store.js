@@ -9,6 +9,7 @@ export class FileSessionStore extends session.Store {
     this.file = path.resolve(options.file || 'data/sessions.json');
     this.tmp = `${this.file}.tmp`;
     this.sessions = new Map();
+    this.touchFlushTimer = null;
     this.load();
   }
 
@@ -33,6 +34,10 @@ export class FileSessionStore extends session.Store {
   }
 
   persist() {
+    if (this.touchFlushTimer) {
+      clearTimeout(this.touchFlushTimer);
+      this.touchFlushTimer = null;
+    }
     const obj = Object.fromEntries(this.sessions.entries());
     const payload = { format: 'encrypted-v1', data: encryptSecret(JSON.stringify(obj)) };
     fs.writeFileSync(this.tmp, JSON.stringify(payload), { mode: 0o600 });
@@ -83,7 +88,17 @@ export class FileSessionStore extends session.Store {
     try {
       if (this.sessions.has(sid)) {
         this.sessions.set(sid, sess);
-        this.persist();
+        // express-session calls touch even for ordinary GETs. Encrypting and
+        // rewriting *all* sessions on every page view blocks the event loop.
+        // Auth changes still persist immediately via set()/destroy().
+        if (!this.touchFlushTimer) {
+          this.touchFlushTimer = setTimeout(() => {
+            this.touchFlushTimer = null;
+            try { this.persist(); }
+            catch (error) { console.error('Session-Touch konnte nicht gespeichert werden:', error.message); }
+          }, 15_000);
+          this.touchFlushTimer.unref?.();
+        }
       }
       cb(null);
     } catch (error) { cb(error); }

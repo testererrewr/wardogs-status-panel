@@ -855,6 +855,46 @@ export function readDb() {
   } catch (error) { throw new Error(`Datenbank konnte nicht gelesen werden: ${error.message}`); }
 }
 
+// Read only the requested collection(s). Unlike readDb(), these accessors do
+// not clone enormous playtime/killfeed histories for every small page lookup.
+// External file replacements still invalidate the snapshot through readDb().
+function currentSnapshot() {
+  ensure();
+  const signature = dbFileSignature();
+  if (!dbCache || dbCacheMtime !== signature.mtime || dbCacheSize !== signature.size) readDb();
+  return dbCache;
+}
+export function readDbField(field) {
+  if (typeof field !== 'string' || !Object.hasOwn(currentSnapshot(), field)) return undefined;
+  return structuredClone(currentSnapshot()[field]);
+}
+// Filter first, clone only matching rows rather than every bot's full stats.
+export function selectDbRows(field, predicate) {
+  const rows = currentSnapshot()[field];
+  return Array.isArray(rows) ? rows.filter(predicate).map((row) => structuredClone(row)) : [];
+}
+// For the configuration page: statistics are loaded in their own authenticated
+// route, so don't clone megabytes of history into the initial HTML request.
+export function listManagedBotConfigsAccessibleToUserService(discordId, serviceId) {
+  const rows = currentSnapshot().managedBots || [];
+  return rows.filter((bot) => bot.serviceId === serviceId && (bot.ownerDiscordId === discordId || (Array.isArray(bot.sharedPanelUserIds) && bot.sharedPanelUserIds.includes(discordId))))
+    .map((bot) => {
+      const { playtimeStats, killStats, ...config } = bot;
+      return structuredClone(config);
+    }).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+}
+export function listManagedBotServiceSummariesForUser(discordId) {
+  const rows = currentSnapshot().managedBots || [];
+  return rows.filter((bot) => bot.ownerDiscordId === discordId || (Array.isArray(bot.sharedPanelUserIds) && bot.sharedPanelUserIds.includes(discordId)))
+    .map(({id, serviceId, ownerDiscordId, createdAt, adminGrant, accessUntil}) => ({id, serviceId, ownerDiscordId, createdAt, adminGrant, accessUntil}));
+}
+export function readDbFields(fields) {
+  const snapshot = currentSnapshot();
+  const result = {};
+  for (const field of fields) if (Object.hasOwn(snapshot, field)) result[field] = structuredClone(snapshot[field]);
+  return result;
+}
+
 export function writeDb(db) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const payload = { format: 'encrypted-db-v1', data: encryptSecret(JSON.stringify(db)) };
@@ -893,7 +933,7 @@ export function upsertServer(server) {
 }
 export function deleteServer(id) { updateDb((db) => { db.servers = db.servers.filter((s) => s.id !== id); }); }
 
-export function findUser(discordId) { return readDb().users.find((u) => u.discordId === discordId) || null; }
+export function findUser(discordId) { return selectDbRows('users', (u) => u.discordId === discordId)[0] || null; }
 export function upsertUser(user) {
   return updateDb((db) => {
     const now = new Date().toISOString();
@@ -921,13 +961,13 @@ export function upsertCustomBot(bot) {
 }
 export function deleteCustomBot(id) { updateDb((db) => { db.customBots = db.customBots.filter((b) => b.id !== id); }); }
 
-export function getManagedBot(id) { return (readDb().managedBots || []).find((b) => b.id === id) || null; }
-export function listManagedBotsForUserService(discordId, serviceId) { return (readDb().managedBots || []).filter((b) => b.ownerDiscordId === discordId && b.serviceId === serviceId).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
-export function listManagedBotsAccessibleToUserService(discordId, serviceId, isAdmin = false) { return (readDb().managedBots || []).filter((b) => b.serviceId === serviceId && (isAdmin || b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId)))).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
+export function getManagedBot(id) { return selectDbRows('managedBots', (b) => b.id === id)[0] || null; }
+export function listManagedBotsForUserService(discordId, serviceId) { return selectDbRows('managedBots', (b) => b.ownerDiscordId === discordId && b.serviceId === serviceId).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
+export function listManagedBotsAccessibleToUserService(discordId, serviceId, isAdmin = false) { return selectDbRows('managedBots', (b) => b.serviceId === serviceId && (isAdmin || b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId)))).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
 export function getManagedBotForUserService(discordId, serviceId) { return listManagedBotsForUserService(discordId, serviceId)[0] || null; }
-export function getManagedBotByAccessRecord(accessRecordId) { const id = String(accessRecordId || ''); return id ? (readDb().managedBots || []).find((b) => String(b.accessRecordId || '') === id) || null : null; }
-export function listManagedBotsFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId); }
-export function listManagedBotsAccessibleFor(discordId, isAdmin = false) { const bots = readDb().managedBots || []; return isAdmin ? bots : bots.filter((b) => b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId))); }
+export function getManagedBotByAccessRecord(accessRecordId) { const id = String(accessRecordId || ''); return id ? selectDbRows('managedBots', (b) => String(b.accessRecordId || '') === id)[0] || null : null; }
+export function listManagedBotsFor(discordId, isAdmin = false) { return selectDbRows('managedBots', (b) => isAdmin || b.ownerDiscordId === discordId); }
+export function listManagedBotsAccessibleFor(discordId, isAdmin = false) { return selectDbRows('managedBots', (b) => isAdmin || b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId))); }
 export function upsertManagedBot(bot) {
   return updateDb((db) => {
     if (!Array.isArray(db.managedBots)) db.managedBots = [];
@@ -947,7 +987,7 @@ export function deleteManagedBot(id) { updateDb((db) => {
   }).filter(Boolean);
 }); }
 
-export function listBanSyncServers() { return readDb().banSyncServers || []; }
+export function listBanSyncServers() { return readDbField('banSyncServers') || []; }
 export function getBanSyncServer(id) { return listBanSyncServers().find((room) => room.id === String(id || '')) || null; }
 export function upsertBanSyncServer(room) {
   return updateDb((db) => {
@@ -975,7 +1015,7 @@ export function upsertStatusNode(node) {
 }
 export function deleteStatusNode(id) { updateDb((db) => { db.statusNodes = (db.statusNodes || []).filter((n) => n.id !== id); for (const s of [...db.servers, ...(db.managedBots || []), ...(db.customBots || [])]) if (s.assignedNodeId === id) s.assignedNodeId = null; }); }
 
-export function getSiteSettings() { return readDb().siteSettings; }
+export function getSiteSettings() { return readDbField('siteSettings'); }
 export function updateSiteSettings(patch) { return updateDb((db) => { db.siteSettings = mergeSettings({ ...db.siteSettings, ...patch, donationLinks: { ...(db.siteSettings?.donationLinks || {}), ...(patch.donationLinks || {}) }, premiumSales: { ...(db.siteSettings?.premiumSales || {}), ...(patch.premiumSales || {}), prices: { ...(db.siteSettings?.premiumSales?.prices || {}), ...(patch.premiumSales?.prices || {}) }, paypalApi: { ...(db.siteSettings?.premiumSales?.paypalApi || {}), ...(patch.premiumSales?.paypalApi || {}) }, paypalAuto: { ...(db.siteSettings?.premiumSales?.paypalAuto || {}), ...(patch.premiumSales?.paypalAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.paypalAuto?.amounts || {}), ...(patch.premiumSales?.paypalAuto?.amounts || {}) } }, paypalSubscription: { ...(db.siteSettings?.premiumSales?.paypalSubscription || {}), ...(patch.premiumSales?.paypalSubscription || {}), planIds: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.planIds || {}), ...(patch.premiumSales?.paypalSubscription?.planIds || {}) }, planMeta: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.planMeta || {}), ...(patch.premiumSales?.paypalSubscription?.planMeta || {}) }, amounts: { ...(db.siteSettings?.premiumSales?.paypalSubscription?.amounts || {}), ...(patch.premiumSales?.paypalSubscription?.amounts || {}) } }, stripeApi: { ...(db.siteSettings?.premiumSales?.stripeApi || {}), ...(patch.premiumSales?.stripeApi || {}) }, stripeAuto: { ...(db.siteSettings?.premiumSales?.stripeAuto || {}), ...(patch.premiumSales?.stripeAuto || {}), amounts: { ...(db.siteSettings?.premiumSales?.stripeAuto?.amounts || {}), ...(patch.premiumSales?.stripeAuto?.amounts || {}) } }, stripeSubscription: { ...(db.siteSettings?.premiumSales?.stripeSubscription || {}), ...(patch.premiumSales?.stripeSubscription || {}), amounts: { ...(db.siteSettings?.premiumSales?.stripeSubscription?.amounts || {}), ...(patch.premiumSales?.stripeSubscription?.amounts || {}) } } }, freeBoost: { ...(db.siteSettings?.freeBoost || {}), ...(patch.freeBoost || {}) } }); return db.siteSettings; }); }
 
 export function listSupporters(visibleOnly = false) { const rows = readDb().supporters || []; return rows.filter((x) => !visibleOnly || x.visible !== false).sort((a,b) => Number(Boolean(b.featured)) - Number(Boolean(a.featured)) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
@@ -993,7 +1033,7 @@ export function deleteSupporter(id) { updateDb((db) => { db.supporters = (db.sup
 
 
 export function listBotServices(visibleOnly = false) {
-  const rows = readDb().botServices || [];
+  const rows = readDbField('botServices') || [];
   return rows.filter((x) => !visibleOnly || x.visible !== false).sort((a, b) => Number(Boolean(b.featured)) - Number(Boolean(a.featured)) || Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || String(a.nameEn || a.nameDe || '').localeCompare(String(b.nameEn || b.nameDe || '')));
 }
 export function getBotService(id) { return listBotServices(false).find((x) => x.id === id) || null; }
@@ -1073,9 +1113,9 @@ export function createPaypalServiceSubscriptionRecord(subscription) {
     return entry;
   });
 }
-export function getPaypalServiceSubscriptionRecord(id) { return (readDb().paypalServiceSubscriptions || []).find((x) => x.id === id) || null; }
+export function getPaypalServiceSubscriptionRecord(id) { return selectDbRows('paypalServiceSubscriptions', (x) => x.id === id)[0] || null; }
 export function getPaypalServiceSubscriptionByPaypalId(subscriptionId) { return (readDb().paypalServiceSubscriptions || []).find((x) => x.subscriptionId === subscriptionId) || null; }
-export function listPaypalServiceSubscriptionsForUser(discordId, serviceId = '') { return (readDb().paypalServiceSubscriptions || []).filter((x) => x.userDiscordId === discordId && (!serviceId || x.serviceId === serviceId)).sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
+export function listPaypalServiceSubscriptionsForUser(discordId, serviceId = '') { return selectDbRows('paypalServiceSubscriptions', (x) => x.userDiscordId === discordId && (!serviceId || x.serviceId === serviceId)).sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))); }
 export function updatePaypalServiceSubscriptionRecord(id, patch) {
   return updateDb((db) => {
     if (!Array.isArray(db.paypalServiceSubscriptions)) db.paypalServiceSubscriptions = [];
