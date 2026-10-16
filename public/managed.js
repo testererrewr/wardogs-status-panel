@@ -278,6 +278,32 @@
   const durationUnit = duration?.querySelector('[data-duration-unit]');
   const durationValue = duration?.querySelector('[data-duration-value]');
   const submit = modal.querySelector('.managed-ban-confirm');
+  const originalParent = modal.parentNode;
+  let portalDocument = null;
+  let openerButton = null;
+
+  // The live management panel is inside a height-adjusted iframe. A fixed
+  // dialog centered in that iframe can be thousands of pixels below the user's
+  // visible viewport. Move the *same node* to the same-origin parent while
+  // open, retaining its CSRF form fields and all existing event handlers.
+  const mountInViewport = () => {
+    if (window.parent === window.self) return document;
+    try {
+      const parentWindow = window.parent;
+      if (parentWindow.location.origin !== window.location.origin) return document;
+      const parentDoc = parentWindow.document;
+      if (!parentDoc.body || !originalParent) return document;
+      parentDoc.body.appendChild(modal);
+      portalDocument = parentDoc;
+      return parentDoc;
+    } catch {
+      // Keep the dialog operational if embedding rules change.
+      return document;
+    }
+  };
+  const onEscape = (event) => {
+    if (event.key === 'Escape' && !modal.hidden) close();
+  };
 
   const syncDuration = () => {
     if (!durationUnit || !durationValue) return;
@@ -310,24 +336,39 @@
       steamInput.readOnly = Boolean(steam);
     }
     if (targetLabel) targetLabel.textContent = steam ? `${player || 'Player'} · ${steam}` : 'SteamID64';
+    openerButton = button;
+    const activeDocument = mountInViewport();
     modal.hidden = false;
-    document.body.classList.add('modal-open');
-    window.setTimeout(() => (steam ? reason : steamInput)?.focus(), 0);
+    activeDocument.body.classList.add('modal-open');
+    if (portalDocument) {
+      // The embedded panel's auto-refresh must not replace the iframe while
+      // its form is displayed in the parent viewport.
+      portalDocument.addEventListener('keydown', onEscape);
+      if (form) form.target = '_top';
+    }
+    window.setTimeout(() => (steam ? reason : steamInput)?.focus({ preventScroll: true }), 0);
   };
   const close = () => {
     modal.hidden = true;
-    document.body.classList.remove('modal-open');
+    (portalDocument || document).body.classList.remove('modal-open');
+    if (portalDocument) {
+      portalDocument.removeEventListener('keydown', onEscape);
+      originalParent?.appendChild(modal);
+      portalDocument = null;
+    }
+    openerButton?.focus({ preventScroll: true });
   };
 
+  // Open buttons are in the iframe. Close buttons and the backdrop move with
+  // the dialog, so their handler must be attached to the dialog itself.
   document.addEventListener('click', (event) => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const opener = target.closest('[data-open-managed-ban]');
-    if (opener) { open(opener); return; }
-    if (target.closest('[data-close-managed-ban]')) { close(); return; }
-    if (target === modal) close();
+    const opener = event.target?.closest?.('[data-open-managed-ban]');
+    if (opener) open(opener);
   });
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !modal.hidden) close(); });
+  modal.addEventListener('click', (event) => {
+    if (event.target?.closest?.('[data-close-managed-ban]') || event.target === modal) close();
+  });
+  document.addEventListener('keydown', onEscape);
   reason?.addEventListener('input', () => { if (template?.value) template.value = ''; syncCount(); });
   durationUnit?.addEventListener('change', () => { if (template?.value) template.value = ''; syncDuration(); });
   durationValue?.addEventListener('input', () => { if (template?.value) template.value = ''; });

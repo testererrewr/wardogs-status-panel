@@ -1,6 +1,6 @@
 /**
  * Helmet protects all panel pages against framing by default.
- * Only the session-protected /bot-services/:id/live and /stats fragments are
+ * Only the session-protected /bot-services/:id/live and /stats and /feed fragments are
  * intentionally embedded inside the same-origin management page. Override the
  * response headers on those fragments only; never relax the global policy.
  */

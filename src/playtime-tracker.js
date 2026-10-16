@@ -703,7 +703,7 @@ function verifyLinkCode(bot, discordUserId, code) {
 function slashCommands() {
   return [
     { name: 'linkgame', description: 'Verknüpft deinen Discord-Account sicher mit deinem WARDOGS/Steam-Spieler.', options: [{ type: 3, name: 'spieler', description: 'Steam-/Ingame-Name des aktuell online befindlichen Spielers', required: true, maxLength: 100 }] },
-    { name: 'status', description: 'Zeigt die Stats eines verknüpften Discord-Accounts.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
+    { name: 'stats', description: 'Zeigt die Stats eines verknüpften Discord-Accounts.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
     { name: 'whois', description: 'Zeigt Ingame-Account und Stats eines Discord-Users.', options: [{ type: 6, name: 'user', description: 'Discord-User; ohne Auswahl wird dein Account verwendet', required: false }] },
     { name: 'whoisplayer', description: 'Zeigt deinen verknüpften Ingame-Account und deine Stats.', options: [{ type: 6, name: 'user', description: 'Optional: anderer verknüpfter Discord-User', required: false }] },
     { name: 'playerstats', description: 'Sucht Stats zu einem Ingame-Spieler, auch ohne Discord-Verknüpfung.', options: [{ type: 3, name: 'spieler', description: 'Ingame-Name, Alias oder SteamID64', required: true, maxLength: 100 }] },
@@ -733,13 +733,13 @@ async function handleStatusCommand(botId, interaction) {
       return interaction.editReply({ content: `Whisper an **${cleanDisplayName(challenge.playerName)}** gesendet. Öffne jetzt das Popup und gib den 6-stelligen Code ein.`, components: [codeButtonRow(botId)] });
     } catch (error) { return interaction.editReply({ content: `Verknüpfung fehlgeschlagen: ${String(error?.message || error).slice(0, 300)}` }); }
   }
-  if (['status', 'whois', 'whoisplayer'].includes(command)) {
+  if (['stats', 'whois', 'whoisplayer'].includes(command)) {
     const target = interaction.options.getUser('user') || interaction.user;
     const link = linkForDiscordUser(bot, target.id);
     if (!link) return interaction.reply({ content: `${target.id === interaction.user.id ? 'Du hast' : `<@${target.id}> hat`} noch keinen WARDOGS Account verknüpft. Nutze **/linkgame**.`, allowedMentions: { users: [target.id] } });
     const snapshot = combinedStatsSnapshot(bot, instances.get(botId)?.state || null);
     const player = snapshot.players.find((row) => row.steamId === link.steamId) || { steamId: link.steamId, name: link.playerName, aliases: [], kills: 0, deaths: 0, kd: 0, totalSeconds: 0, seedingSeconds: 0, killRecord: 0, headshotRate: 0, matchWins: 0, matchesPlayed: 0, winRate: 0 };
-    return interaction.reply({ embeds: [playerStatsEmbed(bot, player, snapshot, { showIdentity: command !== 'status', discordUser: command !== 'status' ? target : null })], allowedMentions: { users: [target.id] } });
+    return interaction.reply({ embeds: [playerStatsEmbed(bot, player, snapshot, { showIdentity: command !== 'stats', discordUser: command !== 'stats' ? target : null })], allowedMentions: { users: [target.id] } });
   }
   if (command === 'leaderboard') {
     await interaction.deferReply();
@@ -1049,7 +1049,7 @@ async function startOne(bot) {
   const discordOutputConfigured = validSnowflake(bot.leaderboardChannelId) || servers.some((server) => validSnowflake(server.killFeedChannelId));
   if (discordOutputConfigured && !token) throw new Error('Discord bot token is required when a leaderboard or killfeed channel is configured');
   // A configured token is enough to connect the bot even without a fixed output
-  // channel: slash commands (/status, /whois, /playerstats, /linkgame) still need
+  // channel: slash commands (/stats, /whois, /playerstats, /linkgame) still need
   // an active Discord gateway session.
   const wantsDiscord = Boolean(token);
   const client = wantsDiscord ? new Client({ intents: [GatewayIntentBits.Guilds] }) : null;

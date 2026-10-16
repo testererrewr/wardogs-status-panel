@@ -1,3 +1,10 @@
+## Update v3.12.58 – gemeinsame Bans & `/stats`
+
+- **Management Bot / mehrere Gameserver:** Permanente und normale temporäre Bans/Unbans aus einem ausgewählten Server gelten nun für **alle Server derselben Management-Bot-Instanz** (auch für Discord-Aktionen). Andere Management-Bots sind **nicht** automatisch verbunden; dafür existiert weiterhin die separate Ban-Sync-Community.
+- Die Web-Management-Banliste zeigt gemeinsame Ban-Einträge und hat die Aktion **„Alle Server abgleichen“**. Bereits vorhandene Server-Bans werden aus den erreichbaren Servern zusammengeführt; kein bestehender Ban wird beim Zusammenführen automatisch gelöscht.
+- Manche WARDOGS-Builds erlauben das Anlegen eines API-Bans nur bei verbundenen Spielern. Solche Bans werden als **ausstehend** vermerkt und beim nächsten Join erneut durchgesetzt. API-Fehler werden protokolliert; die Synchronisation ist nicht gleichzusetzen mit einem erfolgreichen Gameserver-Live-Test.
+- **Stats Bot:** Der Discord-Slash-Command heißt nun **`/stats [user]`** statt `/status [user]`; `/whois`, `/whoisplayer`, `/playerstats`, `/linkgame` und `/leaderboard` bleiben erhalten. Den Bot nach dem Update neu starten, damit Discord die Slash-Commands neu registriert.
+
 # status-hub.lol v3.12.55
 
 ## v3.12.55 – Live-Management- und Stats-Ansicht im Browser repariert
@@ -59,7 +66,7 @@
 - Top 15 bleibt pro Kategorie bestehen; die Suche darunter zeigt weiterhin exakte Positionen außerhalb der Top 15.
 - Headshot-Rate wird erst ab **50 Gesamtkills** gewertet und angezeigt. Unter 50 Kills wird kein Prozentwert ausgegeben; im Spielerprofil erscheint stattdessen der Freischalt-Hinweis.
 - K/D bleibt wie bisher erst ab **100 Kills** in der Rangliste.
-- `/status`, `/whois`, `/whoisplayer` und `/playerstats` wurden in der Feldreihenfolge näher an die Stats-Karte aus der Referenz gebracht: Kills/Tode/KD, Matches/Siege/Rekord, Spielzeit/Seeding/Fraktion.
+- `/stats`, `/whois`, `/whoisplayer` und `/playerstats` wurden in der Feldreihenfolge näher an die Stats-Karte aus der Referenz gebracht: Kills/Tode/KD, Matches/Siege/Rekord, Spielzeit/Seeding/Fraktion.
 - Discord `/leaderboard` nutzt dieselben Mindestgrenzen und hebt sie direkt in der Beschreibung hervor.
 
 
@@ -578,3 +585,7 @@ A single Management Bot can manage up to 12 WARDOGS servers. Each server has sep
 - Service Bot owners can add up to 20 existing panel users as shared operators. Shared users can configure, test, start/stop and operate the bot, while subscription cancellation, permanent deletion and sharing management remain owner/admin-only.
 - Deleting a panel account automatically removes it from all Service Bot sharing lists.
 
+
+### v3.12.57 – Live-Management / BOT Health / Bans / Season-2-Feed
+
+Die Management-Ansicht aktualisiert sich separat im laufenden Panel. Die BOT-Gesundheitsübersicht zeigt ausschließlich eigene Bots. Die Banliste unterstützt mehrere WARDOGS-Antwortformate und unterscheidet Abruffehler von einer leeren Liste. Bei WARDOGS Season 2 ist der Killfeed am Gamehost in der `ServerSettings.ini` zu konfigurieren; die notwendige, geschützte Konfigurationsvorlage wird nach „Server Feed konfigurieren“ im Panel angeboten. Einzelheiten siehe `UPDATE-v3.12.57.md`.

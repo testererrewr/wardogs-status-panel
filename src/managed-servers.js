@@ -28,6 +28,7 @@ export function normalizeManagedServers(bot) {
     killFeedTokenEnc: String(row?.killFeedTokenEnc || ''),
     killFeedConfiguredAt: row?.killFeedConfiguredAt || null,
     killFeedPublicUrl: String(row?.killFeedPublicUrl || '').slice(0, 300),
+    killFeedSetupMode: row?.killFeedSetupMode === 'manual' ? 'manual' : 'legacy',
     killFeedNeedsGameRestart: row?.killFeedNeedsGameRestart === true,
     killFeedLastEventAt: row?.killFeedLastEventAt || null,
     killFeedEvents: (Array.isArray(row?.killFeedEvents) ? row.killFeedEvents : []).slice(-150)
@@ -54,6 +55,7 @@ export function normalizeManagedServers(bot) {
     killFeedTokenEnc: String(bot?.killFeedTokenEnc || ''),
     killFeedConfiguredAt: bot?.killFeedConfiguredAt || null,
     killFeedPublicUrl: String(bot?.killFeedPublicUrl || '').slice(0, 300),
+    killFeedSetupMode: bot?.killFeedSetupMode === 'manual' ? 'manual' : 'legacy',
     killFeedNeedsGameRestart: bot?.killFeedNeedsGameRestart === true,
     killFeedLastEventAt: bot?.killFeedLastEventAt || null,
     killFeedEvents: (Array.isArray(bot?.killFeedEvents) ? bot.killFeedEvents : []).slice(-150)
@@ -86,6 +88,7 @@ export function managedServerContext(bot, serverOrId) {
     killFeedTokenEnc: server.killFeedTokenEnc,
     killFeedConfiguredAt: server.killFeedConfiguredAt,
     killFeedPublicUrl: server.killFeedPublicUrl,
+    killFeedSetupMode: server.killFeedSetupMode,
     killFeedNeedsGameRestart: server.killFeedNeedsGameRestart,
     killFeedLastEventAt: server.killFeedLastEventAt,
     killFeedEvents: server.killFeedEvents

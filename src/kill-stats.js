@@ -482,6 +482,10 @@ function patchIniKey(lines, sectionName, key, value) {
   for(let i=start+1;i<end;i+=1){if(new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\\]\\]/g,'\\$&')}\\s*=`, 'i').test(lines[i])){lines[i]=line;return;}}
   lines.splice(start+1,0,line);
 }
+async function feedSetupMode(request) {
+  try { await request('/v1/feed'); return 'manual'; }
+  catch (error) { if (Number(error?.status) === 404) return 'legacy'; throw error; }
+}
 function patchServerFeedConfig(text, origin, token){const newline=String(text||'').includes('\r\n')?'\r\n':'\n';const lines=String(text||'').split(/\r?\n/);patchIniKey(lines,'WDServerFeed','Url',origin);patchIniKey(lines,'WDServerFeed','Token',token);return lines.join(newline);}
 export async function configureWardogsKillFeed(bot, publicUrl = process.env.PUBLIC_URL || '') {
   if(!SUPPORTED_FEED_SERVICES.has(String(bot?.serviceId||'')))throw new Error('This service does not use the WARDOGS kill feed');
@@ -489,11 +493,16 @@ export async function configureWardogsKillFeed(bot, publicUrl = process.env.PUBL
   const root=baseUrl(bot?.wardogsBaseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
   const secret=decryptMaybe(bot?.wardogsSecretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   let token=decryptMaybe(bot.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
+  const mode=await feedSetupMode(path=>wardogsJson(bot,path));
+  if(mode==='manual'){
+    const fresh=upsertManagedBot({id:bot.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true});
+    return {bot:fresh,origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+  }
   const {data:config}=await wardogsJson(bot,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
   const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(bot?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
   let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
-  const fresh=upsertManagedBot({id:bot.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true});
+  const fresh=upsertManagedBot({id:bot.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'legacy',killFeedNeedsGameRestart:true});
   return{bot:fresh,origin,needsGameRestart:true,result};
 }
 
@@ -507,11 +516,17 @@ export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl 
   const root=baseUrl(server.baseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
   const secret=decryptMaybe(server.secretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
+  const mode=await feedSetupMode(path=>playtimeWardogsJson(bot,server,path));
+  if(mode==='manual'){
+    const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true}:row);
+    const fresh=upsertManagedBot({id:bot.id,playtimeServers:next});
+    return {bot:fresh,server:next[index],origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+  }
   const {data:config}=await playtimeWardogsJson(bot,server,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
   const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(bot?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
   let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
-  const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true}:row);
+  const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'legacy',killFeedNeedsGameRestart:true}:row);
   const fresh=upsertManagedBot({id:bot.id,playtimeServers:next});
   return{bot:fresh,server:next[index],origin,needsGameRestart:true,result};
 }
@@ -525,11 +540,17 @@ export async function configureWardogsManagementFeed(bot, serverId, publicUrl = 
   const root=baseUrl(server.baseUrl);if(!root)throw new Error('WARDOGS base URL is missing');
   const secret=decryptMaybe(server.secretEnc);if(!secret)throw new Error('WARDOGS RCON/API password is missing');
   let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
+  const mode=await feedSetupMode(path=>wardogsJson(ctx,path));
+  if(mode==='manual'){
+    const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true});
+    const fresh=upsertManagedBot({id:bot.id,managedServers:next});
+    return {bot:fresh,server:next.find(row=>row.id===server.id),origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+  }
   const {data:config}=await wardogsJson(ctx,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
   const response=await safeHttpText(`${root}/v1/config?fullApply=true`,{allowPrivate:Boolean(bot?.allowPrivateTarget),method:'PUT',headers:{Accept:'application/json',Authorization:`Bearer ${secret}`,'Content-Type':'text/plain; charset=utf-8',...(revision?{'If-Match':`"${revision.replace(/^"|"$/g,'')}"`}:{})},body:patched,timeoutMs:10000,maxBytes:1024*1024});
   let result={};if(response.text){try{result=JSON.parse(response.text);}catch{result={message:response.text.slice(0,300)};}}if(!response.ok)throw new Error(`WARDOGS API ${response.status}: ${String(result?.error?.message||result?.message||result?.error||'Error').slice(0,220)}`);
-  const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedNeedsGameRestart:true});
+  const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'legacy',killFeedNeedsGameRestart:true});
   const primary=next[0]||server;
   const fresh=upsertManagedBot({id:bot.id,managedServers:next,wardogsBaseUrl:primary.baseUrl,wardogsSecretEnc:primary.secretEnc,alertChannelId:primary.alertChannelId,controlPanelEnabled:primary.controlPanelEnabled,controlPanelChannelId:primary.controlPanelChannelId});
   return{bot:fresh,server:next.find((row)=>row.id===server.id),origin,needsGameRestart:true,result};

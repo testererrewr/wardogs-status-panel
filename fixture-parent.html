@@ -1,0 +1,18 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/public/style.css"><style>body{display:block;margin:0;height:6700px;background:#11182b}.spacer{height:500px}iframe{width:100%;height:4300px;border:0}</style></head><body><div class="spacer"></div><iframe id="live" src="/fixture-inner.html"></iframe><div id="results">WAIT</div><script>
+const delay = (ms)=>new Promise(r=>setTimeout(r,ms));
+(async()=>{
+ const frame=document.querySelector('#live');await new Promise(r=>frame.addEventListener('load',r,{once:true}));
+ scrollTo(0,2100);await delay(130);
+ const btn=frame.contentDocument.querySelector('[data-open-managed-ban]');
+ btn.click(); await delay(150);
+ let modal=document.querySelector('[data-managed-ban-modal]');
+ const rect=modal.getBoundingClientRect();
+ const first = {portal:!!modal,centered:Math.abs((rect.top+rect.bottom)/2-innerHeight/2)<5,withinViewport:rect.top>=0&&rect.bottom<=innerHeight,scroll:scrollY,steam:modal?.querySelector('[data-ban-steam-id]')?.value,csrf:modal?.querySelector('[name="_csrf"]')?.value,target:modal?.querySelector('form')?.target};
+ modal.querySelector('[data-close-managed-ban]').click();await delay(60);
+ const closed = {backInFrame:!!frame.contentDocument.querySelector('[data-managed-ban-modal]'),hidden:frame.contentDocument.querySelector('[data-managed-ban-modal]').hidden,scroll:scrollY};
+ btn.click();await delay(60);
+ document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await delay(60);
+ const escaped={hidden:frame.contentDocument.querySelector('[data-managed-ban-modal]').hidden};
+ document.body.dataset.testResult=JSON.stringify({first,closed,escaped});document.querySelector('#results').textContent=JSON.stringify({first,closed,escaped});
+})().catch(e=>{document.body.dataset.testResult='error: '+e.stack;document.querySelector('#results').textContent=e.stack});
+</script></body></html>

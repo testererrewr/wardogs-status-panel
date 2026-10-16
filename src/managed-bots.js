@@ -20,6 +20,8 @@ import { desiredDynamicServerName } from './managed-dynamic-name.js';
 import { normalizeManagedServers, managedServerContext, managedServerContexts, managedServerByChannel, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat } from './managed-chat.js';
 import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel } from './managed-level-policy.js';
+import { normalizeManagedBans } from './managed-ban-list.js';
+import { sharedServerBanRows, mergeSharedServerBans, removeSharedServerBan, combinedManagedBanList, sharedBanActionTargets } from './managed-shared-bans.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
@@ -619,6 +621,84 @@ async function managedCurrentBanRows(bot, options = {}) {
   }
   return [...desired.values()];
 }
+// One Management Bot owns one shared ban intent list across its configured
+// WARDOGS servers. A live WARDOGS API can reject offline players (404); those
+// bans stay in the shared intent list and are retried when the player joins.
+export async function synchronizeManagedServerBanList(bot, { actor = 'web', maxActions = 200 } = {}) {
+  const fresh = getManagedBot(bot?.id) || bot;
+  if (!fresh || String(fresh.serviceId) !== 'wardogs-warning-bot') throw new Error('Management bot not found');
+  const servers = managedServerContexts(fresh);
+  if (servers.length < 2) return { servers: servers.length, bans: 0, applied: 0, already: 0, pending: 0, failed: 0, errors: [] };
+  const snapshots = [];
+  const errors = [];
+  for (const server of servers) {
+    try {
+      const parsed = normalizeManagedBans(await wardogsRequest(server, '/v1/bans'));
+      if (!parsed.available) throw new Error('Unsupported ban-list response');
+      snapshots.push({ server, bans: new Map(parsed.bans.map(row => [row.steamId, row])) });
+    } catch (error) {
+      if (error?.wardogsAuthLocked) throw error;
+      errors.push(`${server._managedServerLabel}: ${String(error?.message || error).slice(0,140)}`);
+    }
+  }
+  if (!snapshots.length) throw new Error(`Cannot read any WARDOGS ban list: ${errors[0] || 'API unavailable'}`);
+  const now = Date.now();
+  const temporary = new Map(temporaryBans(fresh).map(row => [row.steamId, row]));
+  const dynamic = new Set(dynamicBans(fresh).map(row => row.steamId));
+  const incoming = [];
+  for (const { bans } of snapshots) for (const row of bans.values()) {
+    // Escalated Dynamic Bans are already tracked by the bot-wide Dynamic Ban
+    // system. Never accidentally promote them to permanent shared bans.
+    if (dynamic.has(row.steamId)) continue;
+    const temp = temporary.get(row.steamId);
+    const expiresAt = temp?.expiresAt || row.expiresAtUtc || '';
+    if (expiresAt && Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) <= now) continue;
+    const isTemporary = Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > now;
+    incoming.push({ steamId: row.steamId, reason: row.reason, mode: isTemporary ? 'temporary' : 'permanent', expiresAt: isTemporary ? expiresAt : null, createdAt: row.bannedAtUtc || null });
+  }
+  const merged = mergeSharedServerBans(fresh, incoming);
+  upsertManagedBot({ id: fresh.id, sharedServerBans: merged });
+  let applied = 0, already = 0, pending = 0;
+  // Avoid unbounded WARDOGS calls on a large historical ban list. The remaining
+  // bans are still persisted for join-time enforcement and future resync runs.
+  let budget = Math.max(0, Math.min(200, Math.floor(Number(maxActions) || 0)));
+  for (const { server, bans } of snapshots) {
+    for (const row of merged) {
+      if (bans.has(row.steamId)) { already++; continue; }
+      if (budget-- <= 0) { pending++; continue; }
+      if (row.mode === 'temporary' && !(Date.parse(row.expiresAt || '') > Date.now())) continue;
+      try {
+        await banManagedPlayer(server, row.steamId, row.reason || 'Shared ban', { skipSync: true, _fanout: true, tolerateExisting: true, keepLocalTemporary: true, durationMinutes: row.mode === 'temporary' ? Math.max(1, Math.ceil((Date.parse(row.expiresAt || '') - Date.now()) / 60000)) : 0, actor: 'shared-bans-resync' });
+        applied++;
+      } catch (error) {
+        if (error?.wardogsAuthLocked) throw error;
+        if (banSyncPlayerOfflineError(error)) pending++;
+        else errors.push(`${server._managedServerLabel} · ${row.steamId}: ${String(error?.message || error).slice(0,120)}`);
+      }
+    }
+  }
+  appendManagedAudit(fresh.id, { actor, action: 'shared-server-bans-sync', detail: `${merged.length} shared bans, ${applied} applied, ${pending} pending, ${errors.length} errors`, status: errors.length ? 'error' : 'ok' });
+  setRuntime(fresh.id, { lastSharedBansSyncAt: nowIso(), lastSharedBansSyncError: errors.length ? errors[0] : null });
+  return { servers: servers.length, bans: merged.length, applied, already, pending, failed: errors.length, errors: errors.slice(0, 10) };
+}
+
+async function enforceManagedSharedBansForPlayers(bot, players = []) {
+  const fresh = getManagedBot(bot?.id) || bot;
+  if (managedServerContexts(fresh).length < 2) return;
+  const desired = new Map(sharedServerBanRows(fresh).map(row => [row.steamId, row]));
+  for (const player of players) {
+    const steamId = playerSteamId(player);
+    const row = desired.get(steamId);
+    if (!row) continue;
+    try {
+      await banManagedPlayer(bot, steamId, row.reason || 'Shared Management Bot ban', { skipSync: true, _fanout: true, tolerateExisting: true, keepLocalTemporary: true, durationMinutes: row.mode === 'temporary' ? Math.max(1, Math.ceil((Date.parse(row.expiresAt || '') - Date.now()) / 60000)) : 0, actor: 'shared-ban-enforcement' });
+    } catch (error) {
+      if (error?.wardogsAuthLocked) throw error;
+      appendManagedAudit(fresh.id, { actor: 'shared-ban-enforcement', action: 'shared-ban-enforce-failed', target: steamId, detail: `${bot._managedServerLabel}: ${String(error?.message || error).slice(0,180)}`, status: 'error' });
+    }
+  }
+}
+
 function banSyncRowSatisfied(current, desired) {
   if (!current || !desired) return false;
   if (desired.mode === 'permanent') return current.mode === 'permanent';
@@ -730,7 +810,7 @@ async function applyBanSyncRow(target, row, roomId, sourceBotId) {
     const minutes = Math.max(1, Math.ceil((expiresAtMs - Date.now()) / 60_000));
     await temporaryBanManagedPlayer(target, normalized, row.reason || 'Synced ban', minutes, { createdBy: actor, templateId: row.templateId, forcedExpiresAt: new Date(expiresAtMs).toISOString(), forceNormal: true, skipSync: true, tolerateExisting: true });
   } else {
-    await banManagedPlayer(target, normalized, row.reason || 'Synced ban', { skipSync: true, actor, tolerateExisting: true });
+    await banManagedPlayer(target, normalized, row.reason || 'Synced ban', { skipSync: true, fanoutWithinBot: true, actor, tolerateExisting: true });
   }
   appendManagedAudit(target.id, { actor, action: 'ban-sync-community-applied', target: normalized, detail: `${row.mode} ban from ${sourceBotId || 'community'}${row.expiresAt ? ` until ${row.expiresAt}` : ''}` });
   return true;
@@ -1073,16 +1153,28 @@ export async function syncManagedBanSnapshot(sourceBot, explicitTarget = null, m
 export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation', options = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
-  const fanout = !bot?._managedServerId ? managedServerContexts(bot) : [];
-  if (fanout.length > 1 && options?._fanout !== true) {
-    const results = [], errors = [];
-    for (const server of fanout) {
+  // Even when a ban originates from one web/Discord server tab, its scope is
+  // ALL configured WARDOGS servers within this one Management Bot.
+  const parent = getManagedBot(bot?.id) || bot;
+  const targets = sharedBanActionTargets(parent);
+  if (targets.length > 1 && options?._fanout !== true && (!options?.skipSync || options?.fanoutWithinBot === true)) {
+    const results = [], errors = [], pending = [];
+    for (const server of targets) {
       try { results.push(await banManagedPlayer(server, normalized, reason, { ...options, skipSync: true, _fanout: true, tolerateExisting: true })); }
-      catch (error) { errors.push(`${server._managedServerLabel || server._managedServerId}: ${String(error?.message || error).slice(0,180)}`); }
+      catch (error) {
+        if (error?.wardogsAuthLocked) throw error;
+        if (banSyncPlayerOfflineError(error)) pending.push(server._managedServerLabel || server._managedServerId);
+        else errors.push(`${server._managedServerLabel || server._managedServerId}: ${String(error?.message || error).slice(0,180)}`);
+      }
     }
-    if (errors.length === fanout.length) throw new Error(`Ban failed on all managed servers: ${errors[0]}`);
-    if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(bot.id) || bot, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });
-    return { fanout: true, applied: results.length, failed: errors.length, errors };
+    if (!results.length && !pending.length) throw new Error(`Ban failed on all managed servers: ${errors[0] || 'Unknown error'}`);
+    const fresh = getManagedBot(parent.id) || parent;
+    const minutes = Math.max(0, Number(options?.durationMinutes) || 0);
+    const expiry = options?.forcedExpiresAt || (minutes ? new Date(Date.now() + minutes * 60_000).toISOString() : null);
+    upsertManagedBot({ id: fresh.id, sharedServerBans: mergeSharedServerBans(fresh, [{ steamId: normalized, reason, mode: minutes ? 'temporary' : 'permanent', expiresAt: expiry }]) });
+    if (errors.length || pending.length) appendManagedAudit(parent.id, { actor: options?.actor || 'system', action: 'shared-ban-partial', target: normalized, status: errors.length ? 'error' : 'ok', detail: `${results.length}/${targets.length} applied, ${pending.length} waiting for player join, ${errors.length} errors. ${errors[0] || ''}` });
+    if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(parent.id) || parent, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });
+    return { fanout: true, applied: results.length, pending: pending.length, failed: errors.length, errors };
   }
   let result;
   try {
@@ -1093,7 +1185,7 @@ export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule viol
     // for a duplicate ban. Verify the live list before treating it as a failure.
     try {
       const live = await wardogsRequest(bot, '/v1/bans');
-      const present = (Array.isArray(live?.bans) ? live.bans : []).some((entry) => normalizeSteamId64(entry?.steamId) === normalized);
+      const present = normalizeManagedBans(live).bans.some(entry => normalizeSteamId64(entry.steamId) === normalized);
       if (!present) throw error;
       result = { message: 'Ban already present', alreadyPresent: true };
     } catch (verifyError) {
@@ -1137,7 +1229,7 @@ export async function temporaryBanManagedPlayer(bot, steamId, reason = 'Temporar
   if (!normalized) throw new Error('Invalid SteamID64');
   const minutes = Math.max(1, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
   if (!minutes) throw new Error('Temporary ban duration is invalid');
-  await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes, skipSync: true, actor: meta?.createdBy || 'system', keepLocalTemporary: true, tolerateExisting: meta?.tolerateExisting === true });
+  await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes, skipSync: true, actor: meta?.createdBy || 'system', keepLocalTemporary: true, tolerateExisting: meta?.tolerateExisting === true, fanoutWithinBot: true, forcedExpiresAt: meta?.forcedExpiresAt });
   const fresh = getManagedBot(bot?.id) || bot;
   const existing = temporaryBans(fresh).filter((entry) => entry.steamId !== normalized);
   const forced = Date.parse(meta?.forcedExpiresAt || '');
@@ -1178,7 +1270,7 @@ export async function expireManagedTemporaryBans(bot) {
     appendManagedAudit(fresh.id, { actor: 'system', action: 'temporary-ban-expired', target: entry.steamId, detail: `Expired at ${entry.expiresAt}` });
     await syncUnbanToAcceptedTarget(fresh, entry.steamId, { actor: 'system' });
   }
-  if (expired) upsertManagedBot({ id: fresh.id, temporaryBans: keep });
+  if (expired) upsertManagedBot({ id: fresh.id, temporaryBans: keep, sharedServerBans: sharedServerBanRows(getManagedBot(fresh.id) || fresh).filter(row => !due.some(entry => entry.steamId === row.steamId && !keep.some(kept => kept.steamId === entry.steamId))) });
   if (lastError) setRuntime(fresh.id, { lastTemporaryBanError: lastError });
   else if (expired) setRuntime(fresh.id, { lastTemporaryBanError: null, lastTemporaryBanSweepAt: nowIso() });
   return { expired, pending: keep.length, error: lastError };
@@ -1234,7 +1326,7 @@ async function processManagedDynamicBans(bot, joinedPlayers = []) {
     if (!entry.escalated && attempts.length >= threshold) {
       const remainingMinutes = Math.max(1, Math.ceil((Date.parse(entry.expiresAt) - Date.now()) / 60_000));
       try {
-        await banManagedPlayer(actionBot, steamId, entry.reason, { durationMinutes: remainingMinutes, skipSync: true, actor: 'dynamic-ban-escalation', keepLocalTemporary: true });
+        await banManagedPlayer(actionBot, steamId, entry.reason, { durationMinutes: remainingMinutes, skipSync: true, fanoutWithinBot: true, actor: 'dynamic-ban-escalation', keepLocalTemporary: true });
         entry.escalated = true; entry.escalatedAt = nowIso();
         appendManagedAudit(fresh.id, { actor: 'dynamic-ban', action: 'dynamic-ban-escalated', target: steamId, detail: `${attempts.length} joins in ${windowMinutes} min; normal WARDOGS ban only until original expiry ${entry.expiresAt}` });
       } catch (error) {
@@ -1534,21 +1626,27 @@ export async function unbanManagedPlayer(bot, steamId, meta = {}) {
   if (!normalized) throw new Error('Invalid SteamID64');
   const freshBefore = getManagedBot(bot?.id) || bot;
   const dynamic = meta?._dynamicSnapshot || dynamicBans(freshBefore).find((entry) => entry.steamId === normalized);
-  const fanout = !bot?._managedServerId ? managedServerContexts(freshBefore) : [];
-  if (fanout.length > 1 && meta?._fanout !== true) {
+  const fanout = sharedBanActionTargets(freshBefore);
+  if (fanout.length > 1 && meta?._fanout !== true && (!meta?.skipSync || meta?.fanoutWithinBot === true)) {
     const results = [], errors = [];
     if (!dynamic || dynamic.escalated) {
       for (const server of fanout) {
         try { results.push(await unbanManagedPlayer(server, normalized, { ...meta, skipSync: true, tolerateMissing: true, _fanout: true, _dynamicSnapshot: dynamic || null })); }
-        catch (error) { errors.push(`${server._managedServerLabel || server._managedServerId}: ${String(error?.message || error).slice(0,180)}`); }
+        catch (error) {
+          if (error?.wardogsAuthLocked) throw error;
+          errors.push(`${server._managedServerLabel || server._managedServerId}: ${String(error?.message || error).slice(0,180)}`);
+        }
       }
       if (errors.length === fanout.length) throw new Error(`Unban failed on all managed servers: ${errors[0]}`);
     }
-    const latest = getManagedBot(bot.id) || freshBefore;
-    upsertManagedBot({ id: latest.id, temporaryBans: temporaryBans(latest).filter((entry) => entry.steamId !== normalized), dynamicBans: dynamicBans(latest).filter((entry) => entry.steamId !== normalized) });
-    appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'unban', target: normalized, detail: dynamic && !dynamic.escalated ? 'Dynamic ban removed locally across all managed servers.' : `WARDOGS ban removed across ${results.length}/${fanout.length} managed servers.` });
-    if (!meta?.skipSync) await syncUnbanToAcceptedTarget(getManagedBot(bot.id) || bot, normalized, meta);
-    return { fanout: true, applied: results.length, failed: errors.length, errors, localOnly: Boolean(dynamic && !dynamic.escalated) };
+    const latest = getManagedBot(freshBefore.id) || freshBefore;
+    // Do not acknowledge/forget a shared unban if any server failed. Keeping
+    // the intent lets the operator retry without the next sync resurrecting it.
+    if (!errors.length) upsertManagedBot({ id: latest.id, temporaryBans: temporaryBans(latest).filter(entry => entry.steamId !== normalized), dynamicBans: dynamicBans(latest).filter(entry => entry.steamId !== normalized), sharedServerBans: removeSharedServerBan(latest, normalized) });
+    appendManagedAudit(freshBefore.id, { actor: meta?.actor || 'system', action: 'unban', target: normalized, detail: `Shared unban ${results.length}/${fanout.length} servers; ${errors.length} errors. ${errors[0] || ''}`, status: errors.length ? 'error' : 'ok' });
+    if (errors.length) throw new Error(`Unban only partially applied: ${errors.join(' · ').slice(0,300)}. Retry the unban.`);
+    if (!meta?.skipSync) await syncUnbanToAcceptedTarget(getManagedBot(freshBefore.id) || freshBefore, normalized, meta);
+    return { fanout: true, applied: results.length, failed: 0, localOnly: Boolean(dynamic && !dynamic.escalated) };
   }
   let result = { localOnly: Boolean(dynamic && !dynamic.escalated) };
   if (!dynamic || dynamic.escalated) {
@@ -2093,6 +2191,11 @@ async function pollPlayers(bot, state, client) {
     } catch (error) {
       setRuntime(bot.id, { lastBanSyncAt: nowIso(), lastBanSyncError: String(error?.message || error).slice(0, 300) });
     }
+    try {
+      await enforceManagedSharedBansForPlayers(bot, state.baselineReady ? joinedPlayers : players);
+    } catch (error) {
+      setRuntime(bot.id, { lastSharedBansSyncError: String(error?.message || error).slice(0, 300) });
+    }
     // Dynamic Ban enforcement has its own fast 2-second watcher. Detection rules
     // keep the slower, conservative tracker to avoid false join events.
     const dynamicBlocked = new Set(dynamicBans(getManagedBot(bot.id) || bot).map((entry) => entry.steamId));
@@ -2266,7 +2369,7 @@ async function playerControl(bot, steamId) {
 
 async function bansPanel(bot) {
   const data = await wardogsRequest(bot, '/v1/bans');
-  const bans = Array.isArray(data?.bans) ? data.bans.filter((b) => validSteamId(b?.steamId)) : [];
+  const bans = combinedManagedBanList(normalizeManagedBans(data).bans, bot);
   const rows = [];
   if (bans.length) {
     rows.push(new ActionRowBuilder().addComponents(
@@ -2752,6 +2855,15 @@ async function startOne(bot) {
       }
     }
     setRuntime(bot.id, { state: 'connected', botTag: client.user?.tag || '', botId: client.user?.id || '', managedServerCount: freshServers.length, lastError: null });
+    // Bring historic bans from all configured servers into one list. Run it
+    // asynchronously; Discord login and the web panel must not wait on RCON.
+    if (freshServers.length > 1) {
+      const handle = setTimeout(() => {
+        synchronizeManagedServerBanList(getManagedBot(bot.id) || bot, { actor: 'startup', maxActions: 10 })
+          .catch(error => setRuntime(bot.id, { lastSharedBansSyncError: String(error?.message || error).slice(0,220) }));
+      }, 3000);
+      handle.unref?.();
+    }
     for (const server of freshServers) {
       const serverState = rootState.serverStates.get(String(server._managedServerId || 'primary'));
       await pollPlayers(server, serverState, client);
