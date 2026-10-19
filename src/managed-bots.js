@@ -21,6 +21,7 @@ import { normalizeManagedServers, managedServerContext, managedServerContexts, m
 import { appendManagedChat } from './managed-chat.js';
 import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel } from './managed-level-policy.js';
 import { normalizeManagedBans } from './managed-ban-list.js';
+import { discordPanelMessageMissing } from './managed-panel-recovery.js';
 import { sharedServerBanRows, mergeSharedServerBans, removeSharedServerBan, combinedManagedBanList, sharedBanActionTargets } from './managed-shared-bans.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
@@ -1954,13 +1955,13 @@ function controlPanelComponents(bot) {
 }
 
 async function controlPanelPayload(bot) {
+  // Publishing the Discord management panel must never depend on WARDOGS RCON.
+  // A slow or failing player poll previously prevented the panel from appearing
+  // even though the Discord client was already online. The roster is updated
+  // independently by pollPlayers and the panel uses its latest cached snapshot.
   const recent = cachedRoster(bot);
-  let status = recent?.status || null;
-  let players = recent?.players || null;
-  if (!status || !players) {
-    try { [status, players] = await Promise.all([wardogsRequest(bot, '/v1/status'), wardogsRequest(bot, '/v1/players')]); }
-    catch {}
-  }
+  const status = recent?.status || null;
+  const players = recent?.players || null;
   const playerList = wardogsPlayerRows(players);
   const scores = Array.isArray(status?.factionScores) ? status.factionScores : [];
   const scoreText = scores.length ? scores.slice(0, 6).map((x) => `${cut(x.name, 40)}: ${Number.isFinite(Number(x.score)) ? x.score : '—'}`).join(' · ') : '—';
@@ -1968,7 +1969,7 @@ async function controlPanelPayload(bot) {
     .setTitle('WARDOGS Management Panel')
     .setDescription('Manage the server from Discord. Every action is checked against the permissions configured in the web panel.')
     .addFields(
-      { name: 'Server', value: cut(status?.serverName || 'Unreachable', 1024), inline: true },
+      { name: 'Server', value: cut(status?.serverName || bot?._managedServerLabel || 'WARDOGS', 1024), inline: true },
       { name: 'Map', value: cut(status?.map || '—', 1024), inline: true },
       { name: 'Players', value: `${wardogsReportedPlayerCount(status, players)} / ${status?.players?.max ?? '—'}`, inline: true },
       { name: 'Scores', value: cut(scoreText, 1024), inline: false },
@@ -2011,11 +2012,16 @@ async function ensureControlPanel(bot, client, state, { repost = false } = {}) {
     let message = null;
     const currentMessageId = String(state.panelMessageId || bot.controlPanelMessageId || '');
     if (currentMessageId) {
-      try {
-        message = await channel.messages.fetch(currentMessageId);
+      try { message = await channel.messages.fetch(currentMessageId); }
+      catch (error) {
+        // Recreate only when the old message really disappeared. Permission or
+        // network errors must not trigger duplicate panels every 30 seconds.
+        if (!discordPanelMessageMissing(error)) throw error;
+      }
+      if (message) {
         if (repost) { await message.delete(); message = null; }
         else await message.edit(payload);
-      } catch { message = null; }
+      }
     }
     if (!message) message = await channel.send(payload);
     state.panelMessageId = String(message.id);
@@ -2024,7 +2030,7 @@ async function ensureControlPanel(bot, client, state, { repost = false } = {}) {
     if (String(bot.controlPanelMessageId || '') !== String(message.id) || String(bot.controlPanelMessageChannelId || '') !== channelId) {
       try { persistManagedServerState(bot, { controlPanelMessageId: String(message.id), controlPanelMessageChannelId: channelId }); } catch {}
     }
-    setServerRuntime(bot, { controlPanelMessageId: String(message.id), controlPanelChannelId: channelId });
+    setServerRuntime(bot, { controlPanelMessageId: String(message.id), controlPanelChannelId: channelId, lastPanelError: null });
     return message;
   } finally {
     state.panelPosting = false;
@@ -2032,6 +2038,37 @@ async function ensureControlPanel(bot, client, state, { repost = false } = {}) {
 }
 
 function stateForManagedServer(rootState, bot) { return rootState?.serverStates?.get?.(String(bot?._managedServerId || 'primary')) || rootState; }
+// Own lifecycle: independent of API/player polling, including when /v1/players
+// is slow or unavailable. Each configured server gets one persistent message.
+async function refreshControlPanels(bot, client, rootState, { repost = false } = {}) {
+  const results = [];
+  for (const server of managedServerContexts(bot).filter(row => row.controlPanelEnabled)) {
+    const key = String(server._managedServerId || 'primary');
+    let state = rootState.serverStates.get(key);
+    if (!state) {
+      state = serverStateTemplate(server);
+      rootState.serverStates.set(key, state);
+    }
+    try {
+      const message = await ensureControlPanel(server, client, state, { repost });
+      if (message) results.push({ serverId: key, messageId: String(message.id) });
+    } catch (error) {
+      setServerRuntime(server, { lastPanelError: String(error?.message || error).slice(0, 300) });
+      if (repost) throw new Error(`${server._managedServerLabel}: ${error.message}`);
+    }
+  }
+  return results;
+}
+
+export async function refreshManagedDiscordPanels(id) {
+  const bot = getManagedBot(id);
+  const active = instances.get(id);
+  if (!bot?.enabled || !accessActive(bot)) throw new Error('Management Bot is not enabled');
+  if (!active?.client?.isReady?.() || !active?.state?.serverStates) throw new Error('Discord Bot is not connected');
+  if (!managedServerContexts(bot).some(row => row.controlPanelEnabled)) throw new Error('Discord management panel is not enabled for any server');
+  return refreshControlPanels(bot, active.client, active.state, { repost: true });
+}
+
 function scheduleControlPanelBottom(botId, serverId, client, state) {
   clearTimeout(state.panelRepostTimer);
   state.panelRepostTimer = setTimeout(async () => {
@@ -2268,9 +2305,6 @@ async function pollPlayers(bot, state, client) {
           setRuntime(bot.id, { lastAnnouncementError: error.message });
         }
       }
-    }
-    if (bot.controlPanelEnabled && Date.now() - Number(state.lastPanelRefreshAt || 0) >= 30_000) {
-      await ensureControlPanel(bot, client, state).catch((error) => setRuntime(bot.id, { lastPanelError: error.message }));
     }
     setRuntime(bot.id, { state: 'online', botTag: client.user?.tag || '', players: status ? wardogsReportedPlayerCount(status, data) : (Number.isInteger(state.lastServerStatusPlayerCount) ? state.lastServerStatusPlayerCount : players.length), rosterPlayers: players.length, lastCheck: nowIso(), lastError: null });
   } catch (error) {
@@ -2762,12 +2796,13 @@ async function cleanupLegacySeedingDiscordNickname(bot, client) {
   }
 }
 
-async function stopOne(id, keepRuntime = true) {
+async function stopOne(id, keepRuntime = true, { preservePanel = false } = {}) {
   const active = instances.get(id);
   if (active) instances.delete(id);
   if (active) {
     clearInterval(active.timer);
     clearInterval(active.dynamicTimer);
+    clearInterval(active.panelTimer);
     const stored = getManagedBot(id) || { id };
     const contexts = managedServerContexts(stored);
     for (const ctx of contexts) {
@@ -2777,7 +2812,12 @@ async function stopOne(id, keepRuntime = true) {
         clearInterval(serverState.welcomeTimer);
         clearInterval(serverState.dynamicTimer);
       }
-      try { await deleteStoredControlPanel(ctx, active.client, serverState || {}); } catch {}
+      // On restart keep the existing Discord message; the new client resumes
+      // editing it. Deleting on every restart left channels empty if WARDOGS
+      // polling subsequently failed.
+      if (!preservePanel) {
+        try { await deleteStoredControlPanel(ctx, active.client, serverState || {}); } catch {}
+      }
     }
     try { await active.client.destroy(); } catch {}
   }
@@ -2786,7 +2826,7 @@ async function stopOne(id, keepRuntime = true) {
 }
 
 async function startOne(bot) {
-  await stopOne(bot.id, false);
+  await stopOne(bot.id, false, { preservePanel: true });
   if (!bot.enabled || !accessActive(bot)) { setRuntime(bot.id, { state: bot.wardogsAuthLockedAt ? 'auth-locked' : (accessActive(bot) ? 'stopped' : 'access-expired'), lastError: bot.wardogsAuthLockedAt ? wardogsAuthLockedMessage(bot.wardogsAuthLockedReason) : null, requiresManualRestart: Boolean(bot.wardogsAuthLockedAt) }); return; }
   parseManagedRules(bot.rulesText || '');
   if (!bot.botTokenEnc) throw new Error('Discord bot token is missing');
@@ -2842,6 +2882,16 @@ async function startOne(bot) {
       setRuntime(bot.id, { state: freshBeforeRun.wardogsAuthLockedAt ? 'auth-locked' : (accessActive(freshBeforeRun) ? 'stopped' : 'access-expired'), lastError: freshBeforeRun.wardogsAuthLockedAt ? wardogsAuthLockedMessage(freshBeforeRun.wardogsAuthLockedReason) : null, requiresManualRestart: Boolean(freshBeforeRun.wardogsAuthLockedAt) });
       return;
     }
+    // Publish configured Discord panels immediately after login, before any
+    // expensive /v1/players or other game-server call. A separate timer keeps
+    // them alive even when the player API is unavailable.
+    await refreshControlPanels(freshBeforeRun, client, rootState);
+    rootState.panelTimer = setInterval(() => {
+      const latest = getManagedBot(bot.id);
+      if (latest?.enabled && accessActive(latest) && client.isReady())
+        refreshControlPanels(latest, client, rootState).catch(error => setRuntime(bot.id, { lastPanelError: String(error?.message || error).slice(0, 300) }));
+    }, 30_000);
+    rootState.panelTimer.unref?.();
     await cleanupLegacySeedingDiscordNickname(freshBeforeRun, client);
     const freshServers = managedServerContexts(freshBeforeRun);
     for (const server of freshServers) {
@@ -2891,9 +2941,10 @@ async function startOne(bot) {
       }
     }, Math.max(10, Math.min(300, Number(freshBeforeRun.pollSeconds) || 20)) * 1000);
     timer.unref?.();
-    instances.set(bot.id, { client, timer, dynamicTimer: rootState.dynamicTimer, signature: signature(freshBeforeRun), state: rootState });
+    instances.set(bot.id, { client, timer, dynamicTimer: rootState.dynamicTimer, panelTimer: rootState.panelTimer, signature: signature(freshBeforeRun), state: rootState });
     clearRecovery(bot.id);
   } catch (error) {
+    clearInterval(rootState.panelTimer);
     try { await client.destroy(); } catch {}
     throw error;
   }

@@ -6,6 +6,7 @@ import {
 import { decryptSecret, encryptSecret } from './crypto.js';
 import { readDb, getManagedBot, upsertManagedBot } from './db.js';
 import { safeHttpText } from './target-safety.js';
+import { seasonTwoFeedEndpoint } from './wardogs-feed-mode.js';
 import { normalizeSteamId64 } from './wardogs-players.js';
 import { normalizeManagedServers, managedServerContext, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat, extractChatEvents } from './managed-chat.js';

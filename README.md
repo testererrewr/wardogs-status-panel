@@ -589,3 +589,11 @@ A single Management Bot can manage up to 12 WARDOGS servers. Each server has sep
 ### v3.12.57 – Live-Management / BOT Health / Bans / Season-2-Feed
 
 Die Management-Ansicht aktualisiert sich separat im laufenden Panel. Die BOT-Gesundheitsübersicht zeigt ausschließlich eigene Bots. Die Banliste unterstützt mehrere WARDOGS-Antwortformate und unterscheidet Abruffehler von einer leeren Liste. Bei WARDOGS Season 2 ist der Killfeed am Gamehost in der `ServerSettings.ini` zu konfigurieren; die notwendige, geschützte Konfigurationsvorlage wird nach „Server Feed konfigurieren“ im Panel angeboten. Einzelheiten siehe `UPDATE-v3.12.57.md`.
+
+
+### v3.12.59 — Discord management panel reliability
+
+- Discord management panels publish after login independently of WARDOGS player/API polling, with separate 30-second refresh.
+- Existing management panel messages are preserved across bot restarts and reused.
+- Restore missing management panels via **Discord Panel wiederherstellen** in the management bot configuration.
+- Season 2 feed endpoint import fixed for the protected manual configuration screen.
