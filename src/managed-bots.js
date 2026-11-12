@@ -22,10 +22,11 @@ import { appendManagedChat } from './managed-chat.js';
 import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel, UNLIMITED_LEVEL_CANDIDATES } from './managed-level-policy.js';
 import { normalizeManagedBans } from './managed-ban-list.js';
 import { discordPanelMessageMissing } from './managed-panel-recovery.js';
+import { managementPanelSummary } from './managed-panel-snapshot.js';
 import { sharedServerBanRows, hasPermanentManagedBan, mergeSharedServerBans, removeSharedServerBan, combinedManagedBanList, sharedBanActionTargets } from './managed-shared-bans.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
-import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
+import { getManagedBot, getManagedBotRuntimeConfig, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
 import { parseManagedRules, evaluateManagedRules, matchManagedRules, managedRulesNeedSteam } from './managed-rules.js';
 import { getSteamRiskProfiles, steamApiKeyAvailable } from './steam-risk.js';
 import { WARDOGS_AUTH_MAX_FAILURES, createWardogsAuthLockedError, isWardogsAuthFailure, wardogsAuthLockedMessage } from './wardogs-auth.js';
@@ -229,7 +230,7 @@ export function managedSteamRuleStatus(bot) {
 
 function managedAuthParentId(bot) { return String(bot?._managedParentBotId || bot?.id || ''); }
 function managedAuthKey(bot) { return `${managedAuthParentId(bot)}:${baseUrl(bot?.wardogsBaseUrl).toLowerCase()}`; }
-function managedAuthParent(bot) { const id=managedAuthParentId(bot); return (id && getManagedBot(id)) || bot || null; }
+function managedAuthParent(bot) { const id=managedAuthParentId(bot); return (id && getManagedBotRuntimeConfig(id)) || bot || null; }
 function assertManagedWardogsAuthAllowed(bot) {
   const parent=managedAuthParent(bot);
   if(parent?.wardogsAuthLockedAt)throw createWardogsAuthLockedError(parent.wardogsAuthLockedReason || 'WARDOGS authentication is locked');
@@ -2004,20 +2005,16 @@ async function controlPanelPayload(bot) {
   // A slow or failing player poll previously prevented the panel from appearing
   // even though the Discord client was already online. The roster is updated
   // independently by pollPlayers and the panel uses its latest cached snapshot.
-  const recent = cachedRoster(bot);
-  const status = recent?.status || null;
-  const players = recent?.players || null;
-  const playerList = wardogsPlayerRows(players);
-  const scores = Array.isArray(status?.factionScores) ? status.factionScores : [];
-  const scoreText = scores.length ? scores.slice(0, 6).map((x) => `${cut(x.name, 40)}: ${Number.isFinite(Number(x.score)) ? x.score : '—'}`).join(' · ') : '—';
+  const recent = cachedRoster(bot, 180_000);
+  const summary = managementPanelSummary(recent?.status || null, recent?.players ?? null, bot?._managedServerLabel || 'WARDOGS');
   const embed = new EmbedBuilder()
     .setTitle('WARDOGS Management Panel')
     .setDescription('Manage the server from Discord. Every action is checked against the permissions configured in the web panel.')
     .addFields(
-      { name: 'Server', value: cut(status?.serverName || bot?._managedServerLabel || 'WARDOGS', 1024), inline: true },
-      { name: 'Map', value: cut(status?.map || '—', 1024), inline: true },
-      { name: 'Players', value: `${wardogsReportedPlayerCount(status, players)} / ${status?.players?.max ?? '—'}`, inline: true },
-      { name: 'Scores', value: cut(scoreText, 1024), inline: false },
+      { name: 'Server', value: cut(summary.server, 1024), inline: true },
+      { name: 'Map', value: cut(summary.map, 1024), inline: true },
+      { name: 'Players', value: summary.players, inline: true },
+      { name: 'Scores', value: cut(summary.scores, 1024), inline: false },
       { name: 'Auto-Ban', value: bot.autoBanEnabled === true ? 'ON' : 'OFF', inline: true },
       { name: 'Auto-Announcements', value: bot.announcementEnabled === true ? 'ON' : 'OFF', inline: true }
     )
@@ -2266,24 +2263,37 @@ async function pollPlayers(bot, state, client) {
   state.pollInFlight = true;
   try {
     let status = null;
-    let data = null;
-    data = await wardogsRequest(bot, '/v1/players');
-    // The authoritative occupancy may differ from the actionable roster.
-    // Query status at most once per minute unless dynamic-name needs it now.
-    if (bot.dynamicNameEnabled === true || Date.now() - Number(state.lastServerStatusAt || 0) >= 60_000) {
+    const previousCache = cachedRoster(bot, 180_000);
+    const cacheKey = `${String(bot?._managedParentBotId || bot?.id || '')}:${baseUrl(bot.wardogsBaseUrl)}`;
+    // Status is independent of /v1/players. A slow/broken roster MUST NOT
+    // prevent the permanent Discord message from showing map, scores or slots.
+    const statusDue = bot.dynamicNameEnabled === true ||
+      Date.now() - Number(state.lastServerStatusAt || 0) >= 60_000;
+    if (statusDue) {
       try {
-        status = await wardogsRequest(bot, '/v1/status');
+        status = await wardogsRequest(bot, '/v1/status', { timeoutMs: 2500 });
         state.lastServerStatusAt = Date.now();
-        state.lastServerStatusPlayerCount = wardogsReportedPlayerCount(status, data);
+        state.lastServerStatusPlayerCount = wardogsReportedPlayerCount(status, previousCache?.players);
+        liveRosterCache.set(cacheKey, { status, players: previousCache?.players ?? null, updatedAt: Date.now() });
+        setServerRuntime(bot, { lastPanelStatusError: null, lastPanelStatusAt: nowIso() });
+        if (bot.controlPanelEnabled === true && client?.isReady?.()) {
+          // Do not wait for the slow roster to finish before refreshing Discord.
+          void ensureControlPanel(bot, client, state).catch((error) =>
+            setServerRuntime(bot, { lastPanelError: String(error?.message || error).slice(0, 250) }));
+        }
       } catch (error) {
-        // Auth failures must not get hidden by the optional count refresh.
         if (error?.wardogsAuthLocked) throw error;
         state.lastServerStatusAt = Date.now();
+        setServerRuntime(bot, { lastPanelStatusError: String(error?.message || error).slice(0, 250) });
       }
     }
+    // Only after status is available, fetch the individually actionable rows.
+    const data = await wardogsRequest(bot, '/v1/players');
     const players = wardogsPlayerRows(data);
-    const previousCache = cachedRoster(bot, 90_000);
-    liveRosterCache.set(`${String(bot?._managedParentBotId||bot?.id||'')}:${baseUrl(bot.wardogsBaseUrl)}`, { status: status || previousCache?.status || null, players: data, updatedAt: Date.now() });
+    liveRosterCache.set(cacheKey, {
+      status: status || cachedRoster(bot, 180_000)?.status || previousCache?.status || null,
+      players: data, updatedAt: Date.now()
+    });
     if (status) {
       // Queue the optional config edit after the ordinary roster response.
       await syncManagedLevelCap(bot, state, wardogsReportedPlayerCount(status, data));
@@ -2313,7 +2323,7 @@ async function pollPlayers(bot, state, client) {
     }
     // Dynamic Ban enforcement has its own fast 2-second watcher. Detection rules
     // keep the slower, conservative tracker to avoid false join events.
-    const dynamicBlocked = new Set(dynamicBans(getManagedBot(bot.id) || bot).map((entry) => entry.steamId));
+    const dynamicBlocked = new Set(dynamicBans(getManagedBotRuntimeConfig(bot.id) || bot).map((entry) => entry.steamId));
     const candidates = joinedPlayers.filter((player) => {
       const id = playerSteamId(player);
       return id && !ignored.has(id) && !dynamicBlocked.has(id);
@@ -2680,8 +2690,19 @@ async function handleButton(interaction, client, state) {
     }
     if (action === 'refresh') {
       const bot = interactionBot(interaction, botId, 'view'); if (!bot) return true;
-      await ensureControlPanel(bot, client, stateForManagedServer(state, bot));
-      await interaction.reply({ content: 'Management panel refreshed.', ephemeral: true }); return true;
+      const serverState = stateForManagedServer(state, bot);
+      try {
+        const freshStatus = await wardogsRequest(bot, '/v1/status', { timeoutMs: 2500 });
+        const old = cachedRoster(bot, 180_000);
+        liveRosterCache.set(`${String(bot?._managedParentBotId || bot.id)}:${baseUrl(bot.wardogsBaseUrl)}`, {
+          status: freshStatus, players: old?.players ?? null, updatedAt: Date.now()
+        });
+        serverState.lastServerStatusAt = Date.now();
+      } catch (error) {
+        setServerRuntime(bot, { lastPanelStatusError: String(error?.message || error).slice(0, 250) });
+      }
+      await ensureControlPanel(bot, client, serverState);
+      await interaction.reply({ content: 'Management panel refreshed (latest available server snapshot).', ephemeral: true }); return true;
     }
     if (['pkick','pban','pwhisper','pkill','pteam'].includes(action)) {
       const steamId = parts[3]; if (!validSteamId(steamId)) throw new Error('Invalid SteamID64');
@@ -2928,7 +2949,7 @@ async function startOne(bot) {
   try {
     client.on('interactionCreate', (interaction) => handleInteraction(interaction, client, rootState).catch((error) => console.error(`Managed bot interaction ${bot.id}:`, error.message)));
     client.on('messageCreate', (message) => {
-      const fresh = getManagedBot(bot.id);
+      const fresh = getManagedBotRuntimeConfig(bot.id);
       if (!fresh?.enabled) return;
       const server = managedServerByChannel(fresh, message.channelId);
       if (!server?.controlPanelEnabled || String(message.channelId || '') !== String(server.controlPanelChannelId || '')) return;
@@ -2954,7 +2975,7 @@ async function startOne(bot) {
       client.once('clientReady', () => { clearTimeout(timeout); resolve(); });
       client.login(token).catch((error) => { clearTimeout(timeout); reject(error); });
     });
-    const freshBeforeRun = getManagedBot(bot.id) || bot;
+    const freshBeforeRun = getManagedBotRuntimeConfig(bot.id) || bot;
     if (!freshBeforeRun.enabled || !accessActive(freshBeforeRun)) {
       try { await client.destroy(); } catch {}
       setRuntime(bot.id, { state: freshBeforeRun.wardogsAuthLockedAt ? 'auth-locked' : (accessActive(freshBeforeRun) ? 'stopped' : 'access-expired'), lastError: freshBeforeRun.wardogsAuthLockedAt ? wardogsAuthLockedMessage(freshBeforeRun.wardogsAuthLockedReason) : null, requiresManualRestart: Boolean(freshBeforeRun.wardogsAuthLockedAt) });
@@ -2965,7 +2986,7 @@ async function startOne(bot) {
     // them alive even when the player API is unavailable.
     await refreshControlPanels(freshBeforeRun, client, rootState);
     rootState.panelTimer = setInterval(() => {
-      const latest = getManagedBot(bot.id);
+      const latest = getManagedBotRuntimeConfig(bot.id);
       if (latest?.enabled && accessActive(latest) && client.isReady())
         refreshControlPanels(latest, client, rootState).catch(error => setRuntime(bot.id, { lastPanelError: String(error?.message || error).slice(0, 300) }));
     }, 30_000);
@@ -2999,7 +3020,7 @@ async function startOne(bot) {
       if (freshBeforeRun.welcomeWhisperEnabled === true) await pollManagedWelcome(server, serverState);
     }
     rootState.dynamicTimer = setInterval(() => {
-      const fresh = getManagedBot(bot.id);
+      const fresh = getManagedBotRuntimeConfig(bot.id);
       if (!fresh?.enabled || !accessActive(fresh)) return;
       for (const server of managedServerContexts(fresh)) {
         const serverState = rootState.serverStates.get(String(server._managedServerId || 'primary')) || serverStateTemplate(server);
@@ -3010,7 +3031,7 @@ async function startOne(bot) {
     }, DYNAMIC_BAN_POLL_MS);
     rootState.dynamicTimer.unref?.();
     const timer = setInterval(() => {
-      const fresh = getManagedBot(bot.id);
+      const fresh = getManagedBotRuntimeConfig(bot.id);
       if (!fresh?.enabled || !accessActive(fresh)) return;
       for (const server of managedServerContexts(fresh)) {
         const serverState = rootState.serverStates.get(String(server._managedServerId || 'primary')) || serverStateTemplate(server);

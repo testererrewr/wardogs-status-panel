@@ -124,10 +124,10 @@ function defaultBotServices() {
     id: 'wardogs-playtime-tracker',
     slug: 'wardogs-playtime-tracker',
     category: 'wardogs',
-    nameDe: 'WARDOGS Status Bot',
-    nameEn: 'WARDOGS Status Bot',
-    descriptionDe: 'Gehosteter WARDOGS Status Bot für mehrere Gameserver: Spielzeit, globale Spieler- und Kill-Statistiken sowie ein eigener fester Discord-Killfeed pro Server in einer Instanz.',
-    descriptionEn: 'Hosted WARDOGS Status Bot for multiple game servers: playtime, global player and kill statistics, plus one fixed Discord killfeed panel per server in a single instance.',
+    nameDe: 'WARDOGS Stats Bot',
+    nameEn: 'WARDOGS Stats Bot',
+    descriptionDe: 'Gehosteter WARDOGS Stats Bot für mehrere Gameserver: Spielzeit, globale Spieler- und Kill-Statistiken sowie ein eigener fester Discord-Killfeed pro Server in einer Instanz.',
+    descriptionEn: 'Hosted WARDOGS Stats Bot for multiple game servers: playtime, global player and kill statistics, plus one fixed Discord killfeed panel per server in a single instance.',
     featuresDe: ['Mehrere WARDOGS Server pro Bot', 'Sichere Discord↔Game-Verknüpfung per Ingame-Whisper-Code', 'Slash Commands: /stats, /whois, /whoisplayer, /playerstats, /linkgame & /leaderboard', 'Eigener Discord Killfeed pro Server (letzte 15 Kills)', 'Globale Stats: Kills, Tode, K/D, Headshot-Rate ab 50 Kills, Kill-Rekord, Spielzeit, Matches, Siege & Seeding-Zeit', 'Top-15 Leaderboard pro Statistik-Kategorie mit Spielersuche und exakter Platzierung', 'Spielersuche nach Name / Alias / Steam64ID mit Auswahl bei mehreren Treffern', 'Peak-Zeiten nach Tagesstunde', 'Meistgenutzte Clan-Tags', 'Webpanel mit letzten 150 Kills pro Server', 'Config Export / Import', 'Auto-Recovery'],
     featuresEn: ['Multiple WARDOGS servers per bot', 'Secure Discord↔game linking using an in-game whisper code', 'Slash commands: /stats, /whois, /whoisplayer, /playerstats, /linkgame & /leaderboard', 'Dedicated Discord killfeed per server (latest 15 kills)', 'Global stats: kills, deaths, K/D, headshot rate from 50 kills, kill record, playtime, matches, wins & seeding time', 'Top-15 leaderboard per stat category with player search and exact placement', 'Player search by name / alias / Steam64ID with selection for ambiguous matches', 'Peak activity by hour of day', 'Most used clan tags', 'Web panel with the latest 150 kills per server', 'Config export / import', 'Auto recovery'],
     priceLabel: '€1.99 / month',
@@ -204,6 +204,19 @@ function migrate(parsed) {
   parsed.statusNodes = parsed.statusNodes.map((n) => ({ ...n, disabled: Boolean(n.disabled), acceptNewBots: n.acceptNewBots !== false }));
   parsed.supporters = parsed.supporters.map((s) => ({ ...s, id: s.id || crypto.randomUUID(), visible: s.visible !== false, featured: Boolean(s.featured) }));
   parsed.botServices = parsed.botServices.map((x, index) => ({ ...x, id: x.id || crypto.randomUUID(), slug: String(x.slug || x.id || `service-${index + 1}`), visible: x.visible !== false, featured: Boolean(x.featured), status: ['coming_soon','available','paused'].includes(x.status) ? x.status : 'coming_soon', sortOrder: Number.isFinite(Number(x.sortOrder)) ? Number(x.sortOrder) : ((index + 1) * 10), featuresDe: Array.isArray(x.featuresDe) ? x.featuresDe : [], featuresEn: Array.isArray(x.featuresEn) ? x.featuresEn : [], monthlyAmount: String(x.monthlyAmount || ''), currency: /^[A-Z]{3}$/.test(String(x.currency || '').toUpperCase()) ? String(x.currency).toUpperCase() : 'EUR', paypalProductId: String(x.paypalProductId || ''), paypalPlanId: String(x.paypalPlanId || ''), category: String(x.category || 'wardogs').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-') || 'wardogs', paypalPlanMeta: x.paypalPlanMeta && typeof x.paypalPlanMeta === 'object' ? x.paypalPlanMeta : {} }));
+  // Display-only rename of the hosted statistics service. Preserve any custom
+  // administrator labels, service IDs, subscribers and player stats.
+  for (const service of parsed.botServices) {
+    if (service.id !== 'wardogs-playtime-tracker') continue;
+    if (service.nameDe === 'WARDOGS Status Bot') service.nameDe = 'WARDOGS Stats Bot';
+    if (service.nameEn === 'WARDOGS Status Bot') service.nameEn = 'WARDOGS Stats Bot';
+    if (typeof service.descriptionDe === 'string') service.descriptionDe = service.descriptionDe.replace('WARDOGS Status Bot', 'WARDOGS Stats Bot');
+    if (typeof service.descriptionEn === 'string') service.descriptionEn = service.descriptionEn.replace('WARDOGS Status Bot', 'WARDOGS Stats Bot');
+  }
+  for (const bot of parsed.managedBots) {
+    if (bot.serviceId === 'wardogs-playtime-tracker' && /^WARDOGS Status Bot(?: #\d+)?$/.test(String(bot.name || '')))
+      bot.name = bot.name.replace('WARDOGS Status Bot', 'WARDOGS Stats Bot');
+  }
   if (previousVersion < 16) {
     const serviceIndex = parsed.botServices.findIndex((x) => x.id === 'wardogs-warning-bot' || x.slug === 'wardogs-warning-bot');
     const managedService = defaultBotServices()[0];
@@ -963,6 +976,15 @@ export function upsertCustomBot(bot) {
 export function deleteCustomBot(id) { updateDb((db) => { db.customBots = db.customBots.filter((b) => b.id !== id); }); }
 
 export function getManagedBot(id) { return selectDbRows('managedBots', (b) => b.id === id)[0] || null; }
+export function getManagedBotRuntimeConfig(id) {
+  const row = (currentSnapshot().managedBots || []).find((bot) => bot.id === id);
+  if (!row) return null;
+  // No stats tables or recent event buffers are needed to schedule polls or
+  // update the fixed Discord panel. Shallow omit BEFORE structuredClone.
+  const { playtimeStats, killStats, killFeedEvents, ...config } = row;
+  return structuredClone(config);
+}
+
 export function listManagedBotsForUserService(discordId, serviceId) { return selectDbRows('managedBots', (b) => b.ownerDiscordId === discordId && b.serviceId === serviceId).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
 export function listManagedBotsAccessibleToUserService(discordId, serviceId, isAdmin = false) { return selectDbRows('managedBots', (b) => b.serviceId === serviceId && (isAdmin || b.ownerDiscordId === discordId || (Array.isArray(b.sharedPanelUserIds) && b.sharedPanelUserIds.includes(discordId)))).sort((a,b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))); }
 export function getManagedBotForUserService(discordId, serviceId) { return listManagedBotsForUserService(discordId, serviceId)[0] || null; }

@@ -1,0 +1,24 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {pathToFileURL} from 'node:url';
+const originalCwd=process.cwd();
+const oldKey=process.env.APP_ENCRYPTION_KEY;
+const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'wardogs-runtime-perf-'));
+process.chdir(tmp);
+process.env.APP_ENCRYPTION_KEY=crypto.randomBytes(32).toString('base64');
+const db=await import(`${pathToFileURL(path.join(originalCwd,'src/db.js')).href}?runtime-test=${Date.now()}`);
+test.after(()=>{process.chdir(originalCwd);if(oldKey===undefined)delete process.env.APP_ENCRYPTION_KEY;else process.env.APP_ENCRYPTION_KEY=oldKey;fs.rmSync(tmp,{recursive:true,force:true});});
+test('background management config omits heavy history but retains all operational fields',()=>{
+ const id='a-b-c';
+ db.upsertManagedBot({id,serviceId:'wardogs-warning-bot',ownerDiscordId:'123',enabled:true,autoBanEnabled:true,managedServers:[{id:'eu1',baseUrl:'http://example.org',secretEnc:'x'}],playtimeStats:{history:Array.from({length:3000},(_,i)=>({i,name:'Player',seconds:900}))},killStats:{recentEvents:[{kind:'kill'}]}});
+ const a=db.getManagedBotRuntimeConfig(id);
+ assert.equal(a.enabled,true);assert.equal(a.autoBanEnabled,true);assert.equal(a.managedServers.length,1);
+ assert.equal(a.playtimeStats,undefined);assert.equal(a.killStats,undefined);assert.equal(a.killFeedEvents,undefined);
+ a.managedServers[0].baseUrl='broken';
+ assert.equal(db.getManagedBotRuntimeConfig(id).managedServers[0].baseUrl,'http://example.org');
+ assert.equal(db.getManagedBot(id).playtimeStats.history.length,3000);
+});
