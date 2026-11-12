@@ -149,10 +149,10 @@ function buildDockerfile(runtime, entrypoint) {
   const entry = safeEntry(entrypoint, runtime);
   const command = runtime === 'node22' ? ['node', entry] : ['python', entry];
   if (runtime === 'node22') {
-    return `FROM node:22-alpine\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; elif [ -f package.json ]; then npm install --omit=dev --no-audit --no-fund; fi\nRUN chown -R node:node /bot\nUSER node\nCMD ${JSON.stringify(command)}\n`;
+    return `FROM node:22-alpine\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; elif [ -f package.json ]; then npm install --omit=dev --no-audit --no-fund; fi\nRUN mkdir -p /bot/data && chown -R node:node /bot\nUSER node\nCMD ${JSON.stringify(command)}\n`;
   }
   if (runtime === 'python313') {
-    return `FROM python:3.13-slim\nENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt; fi\nRUN useradd -m -u 10001 bot && chown -R bot:bot /bot\nUSER bot\nCMD ${JSON.stringify(command)}\n`;
+    return `FROM python:3.13-slim\nENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt; fi\nRUN useradd -m -u 1000 bot && mkdir -p /bot/data && chown -R bot:bot /bot\nUSER bot\nCMD ${JSON.stringify(command)}\n`;
   }
   throw new Error('Unbekannte Runtime');
 }
@@ -331,9 +331,111 @@ export function listCustomBotFiles(id) {
   return rows.sort((a, b) => a.path.localeCompare(b.path, 'en', { numeric: true, sensitivity: 'base' }));
 }
 
+// Runtime databases do not live in the uploaded source. The runner mirrors
+// /bot/data into runtime-data and other writable /bot files into runtime-root.
+// Never follow symlinks when exposing either tree through the web UI.
+const MAX_BACKUP_FILES = 6000;
+const MAX_BACKUP_BYTES = 160 * 1024 * 1024;
+function storedTree(id, kind) {
+  if (!['runtime-data', 'runtime-export-data', 'runtime-root'].includes(kind)) throw new Error('Ungültiger Speicherbereich');
+  return path.join(botDir(id), kind);
+}
+function walkStoredTree(root, { maxFiles = MAX_BACKUP_FILES, maxBytes = MAX_BACKUP_BYTES } = {}) {
+  if (!fs.existsSync(root)) return [];
+  if (!fs.lstatSync(root).isDirectory() || fs.lstatSync(root).isSymbolicLink()) throw new Error('Unsicherer Datenspeicher');
+  const files = [], stack = [root];
+  let total = 0;
+  while (stack.length) {
+    const dir = stack.pop();
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      // A symlink inside an untrusted bot must never escape the assigned tree.
+      if (e.isSymbolicLink()) throw new Error('Datenordner enthält einen symbolischen Link; Export abgebrochen');
+      const absolute = path.join(dir, e.name);
+      if (e.isDirectory()) { stack.push(absolute); continue; }
+      if (!e.isFile()) continue;
+      const stat = fs.lstatSync(absolute);
+      if (!stat.isFile() || stat.nlink > 1) throw new Error('Unsichere Datei im Datenspeicher');
+      const relative = path.relative(root, absolute).split(path.sep).join('/');
+      const safe = safeRelativePath(relative);
+      files.push({ path: safe, absolute, size: stat.size, modifiedAt: stat.mtime.toISOString() });
+      total += stat.size;
+      if (files.length > maxFiles || total > maxBytes) throw new Error('Bot-Daten zu groß für den Web-Export. Bitte Daten auf dem VPS sichern.');
+    }
+  }
+  return files.sort((a,b) => a.path.localeCompare(b.path, 'en', { numeric: true }));
+}
+export function listCustomBotRuntimeFiles(id, kind = 'runtime-data') {
+  return walkStoredTree(storedTree(id, kind)).map(({ absolute, ...rest }) => rest);
+}
+export function resolveCustomBotRuntimeFile(id, kind, relativePath) {
+  const root = storedTree(id, kind);
+  const rel = safeRelativePath(relativePath);
+  const candidate = path.join(root, ...rel.split('/'));
+  const base = path.resolve(root);
+  if (!path.resolve(candidate).startsWith(base + path.sep)) throw new Error('Ungültiger Dateipfad');
+  let current = base;
+  for (const part of rel.split('/')) {
+    current = path.join(current, part);
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('Symbolische Links sind nicht erlaubt');
+  }
+  const stat = fs.lstatSync(candidate);
+  if (!stat.isFile() || stat.nlink > 1) throw new Error('Nur normale Dateien sind erlaubt');
+  return { absolute: candidate, rel, size: stat.size };
+}
+export function deleteCustomBotSourceFile(id, relativePath, entrypoint, runtime) {
+  const rel = safeRelativePath(relativePath);
+  if (rel === safeEntry(entrypoint, runtime)) throw new Error('Entrypoint darf nicht gelöscht werden. Bitte erst den Entrypoint ändern.');
+  const { absolute, root } = resolveSourcePath(id, rel);
+  let parent = path.dirname(absolute);
+  while (parent !== root) {
+    if (fs.lstatSync(parent).isSymbolicLink()) throw new Error('Unsicherer Ordner');
+    parent = path.dirname(parent);
+  }
+  if (!fs.lstatSync(absolute).isFile() || fs.lstatSync(absolute).isSymbolicLink()) throw new Error('Nur normale Dateien dürfen gelöscht werden');
+  fs.unlinkSync(absolute);
+  let dir = path.dirname(absolute);
+  while (dir !== root && fs.readdirSync(dir).length === 0) { fs.rmdirSync(dir); dir = path.dirname(dir); }
+  const stats = projectStats(id);
+  rebuildSourceZip(id);
+  return stats;
+}
+export function deleteCustomBotRuntimeFile(id, relativePath) {
+  const file = resolveCustomBotRuntimeFile(id, 'runtime-data', relativePath);
+  fs.unlinkSync(file.absolute);
+  const root = storedTree(id, 'runtime-data');
+  let dir = path.dirname(file.absolute);
+  while (dir !== root && fs.readdirSync(dir).length === 0) { fs.rmdirSync(dir); dir = path.dirname(dir); }
+}
+export function createCustomBotBackup(id, label = 'Custom Bot') {
+  // Always generate a fresh archive; the historical source.zip is just the
+  // original upload and cannot contain runtime databases or subsequent edits.
+  const zip = new AdmZip();
+  const files = [
+    ...listCustomBotFiles(id).map((file) => ({ zipPath: 'project/' + file.path, absolute: resolveCustomBotFile(id, file.path).absolute, size: file.size })),
+    ...walkStoredTree(storedTree(id, 'runtime-export-data')).map((file) => ({ zipPath: 'data/' + file.path, ...file })),
+    ...walkStoredTree(storedTree(id, 'runtime-root')).map((file) => ({ zipPath: 'runtime-root/' + file.path, ...file }))
+  ];
+  const bytes = files.reduce((sum, f) => sum + f.size, 0);
+  if (files.length > MAX_BACKUP_FILES || bytes > MAX_BACKUP_BYTES) throw new Error('Bot-Backup überschreitet 160 MB / 6000 Dateien. Bitte eine VPS-Sicherung verwenden.');
+  for (const f of files) zip.addFile(f.zipPath, fs.readFileSync(f.absolute));
+  const manifest = {
+    createdAt: new Date().toISOString(), bot: String(label || 'Custom Bot'),
+    layout: { 'project/': 'Hochgeladener Sourcecode', 'data/': 'Persistente Dateien aus /bot/data', 'runtime-root/': 'Weitere im Container geänderte Dateien relativ zu /bot' },
+    files: files.length, bytes,
+    note: 'Dieses Backup kann API-Keys, Tokens und personenbezogene Daten enthalten. Privat aufbewahren. Container-Daten außerhalb /bot werden nicht erfasst.'
+  };
+  zip.addFile('BACKUP-INFO.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+  return zip.toBuffer();
+}
+
 export function resolveCustomBotFile(id, relativePath) {
   const resolved = resolveSourcePath(id, relativePath);
   if (!fs.existsSync(resolved.absolute)) throw new Error('Datei wurde nicht gefunden');
+  let ancestor = path.dirname(resolved.absolute);
+  while (ancestor !== resolved.root) {
+    if (fs.lstatSync(ancestor).isSymbolicLink()) throw new Error('Unsicherer Ordner');
+    ancestor = path.dirname(ancestor);
+  }
   const stat = fs.lstatSync(resolved.absolute);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Datei wurde nicht gefunden');
   return { ...resolved, size: stat.size, modifiedAt: stat.mtime.toISOString() };

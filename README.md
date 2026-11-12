@@ -1,3 +1,13 @@
+
+## v3.12.62 – Custom Bots: vollständiger Source-/Datenexport und einzelne Dateien löschen
+
+- **Bot Services → Custom Bots → Dateien:** Projektdateien sind einzeln herunterladbar und löschbar; der Einstiegspunkt (`entrypoint`) ist vor versehentlichem Löschen geschützt. Für Nicht-Admins erfordern Source-Änderungen weiterhin eine neue Admin-Freigabe; bei der Freigabe wird der neue Code tatsächlich neu gebaut.
+- **Source + Daten sichern (ZIP)** erzeugt bei jedem Download ein frisches Backup (nicht das ursprüngliche `source.zip`): `project/` enthält die Quelldateien, `data/` die tatsächlich angelegten Datenbank- und Datendateien aus `/bot/data`, `runtime-root/` weitere erkannte geänderte DB-/Zustandsdateien unter `/bot`, `BACKUP-INFO.json` beschreibt den Inhalt. Das Archiv kann Zugangsdaten enthalten und darf nicht öffentlich geteilt werden.
+- **Persistenter Datenordner:** Neubauten erhalten `/bot/data`, gespiegelt auf `custom-bots/<Bot-ID>/runtime-data/` auf der VPS. Vor dem ersten Neu-Bauen eines älteren Bots werden die alten `/bot/data`-Dateien und erkannte root-level Datenbanken aus dem vorhandenen Docker-Container übernommen. Daten aus **bereits früher gelöschten** Containern lassen sich nicht wiederherstellen.
+- **Einzelne Laufzeitdateien** können nach dem Stoppen des Bots über die Datei-Ansicht heruntergeladen oder gelöscht werden (der Bot selbst und andere Dateien bleiben erhalten). Bei älteren noch nicht umgestellten Containern zuerst ein vollständiges Backup herunterladen und danach einmal bewusst „Start/Neu bauen“ ausführen.
+- **Grenzen:** Export maximal 160 MB unkomprimiert / 6000 Dateien. Automatische Erkennung berücksichtigt `/bot/data` sowie übliche geänderte Datenbanken und Zustandsdateien unter `/bot`, nicht beliebige externe Pfade, andere Docker-Volumes oder bereits verschwundene Dateien. `node_modules`, Caches und Laufzeit-Abhängigkeiten werden wie bisher nicht als Source exportiert.
+- **SQLite:** Für eine besonders zuverlässige Sicherung den Bot vor dem ZIP-Export stoppen; während eines Live-Exports pausiert der Runner den Container kurz. Kein erneuter Upload von Datenbanken in einen laufenden Bot.
+
 ## Update v3.12.58 – gemeinsame Bans & `/stats`
 
 - **Management Bot / mehrere Gameserver:** Permanente und normale temporäre Bans/Unbans aus einem ausgewählten Server gelten nun für **alle Server derselben Management-Bot-Instanz** (auch für Discord-Aktionen). Andere Management-Bots sind **nicht** automatisch verbunden; dafür existiert weiterhin die separate Ban-Sync-Community.
@@ -591,7 +601,7 @@ A single Management Bot can manage up to 12 WARDOGS servers. Each server has sep
 Die Management-Ansicht aktualisiert sich separat im laufenden Panel. Die BOT-Gesundheitsübersicht zeigt ausschließlich eigene Bots. Die Banliste unterstützt mehrere WARDOGS-Antwortformate und unterscheidet Abruffehler von einer leeren Liste. Bei WARDOGS Season 2 ist der Killfeed am Gamehost in der `ServerSettings.ini` zu konfigurieren; die notwendige, geschützte Konfigurationsvorlage wird nach „Server Feed konfigurieren“ im Panel angeboten. Einzelheiten siehe `UPDATE-v3.12.57.md`.
 
 
-### v3.12.59 — Discord management panel reliability
+### v3.12.61 — Discord management panel reliability
 
 - Discord management panels publish after login independently of WARDOGS player/API polling, with separate 30-second refresh.
 - Existing management panel messages are preserved across bot restarts and reused.

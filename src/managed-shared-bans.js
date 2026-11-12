@@ -18,6 +18,9 @@ export function sharedServerBanRows(bot) {
   }
   return [...result.values()].slice(-5000);
 }
+export function hasPermanentManagedBan(bot, steamId) {
+  return sharedServerBanRows(bot).some(row => row.steamId === String(steamId) && row.mode === 'permanent');
+}
 export function mergeSharedServerBans(bot, entries) {
   const merged = new Map(sharedServerBanRows(bot).map(row => [row.steamId, row]));
   for (const entry of entries || []) {
@@ -41,17 +44,17 @@ export function removeSharedServerBan(bot, steamId) {
 export function combinedManagedBanList(liveBans, bot) {
   const merged = new Map();
   for (const row of sharedServerBanRows(bot)) merged.set(row.steamId, {
-    steamId: row.steamId, reason: row.reason, bannedBy: 'Management Bot · alle Server',
-    bannedAtUtc: row.createdAt, expiresAtUtc: row.expiresAt || '', shared: true
+    steamId: row.steamId, reason: row.reason, bannedBy: 'Management Bot',
+    bannedAtUtc: row.createdAt, expiresAtUtc: row.expiresAt || '', sharedMode: row.mode, shared: true, pending: true
   });
   for (const row of Array.isArray(liveBans) ? liveBans : []) {
     if (!validId(row?.steamId)) continue;
     const current = merged.get(String(row.steamId));
-    merged.set(String(row.steamId), { ...row, shared: Boolean(current),
+    merged.set(String(row.steamId), { ...row, shared: Boolean(current), sharedMode: current?.sharedMode || null, pending: false,
       reason: row.reason || current?.reason || '',
       bannedAtUtc: row.bannedAtUtc || current?.bannedAtUtc || '',
       bannedBy: row.bannedBy || current?.bannedBy || '',
-      expiresAtUtc: current?.expiresAtUtc || row.expiresAtUtc || ''
+      expiresAtUtc: current?.sharedMode === 'permanent' ? '' : (current?.expiresAtUtc || row.expiresAtUtc || '')
     });
   }
   return [...merged.values()].sort((a,b)=>a.steamId.localeCompare(b.steamId));

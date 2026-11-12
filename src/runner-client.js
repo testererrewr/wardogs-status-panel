@@ -26,3 +26,8 @@ export function customBotStatus(bot) { return call('/status', { id: bot.id }, 70
 export function customBotLogs(bot) { const env = envFor(bot); return call('/logs', { id: bot.id, redact: Object.values(env).map(String).filter((x) => x.length >= 6).slice(0, 50) }, 15000); }
 
 export function customBotStatuses(bots) { return call('/statuses', { ids: bots.map((bot) => bot.id) }, 6500); }
+
+// Only the authenticated control plane can ask the runner to read container data.
+export function customBotSnapshot(bot) { return call('/snapshot', { id: bot.id }, 60000); }
+export function customBotRuntimeStopped(bot) { return call('/runtime-stopped', { id: bot.id }, 10000); }
+export function customBotDeleteData(bot, file) { return call('/delete-data-file', { id: bot.id, path: file }, 15000); }

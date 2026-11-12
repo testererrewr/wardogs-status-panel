@@ -1,4 +1,4 @@
-import { normalizeFactionKey, normalizeSteamId64, playerFaction, playerHasPlayableFaction, playerSteamId } from './wardogs-players.js';
+import { normalizeFactionKey, normalizeSteamId64, playerFaction, playerHasPlayableFaction, playerHasFaction, playerSteamId } from './wardogs-players.js';
 
 export function renderManagedWelcomeMessage(template, player) {
   const steamId = playerSteamId(player);
@@ -149,6 +149,7 @@ export function managedJoinCandidates(tracker, players, missingThreshold = 3, op
 
 function ensureWelcomeState(state) {
   if (!(state.welcomePending instanceof Set)) state.welcomePending = new Set();
+  if (!(state.welcomeJoinedAt instanceof Map)) state.welcomeJoinedAt = new Map();
   if (!(state.welcomeDelivered instanceof Set)) state.welcomeDelivered = new Set();
   if (!(state.welcomeFailed instanceof Set)) state.welcomeFailed = new Set();
   if (!(state.welcomeAttempts instanceof Map)) state.welcomeAttempts = new Map();
@@ -162,6 +163,7 @@ function ensureWelcomeState(state) {
 
 function clearWelcomeSessionState(state, id) {
   state.welcomePending?.delete?.(id);
+  state.welcomeJoinedAt?.delete?.(id);
   state.welcomeDelivered?.delete?.(id);
   state.welcomeFailed?.delete?.(id);
   state.welcomeAttempts?.delete?.(id);
@@ -186,6 +188,8 @@ export function managedWelcomeTargets(state, players, joinedPlayers, {
   spawnSettleMs = 5_000,
   teamStablePolls = 2,
   maxAttempts = 24,
+  initialFactionGraceMs = 20_000,
+  unknownCatalogGraceMs = 30_000,
   validFactions = [],
   nowMs = Date.now()
 } = {}) {
@@ -196,6 +200,7 @@ export function managedWelcomeTargets(state, players, joinedPlayers, {
   // Only clear a session after the join tracker has confirmed the player absent.
   const knownIds = new Set([
     ...state.welcomePending, ...state.welcomeDelivered, ...state.welcomeFailed,
+    ...state.welcomeJoinedAt.keys(),
     ...state.welcomeAttempts.keys(), ...state.welcomeReadyAt.keys(),
     ...state.welcomeInitialFactionKey.keys(), ...state.welcomeSawPreTeam,
     ...state.welcomeTeamChoiceConfirmed, ...state.welcomeFactionStableKey.keys(),
@@ -208,6 +213,7 @@ export function managedWelcomeTargets(state, players, joinedPlayers, {
     if (!steamId) continue;
     clearWelcomeSessionState(state, steamId);
     state.welcomePending.add(steamId);
+    state.welcomeJoinedAt.set(steamId, Number(nowMs));
     const initialKey = normalizeFactionKey(playerFaction(player));
     state.welcomeInitialFactionKey.set(steamId, initialKey);
     if (!playerHasPlayableFaction(player, validFactions)) state.welcomeSawPreTeam.add(steamId);
@@ -221,7 +227,9 @@ export function managedWelcomeTargets(state, players, joinedPlayers, {
     const player = bySteamId.get(steamId);
     if (!player || state.welcomeDelivered.has(steamId) || state.welcomeFailed.has(steamId)) continue;
 
-    const playable = playerHasPlayableFaction(player, validFactions);
+    const sinceJoin = Number(nowMs) - Number(state.welcomeJoinedAt.get(steamId) ?? nowMs);
+    const playable = playerHasPlayableFaction(player, validFactions) ||
+      (!validFactions.length && sinceJoin >= unknownCatalogGraceMs && playerHasFaction(player));
     const currentKey = normalizeFactionKey(playerFaction(player));
     if (!playable) {
       // Seeing the player in the menu is the strongest signal that a later valid
@@ -238,9 +246,10 @@ export function managedWelcomeTargets(state, players, joinedPlayers, {
       const initialKey = String(state.welcomeInitialFactionKey.get(steamId) || '');
       const sawPreTeam = state.welcomeSawPreTeam.has(steamId);
       const changedAfterJoin = Boolean(initialKey && currentKey && initialKey !== currentKey);
-      if (!sawPreTeam && !changedAfterJoin) {
-        // Do NOT treat a faction that was already present in the join snapshot as
-        // proof of team selection. This was the cause of premature welcomes.
+      if (!sawPreTeam && !changedAfterJoin && sinceJoin <
+        (validFactions.length ? initialFactionGraceMs : unknownCatalogGraceMs)) {
+        // WARDOGS can first expose a player only after the faction was chosen.
+        // After a cautious grace period, stable playable faction is sufficient.
         continue;
       }
       state.welcomeTeamChoiceConfirmed.add(steamId);
@@ -277,6 +286,7 @@ export function managedWelcomeSucceeded(state, steamId) {
   if (!id) return;
   ensureWelcomeState(state);
   state.welcomePending.delete(id);
+  state.welcomeJoinedAt.delete(id);
   state.welcomeAttempts.delete(id);
   state.welcomeReadyAt.delete(id);
   state.welcomeInitialFactionKey.delete(id);
@@ -296,6 +306,7 @@ export function managedWelcomeFailed(state, steamId, { retryable = true, maxAtte
   const retry = Boolean(retryable) && attempts < Number(maxAttempts || 24);
   if (!retry) {
     state.welcomePending.delete(id);
+    state.welcomeJoinedAt.delete(id);
     state.welcomeReadyAt.delete(id);
     state.welcomeInitialFactionKey.delete(id);
     state.welcomeSawPreTeam.delete(id);

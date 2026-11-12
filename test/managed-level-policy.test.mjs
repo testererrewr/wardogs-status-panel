@@ -40,6 +40,14 @@ test('ini patch creates section if missing, validates level',()=>{
   const result=patchMaxPlayerLevel('[Other]\nFoo=bar\n',30);
   assert.match(result,/\[\/Script\/WDGame\.WDGameSession\]/);
   assert.equal(configMaxPlayerLevel(result),30);
-  assert.throws(()=>patchMaxPlayerLevel(result,601));
+  assert.equal(configMaxPlayerLevel(patchMaxPlayerLevel(result,900)),900);
+  assert.throws(()=>patchMaxPlayerLevel(result,901));
   assert.throws(()=>patchMaxPlayerLevel(result,-1));
+});
+
+test('level-limit release prefers 900 and retains documented 600 fallback, never zero', async () => {
+  const {UNLIMITED_LEVEL_CANDIDATES}=await import('../src/managed-level-policy.js');
+  assert.deepEqual([...UNLIMITED_LEVEL_CANDIDATES],[900,600]);
+  assert.equal(configMaxPlayerLevel(patchMaxPlayerLevel('[/Script/WDGame.WDGameSession]\nServerMaxPlayerLevel=30',900)),900);
+  assert.equal(configMaxPlayerLevel(patchMaxPlayerLevel('[/Script/WDGame.WDGameSession]\nServerMaxPlayerLevel=30',600)),600);
 });

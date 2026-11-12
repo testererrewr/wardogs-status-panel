@@ -27,17 +27,23 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function auth(req, res, next) { if (!shared || !safeEqual(req.get('X-Runner-Secret'), shared)) return res.status(403).json({ error: 'forbidden' }); next(); }
 app.use(auth);
 
-function run(cmd, args, { timeout = 120000, allowFailure = false, env = process.env, cwd = undefined } = {}) {
+function run(cmd, args, { timeout = 120000, allowFailure = false, env = process.env, cwd = undefined, maxOutput = 120000, requireFullOutput = false } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
-    const add = (target, chunk) => (target + chunk.toString()).slice(-120000);
+    let truncated = false;
+    const add = (target, chunk) => {
+      const next = target + chunk.toString();
+      if (next.length > maxOutput) truncated = true;
+      return next.slice(-maxOutput);
+    };
     p.stdout.on('data', (c) => { out = add(out, c); });
     p.stderr.on('data', (c) => { err = add(err, c); });
     const timer = setTimeout(() => { p.kill('SIGKILL'); reject(new Error(`${cmd} Timeout`)); }, timeout);
     p.on('error', (e) => { clearTimeout(timer); reject(e); });
     p.on('close', (code) => {
       clearTimeout(timer);
+      if (requireFullOutput && truncated) return reject(new Error('Zu viele Laufzeit-Dateiänderungen für eine vollständige Sicherung'));
       if (code === 0 || allowFailure) resolve({ code, out, err });
       else reject(new Error((err || out || `${cmd} exit ${code}`).slice(-4000)));
     });
@@ -99,60 +105,278 @@ async function build(id, image) {
   }
   await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
 }
+// Custom Bot runtime state MUST survive rebuilds. The main panel and runner
+// share the same /workspace bind mount; resolve its actual HOST source from
+// this runner container before asking the Docker daemon to mount it.
+let hostWorkspaceCache = '';
+async function hostWorkspace() {
+  if (hostWorkspaceCache) return hostWorkspaceCache;
+  const explicit = String(process.env.CUSTOM_BOTS_HOST_PATH || '').trim();
+  const result = explicit || (await run('docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}', process.env.HOSTNAME || ''], { timeout: 12000 })).out.trim();
+  if (!path.isAbsolute(result)) throw new Error('Custom-Bot-Datenspeicher: Host-Pfad des Runner-Mounts nicht gefunden');
+  hostWorkspaceCache = path.resolve(result);
+  return hostWorkspaceCache;
+}
+async function containerHasDataMount(container) {
+  const r = await run('docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/bot/data"}}yes{{end}}{{end}}', container], { allowFailure: true, timeout: 15000 });
+  return r.code === 0 && r.out.trim() === 'yes';
+}
+const RUNTIME_MAX_FILES = 6000;
+const RUNTIME_MAX_BYTES = 160 * 1024 * 1024;
+function collectFiles(src) {
+  if (!fs.existsSync(src)) return [];
+  if (!fs.lstatSync(src).isDirectory()) throw new Error('Runtime-Datenordner ist ungültig');
+  const out = [], stack = [src]; let bytes = 0;
+  while (stack.length) {
+    const dir = stack.pop();
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      const absolute = path.join(dir, item.name);
+      if (item.isSymbolicLink()) throw new Error('Runtime-Daten enthalten einen unsicheren symbolischen Link');
+      if (item.isDirectory()) { stack.push(absolute); continue; }
+      if (!item.isFile()) continue;
+      const stat = fs.lstatSync(absolute);
+      if (stat.nlink !== 1) throw new Error('Runtime-Daten enthalten einen unsicheren Hardlink');
+      bytes += stat.size;
+      out.push(path.relative(src, absolute));
+      if (out.length > RUNTIME_MAX_FILES || bytes > RUNTIME_MAX_BYTES) throw new Error('Runtime-Daten überschreiten 160 MB / 6000 Dateien – zuerst extern sichern');
+    }
+  }
+  return out;
+}
+function copyTree(src, dest) {
+  fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
+  for (const file of collectFiles(src)) {
+    const target = path.join(dest, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(path.join(src, file), target);
+    fs.chmodSync(target, 0o600);
+  }
+}
+function replaceTree(dest, fresh) {
+  const old = dest + '.old';
+  fs.rmSync(old, { recursive: true, force: true });
+  if (fs.existsSync(dest)) fs.renameSync(dest, old);
+  fs.renameSync(fresh, dest);
+  fs.rmSync(old, { recursive: true, force: true });
+}
+function writableRuntimeName(p) {
+  const relative = p.startsWith('/bot/') ? p.slice(5) : '';
+  if (!relative || relative.startsWith('data/') || relative === 'data') return '';
+  const parts = relative.split('/');
+  if (parts.some((x) => !x || x === '.' || x === '..' || /[\x00-\x1f\x7f]/.test(x))) return '';
+  if (parts.some((x) => ['node_modules','.git','.venv','venv','__pycache__'].includes(x))) return '';
+  // Other bot-created state (including root-level .db/.sqlite/.json) is kept;
+  // changed directories are excluded by the explicit extension check below.
+  const name = parts.at(-1);
+  if (!/\.(?:db|sqlite|sqlite3|db-wal|db-shm|sqlite-wal|sqlite-shm|json|jsonl|yml|yaml|toml|csv|txt|log|bin|dat|pkl|pickle|parquet)$/i.test(name) && !/\.(?:db|sqlite|sqlite3)-(?:wal|shm|journal)$/i.test(name)) return '';
+  return relative;
+}
+async function captureWritableRoot(container, id) {
+  const base = path.join(root, id);
+  const staged = path.join(base, '.runtime-root-next');
+  fs.rmSync(staged, { recursive: true, force: true });
+  fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
+  const result = await run('docker', ['diff', container], { timeout: 20000, maxOutput: 2_000_000, requireFullOutput: true });
+  const candidates = [...new Set(result.out.split(/\r?\n/).map((line) => writableRuntimeName(line.slice(2).trim())).filter(Boolean))];
+  if (candidates.length > RUNTIME_MAX_FILES) throw new Error('Zu viele geänderte Laufzeitdateien für die Sicherung');
+  for (const rel of candidates) {
+    const out = path.join(staged, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+    const copied = await run('docker', ['cp', `${container}:/bot/${rel}`, out], { timeout: 20000, allowFailure: true });
+    if (copied.code !== 0) continue; // file may have disappeared while capturing
+    if (!fs.lstatSync(out).isFile() || fs.lstatSync(out).isSymbolicLink()) throw new Error('Unsichere Laufzeitdatei entdeckt');
+  }
+  collectFiles(staged);
+  replaceTree(path.join(base, 'runtime-root'), staged);
+}
+async function captureRuntime(id, { forBackup = false } = {}) {
+  const { container } = names(id), base = path.join(root, id);
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const data = path.join(base, 'runtime-data');
+  let running = false;
+  if (await existsContainer(container)) {
+    running = await isRunning(container);
+    if (running) await run('docker', ['pause', container], { timeout: 20000 });
+    try {
+      if (!(await containerHasDataMount(container))) {
+        const staging = path.join(base, '.runtime-data-next');
+        fs.rmSync(staging, { recursive: true, force: true });
+        fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
+        const copied = await run('docker', ['cp', `${container}:/bot/data/.`, staging], { allowFailure: true, timeout: 25000 });
+        if (copied.code !== 0 && !/no such file|could not find/i.test(copied.err)) throw new Error(`Container-Daten konnten nicht gelesen werden: ${copied.err.slice(0, 150)}`);
+        collectFiles(staging);
+        if (copied.code === 0) replaceTree(data, staging);
+        else { fs.rmSync(staging, { recursive: true, force: true }); }
+      }
+      await captureWritableRoot(container, id);
+      if (!fs.existsSync(data)) copyTree(path.join(base, 'src', 'data'), data);
+      if (forBackup) {
+        const staged = path.join(base, '.runtime-export-next');
+        fs.rmSync(staged, { recursive: true, force: true });
+        copyTree(data, staged);
+        replaceTree(path.join(base, 'runtime-export-data'), staged);
+      }
+    } finally {
+      if (running) await run('docker', ['unpause', container], { allowFailure: true, timeout: 20000 });
+    }
+  }
+  // Source contains any initial data/ files. Seed only if the bot never wrote
+  // its own runtime data (and a previous container could not be migrated).
+  if (!fs.existsSync(data)) copyTree(path.join(base, 'src', 'data'), data);
+  collectFiles(data);
+  if (forBackup && !(await existsContainer(container))) {
+    const staged = path.join(base, '.runtime-export-next');
+    fs.rmSync(staged, { recursive: true, force: true });
+    copyTree(data, staged);
+    replaceTree(path.join(base, 'runtime-export-data'), staged);
+  }
+  return { running, files: collectFiles(data).length };
+}
+// A snapshot, rebuild and delete for one bot must not overlap: all three
+// touch the same SQLite files and staging directories.
+const botLocks = new Map();
+async function withBotLock(id, action) {
+  const previous = botLocks.get(id) || Promise.resolve();
+  let release;
+  const mine = new Promise((resolve) => { release = resolve; });
+  botLocks.set(id, mine);
+  await previous;
+  try { return await action(); }
+  finally { release(); if (botLocks.get(id) === mine) botLocks.delete(id); }
+}
 async function startFresh(id, envObj) {
   const { container, image, network } = names(id);
-  await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 });
+  // Build first while the previous bot continues running. Stop it only for
+  // the final, consistent SQLite snapshot (including WAL/SHM) before removal.
+  const hostSource = path.join(await hostWorkspace(), id, 'runtime-data');
   await ensureNetwork(network, id);
   await build(id, image);
-  const args = ['run', '-d', '--name', container, '--restart', 'unless-stopped',
+  const hadContainer = await existsContainer(container);
+  const wasRunning = hadContainer && await isRunning(container);
+  if (wasRunning) await run('docker', ['stop', '-t', '10', container], { timeout: 25000 });
+  try { await captureRuntime(id); }
+  catch (error) {
+    if (wasRunning) await run('docker', ['start', container], { allowFailure: true, timeout: 20000 });
+    throw error;
+  }
+  const localData = path.join(root, id, 'runtime-data');
+  fs.mkdirSync(localData, { recursive: true, mode: 0o700 });
+  await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 });
+  const args = ['create', '--name', container, '--restart', 'unless-stopped',
     '--memory', '256m', '--cpus', '0.50', '--pids-limit', '100',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--network', network,
+    '--mount', `type=bind,src=${hostSource},dst=/bot/data`,
     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2', '--label', `server-status-hub.custom=${id}`];
   for (const [k, v] of Object.entries(validateEnv(envObj))) args.push('-e', `${k}=${v}`);
   args.push(image);
-  const r = await run('docker', args, { timeout: 30000 });
-  // A custom bot is expected to be a long-running process. Give it a brief
-  // startup window so an immediate crash is surfaced instead of being reported
-  // as a successful start. Docker still keeps the normal unless-stopped policy.
+  await run('docker', args, { timeout: 30000 });
+  // Restore older root-level databases before the bot's process starts.
+  const restored = path.join(root, id, 'runtime-root');
+  if (fs.existsSync(restored) && collectFiles(restored).length) {
+    await run('docker', ['cp', '-a', `${restored}/.`, `${container}:/bot/`], { timeout: 30000 });
+  }
+  await run('docker', ['start', container], { timeout: 20000 });
   await sleep(1200);
   if (!(await isRunning(container))) {
     const logs = await recentLogs(container);
     throw new Error(`custom bot exited directly after start${logs ? `: ${logs}` : ''}`);
   }
-  return r.out.trim();
+  return container;
 }
 
 app.post('/ensure', async (req, res) => {
   try {
     const id = req.body.id; if (!validId(id)) throw new Error('invalid id');
-    const { container, network } = names(id);
-    if (await existsContainer(container)) {
-      const wrongNetwork = !(await containerUsesNetwork(container, network));
-      const legacyReadOnly = await containerIsReadOnly(container);
-      if (wrongNetwork || legacyReadOnly) {
-        await startFresh(id, req.body.env || {});
-        return res.json({ ok: true, running: true, reused: false, migratedNetwork: wrongNetwork, migratedRuntime: legacyReadOnly });
+    const result = await withBotLock(id, async () => {
+      const { container, network } = names(id);
+      if (await existsContainer(container)) {
+        const wrongNetwork = !(await containerUsesNetwork(container, network));
+        const legacyReadOnly = await containerIsReadOnly(container);
+        if (wrongNetwork || legacyReadOnly) {
+          await startFresh(id, req.body.env || {});
+          return { ok: true, running: true, reused: false, migratedNetwork: wrongNetwork, migratedRuntime: legacyReadOnly };
+        }
+        if (!(await isRunning(container))) await run('docker', ['start', container], { timeout: 20000 });
+        return { ok: true, running: true, reused: true };
       }
-      if (!(await isRunning(container))) await run('docker', ['start', container], { timeout: 20000 });
-      return res.json({ ok: true, running: true, reused: true });
-    }
-    await startFresh(id, req.body.env || {});
-    res.json({ ok: true, running: true, reused: false });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+      await startFresh(id, req.body.env || {});
+      return { ok: true, running: true, reused: false };
+    });
+    res.json(result);
+  } catch(e) { res.status(400).json({ error: e.message }); }
 });
-
 app.post('/restart', async (req, res) => {
-  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); await startFresh(id, req.body.env || {}); res.json({ ok: true }); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    await withBotLock(id, () => startFresh(id, req.body.env || {}));
+    res.json({ok:true});
+  } catch(e) { res.status(400).json({error:e.message}); }
+});
+app.post('/snapshot', async (req, res) => {
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    const result = await withBotLock(id, () => captureRuntime(id, { forBackup: true }));
+    res.json({ok:true,...result});
+  } catch(e) { res.status(400).json({error:e.message}); }
+});
+app.post('/runtime-stopped', async (req, res) => {
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    const result=await withBotLock(id, async ()=>{
+      const {container}=names(id), exists=await existsContainer(names(id).container);
+      return {ok:true, stopped:!exists || !(await isRunning(container)), persistent:!exists || await containerHasDataMount(container)};
+    });
+    res.json(result);
+  } catch(e) {res.status(400).json({error:e.message});}
+});
+app.post('/delete-data-file', async (req, res) => {
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    const filename=String(req.body.path||'').replace(/\\/g,'/');
+    const parts=filename.split('/');
+    if (!filename || parts.some((x)=>!x || x==='.' || x==='..' || /[\x00-\x1f\x7f]/.test(x))) throw new Error('Ungültiger Dateipfad');
+    const result=await withBotLock(id, async()=>{
+      const {container}=names(id);
+      if(await existsContainer(container)) {
+        if(await isRunning(container)) throw new Error('Bot zuerst stoppen, bevor Datenbankdateien gelöscht werden.');
+        if(!(await containerHasDataMount(container))) throw new Error('Bestehenden Bot zuerst über Start/Neu bauen auf persistenten Speicher umstellen.');
+      }
+      const base=path.resolve(root,id,'runtime-data');
+      let current=base;
+      for(const part of parts) {
+        current=path.join(current,part);
+        if(fs.lstatSync(current).isSymbolicLink()) throw new Error('Symbolische Links sind nicht erlaubt');
+      }
+      if(!current.startsWith(base+path.sep)) throw new Error('Ungültiger Dateipfad');
+      const stat=fs.lstatSync(current);
+      if(!stat.isFile() || stat.nlink>1) throw new Error('Nur normale Dateien dürfen gelöscht werden');
+      fs.unlinkSync(current);
+      let dir=path.dirname(current);
+      while(dir!==base && fs.readdirSync(dir).length===0){fs.rmdirSync(dir);dir=path.dirname(dir);}
+      return {ok:true};
+    });
+    res.json(result);
+  } catch(e) {res.status(400).json({error:e.message});}
 });
 app.post('/stop', async (req, res) => {
-  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container } = names(id); await run('docker', ['stop', '-t', '10', container], { allowFailure: true, timeout: 20000 }); res.json({ ok: true }); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    await withBotLock(id, async ()=>{ const {container}=names(id); await run('docker',['stop','-t','10',container],{allowFailure:true,timeout:20000}); });
+    res.json({ok:true});
+  } catch(e) {res.status(400).json({error:e.message});}
 });
-app.post('/delete', async (req, res) => {
-  try { const id = req.body.id; if (!validId(id)) throw new Error('invalid id'); const { container, image, network } = names(id); await run('docker', ['rm', '-f', container], { allowFailure: true, timeout: 20000 }); await run('docker', ['image', 'rm', '-f', image], { allowFailure: true, timeout: 30000 }); await run('docker', ['network', 'rm', network], { allowFailure: true, timeout: 20000 }); res.json({ ok: true }); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+app.post('/delete', async (req,res) => {
+  try {
+    const id=req.body.id; if(!validId(id)) throw new Error('invalid id');
+    await withBotLock(id, async ()=>{
+      const {container,image,network}=names(id);
+      await run('docker',['rm','-f',container],{allowFailure:true,timeout:20000});
+      await run('docker',['image','rm','-f',image],{allowFailure:true,timeout:30000});
+      await run('docker',['network','rm',network],{allowFailure:true,timeout:20000});
+    });
+    res.json({ok:true});
+  } catch(e) {res.status(400).json({error:e.message});}
 });
 // Query all custom containers with one Docker invocation instead of 2 calls per bot.
 // The caller still enforces ownership; runner validates identifiers and exposes

@@ -496,8 +496,8 @@ export async function configureWardogsKillFeed(bot, publicUrl = process.env.PUBL
   let token=decryptMaybe(bot.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
   const mode=await feedSetupMode(path=>wardogsJson(bot,path));
   if(mode==='manual'){
-    const fresh=upsertManagedBot({id:bot.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true});
-    return {bot:fresh,origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+    const fresh=upsertManagedBot({id:bot.id,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:false});
+    return {bot:fresh,origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:false};
   }
   const {data:config}=await wardogsJson(bot,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
@@ -519,9 +519,9 @@ export async function configureWardogsPlaytimeKillFeed(bot, serverId, publicUrl 
   let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
   const mode=await feedSetupMode(path=>playtimeWardogsJson(bot,server,path));
   if(mode==='manual'){
-    const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true}:row);
+    const next=servers.map((row,i)=>i===index?{...row,killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:false}:row);
     const fresh=upsertManagedBot({id:bot.id,playtimeServers:next});
-    return {bot:fresh,server:next[index],origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+    return {bot:fresh,server:next[index],origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:false};
   }
   const {data:config}=await playtimeWardogsJson(bot,server,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();
@@ -543,9 +543,9 @@ export async function configureWardogsManagementFeed(bot, serverId, publicUrl = 
   let token=decryptMaybe(server.killFeedTokenEnc);if(!token)token=crypto.randomBytes(32).toString('base64url');
   const mode=await feedSetupMode(path=>wardogsJson(ctx,path));
   if(mode==='manual'){
-    const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:true});
+    const next=managedServerPatch(bot,server.id,{killFeedTokenEnc:encryptSecret(token),killFeedConfiguredAt:nowIso(),killFeedPublicUrl:origin,killFeedSetupMode:'manual',killFeedNeedsGameRestart:false});
     const fresh=upsertManagedBot({id:bot.id,managedServers:next});
-    return {bot:fresh,server:next.find(row=>row.id===server.id),origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:true};
+    return {bot:fresh,server:next.find(row=>row.id===server.id),origin,manualRequired:true,feedUrl:seasonTwoFeedEndpoint(origin),needsGameRestart:false};
   }
   const {data:config}=await wardogsJson(ctx,'/v1/config');if(typeof config?.text!=='string')throw new Error('WARDOGS config document is unavailable');
   const patched=patchServerFeedConfig(config.text,origin,token);const revision=String(config?.revision||'').trim();

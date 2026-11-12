@@ -19,10 +19,10 @@ import { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, 
 import { desiredDynamicServerName } from './managed-dynamic-name.js';
 import { normalizeManagedServers, managedServerContext, managedServerContexts, managedServerByChannel, managedServerPatch } from './managed-servers.js';
 import { appendManagedChat } from './managed-chat.js';
-import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel } from './managed-level-policy.js';
+import { levelCapDecision, patchMaxPlayerLevel, configMaxPlayerLevel, UNLIMITED_LEVEL_CANDIDATES } from './managed-level-policy.js';
 import { normalizeManagedBans } from './managed-ban-list.js';
 import { discordPanelMessageMissing } from './managed-panel-recovery.js';
-import { sharedServerBanRows, mergeSharedServerBans, removeSharedServerBan, combinedManagedBanList, sharedBanActionTargets } from './managed-shared-bans.js';
+import { sharedServerBanRows, hasPermanentManagedBan, mergeSharedServerBans, removeSharedServerBan, combinedManagedBanList, sharedBanActionTargets } from './managed-shared-bans.js';
 export { normalizeSteamId64 } from './wardogs-players.js';
 export { createManagedJoinTracker, managedJoinCandidates, managedMatchBoundary, markManagedJoinBoundary, managedWelcomeFailed, managedWelcomeSucceeded, managedWelcomeTargets, renderManagedWelcomeMessage } from './managed-welcome.js';
 import { getManagedBot, upsertManagedBot, getBanSyncServer, listBanSyncServers, upsertBanSyncServer, deleteBanSyncServer } from './db.js';
@@ -205,7 +205,7 @@ function persistManagedServerState(bot, patch) {
   return upsertManagedBot({ id: fresh.id, managedServers: managedServerPatch(fresh, bot._managedServerId, patch) });
 }
 function serverStateTemplate(bot) {
-  return { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, dynamicPollInFlight: false, dynamicNameRotationStartedAt: Date.now(), dynamicNameBlockedUntil: 0, dynamicNameLastAppliedName: '', dynamicNameLastAppliedAtMs: 0, dynamicJoinTracker: createManagedJoinTracker(), dynamicTimer: null, welcomePending: new Set(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInitialFactionKey: new Map(), welcomeSawPreTeam: new Set(), welcomeTeamChoiceConfirmed: new Set(), welcomeFactionStableKey: new Map(), welcomeFactionStablePolls: new Map(), welcomeValidFactions: [], welcomeMatchSnapshot: null, welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot?.controlPanelMessageId || ''), panelChannelId: String(bot?.controlPanelMessageChannelId || '') };
+  return { joinTracker: createManagedJoinTracker(), baselineReady: false, pollInFlight: false, dynamicPollInFlight: false, dynamicNameRotationStartedAt: Date.now(), dynamicNameBlockedUntil: 0, dynamicNameLastAppliedName: '', dynamicNameLastAppliedAtMs: 0, dynamicJoinTracker: createManagedJoinTracker(), dynamicTimer: null, welcomePending: new Set(), welcomeJoinedAt: new Map(), welcomeDelivered: new Set(), welcomeFailed: new Set(), welcomeAttempts: new Map(), welcomeReadyAt: new Map(), welcomeInitialFactionKey: new Map(), welcomeSawPreTeam: new Set(), welcomeTeamChoiceConfirmed: new Set(), welcomeFactionStableKey: new Map(), welcomeFactionStablePolls: new Map(), welcomeValidFactions: [], welcomeMatchSnapshot: null, welcomeInFlight: false, welcomePollInFlight: false, welcomeJoinTracker: createManagedJoinTracker(), welcomeTimer: null, panelMessageId: String(bot?.controlPanelMessageId || ''), panelChannelId: String(bot?.controlPanelMessageChannelId || '') };
 }
 function cut(value, max = 100) { return String(value ?? '').slice(0, max); }
 function uiKey(botId, userId) { return `${botId}:${userId}`; }
@@ -685,7 +685,8 @@ export async function synchronizeManagedServerBanList(bot, { actor = 'web', maxA
 
 async function enforceManagedSharedBansForPlayers(bot, players = []) {
   const fresh = getManagedBot(bot?.id) || bot;
-  if (managedServerContexts(fresh).length < 2) return;
+  // Single-server bots also need to enforce an offline permanent ban at join.
+  // WARDOGS can reject POST /v1/bans when the player is not connected.
   const desired = new Map(sharedServerBanRows(fresh).map(row => [row.steamId, row]));
   for (const player of players) {
     const steamId = playerSteamId(player);
@@ -1151,6 +1152,20 @@ export async function syncManagedBanSnapshot(sourceBot, explicitTarget = null, m
   return { synced, removed };
 }
 
+// A permanent ban is an explicit, durable intent. It must never be erased by
+// a previously scheduled temporary/dynamic expiry, or by a game server that
+// can only add the native ban while the SteamID is online.
+function rememberPermanentManagedBan(bot, steamId, reason) {
+  const fresh = getManagedBot(bot?.id) || bot;
+  if (!fresh?.id) throw new Error('Management bot not found');
+  upsertManagedBot({
+    id: fresh.id,
+    sharedServerBans: mergeSharedServerBans(fresh, [{ steamId, reason, mode: 'permanent', expiresAt: null }]),
+    temporaryBans: temporaryBans(fresh).filter(row => row.steamId !== steamId),
+    dynamicBans: dynamicBans(fresh).filter(row => row.steamId !== steamId)
+  });
+}
+
 export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule violation', options = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
@@ -1172,16 +1187,26 @@ export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule viol
     const fresh = getManagedBot(parent.id) || parent;
     const minutes = Math.max(0, Number(options?.durationMinutes) || 0);
     const expiry = options?.forcedExpiresAt || (minutes ? new Date(Date.now() + minutes * 60_000).toISOString() : null);
-    upsertManagedBot({ id: fresh.id, sharedServerBans: mergeSharedServerBans(fresh, [{ steamId: normalized, reason, mode: minutes ? 'temporary' : 'permanent', expiresAt: expiry }]) });
+    if (minutes === 0) rememberPermanentManagedBan(fresh, normalized, reason);
+    else upsertManagedBot({ id: fresh.id, sharedServerBans: mergeSharedServerBans(fresh, [{ steamId: normalized, reason, mode: 'temporary', expiresAt: expiry }]) });
     if (errors.length || pending.length) appendManagedAudit(parent.id, { actor: options?.actor || 'system', action: 'shared-ban-partial', target: normalized, status: errors.length ? 'error' : 'ok', detail: `${results.length}/${targets.length} applied, ${pending.length} waiting for player join, ${errors.length} errors. ${errors[0] || ''}` });
     if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(parent.id) || parent, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });
-    return { fanout: true, applied: results.length, pending: pending.length, failed: errors.length, errors };
+    return { fanout: true, permanent: minutes === 0, applied: results.length, pending: pending.length, failed: errors.length, errors };
   }
+  const ownPermanentIntent = options?._fanout !== true && options?.skipSync !== true && !(Number(options?.durationMinutes) > 0);
   let result;
   try {
     result = await wardogsRequest(bot, '/v1/bans', { method: 'POST', body: { steamId: normalized, reason: formatManagedBanReason(bot, reason, options?.durationMinutes) } });
   } catch (error) {
-    if (options?.tolerateExisting !== true) throw error;
+    if (ownPermanentIntent && banSyncPlayerOfflineError(error)) {
+      rememberPermanentManagedBan(parent, normalized, reason);
+      appendManagedAudit(parent.id, { actor: options?.actor || 'system', action: 'permanent-ban-pending', target: normalized, detail: 'Player offline; permanent ban is queued for next join.' });
+      return { permanent: true, pending: true };
+    }
+    // A permanent ban can legitimately upgrade an already banned SteamID.
+    // Verify an existing native entry rather than treating its duplicate-POST
+    // response as a failed permanent-ban request.
+    if (options?.tolerateExisting !== true && !ownPermanentIntent) throw error;
     // Different WARDOGS builds/proxies do not consistently use the same status
     // for a duplicate ban. Verify the live list before treating it as a failure.
     try {
@@ -1200,6 +1225,7 @@ export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule viol
     const nextDynamic = dynamicBans(fresh).filter((entry) => entry.steamId !== normalized);
     if (nextTemporary.length !== temporaryBans(fresh).length || nextDynamic.length !== dynamicBans(fresh).length) upsertManagedBot({ id: fresh.id, temporaryBans: nextTemporary, dynamicBans: nextDynamic });
   }
+  if (ownPermanentIntent) rememberPermanentManagedBan(parent, normalized, reason);
   appendManagedAudit(bot.id, { actor: options?.actor || 'system', action: 'ban', target: normalized, detail: String(reason || '').slice(0, 300) });
   if (!options?.skipSync) await syncBanToAcceptedTarget(getManagedBot(bot.id) || bot, { mode: 'permanent', steamId: normalized, reason, actor: options?.actor });
   return result;
@@ -1208,6 +1234,8 @@ export async function banManagedPlayer(bot, steamId, reason = 'WARDOGS rule viol
 export async function dynamicBanManagedPlayer(bot, steamId, reason = 'Dynamic ban', durationMinutes = 1440, meta = {}) {
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
+  if (hasPermanentManagedBan(getManagedBot(bot?.id) || bot, normalized))
+    throw new Error('Player already has a permanent ban. Remove the permanent ban explicitly before creating a temporary ban.');
   const minutes = Math.max(1, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
   if (!minutes) throw new Error('Dynamic ban duration is invalid');
   const forced = Date.parse(meta?.forcedExpiresAt || '');
@@ -1228,6 +1256,8 @@ export async function temporaryBanManagedPlayer(bot, steamId, reason = 'Temporar
   if (bot?.dynamicBanEnabled === true && meta?.forceNormal !== true) return dynamicBanManagedPlayer(bot, steamId, reason, durationMinutes, meta);
   const normalized = normalizeSteamId64(steamId);
   if (!normalized) throw new Error('Invalid SteamID64');
+  if (hasPermanentManagedBan(getManagedBot(bot?.id) || bot, normalized))
+    throw new Error('Player already has a permanent ban. Remove the permanent ban explicitly before creating a temporary ban.');
   const minutes = Math.max(1, Math.min(525600, Math.floor(Number(durationMinutes) || 0)));
   if (!minutes) throw new Error('Temporary ban duration is invalid');
   await banManagedPlayer(bot, normalized, reason, { durationMinutes: minutes, skipSync: true, actor: meta?.createdBy || 'system', keepLocalTemporary: true, tolerateExisting: meta?.tolerateExisting === true, fanoutWithinBot: true, forcedExpiresAt: meta?.forcedExpiresAt });
@@ -1255,6 +1285,13 @@ export async function expireManagedTemporaryBans(bot) {
   if (!targets.length) return { expired: 0, pending: rows.length };
   const keep = [...rows]; let expired = 0; let lastError = null;
   for (const entry of due) {
+    if (hasPermanentManagedBan(getManagedBot(fresh.id) || fresh, entry.steamId)) {
+      const index = keep.findIndex(row => row.steamId === entry.steamId);
+      if (index >= 0) keep.splice(index, 1);
+      expired++;
+      appendManagedAudit(fresh.id, { actor: 'system', action: 'stale-temporary-ban-cleared', target: entry.steamId, detail: 'Permanent ban preserved; no WARDOGS unban issued.' });
+      continue;
+    }
     let hardFailures = 0;
     for (const target of targets) {
       try { await wardogsRequest(target, `/v1/bans/${encodeURIComponent(entry.steamId)}`, { method: 'DELETE' }); }
@@ -1271,7 +1308,7 @@ export async function expireManagedTemporaryBans(bot) {
     appendManagedAudit(fresh.id, { actor: 'system', action: 'temporary-ban-expired', target: entry.steamId, detail: `Expired at ${entry.expiresAt}` });
     await syncUnbanToAcceptedTarget(fresh, entry.steamId, { actor: 'system' });
   }
-  if (expired) upsertManagedBot({ id: fresh.id, temporaryBans: keep, sharedServerBans: sharedServerBanRows(getManagedBot(fresh.id) || fresh).filter(row => !due.some(entry => entry.steamId === row.steamId && !keep.some(kept => kept.steamId === entry.steamId))) });
+  if (expired) upsertManagedBot({ id: fresh.id, temporaryBans: keep, sharedServerBans: sharedServerBanRows(getManagedBot(fresh.id) || fresh).filter(row => row.mode === 'permanent' || !due.some(entry => entry.steamId === row.steamId && !keep.some(kept => kept.steamId === entry.steamId))) });
   if (lastError) setRuntime(fresh.id, { lastTemporaryBanError: lastError });
   else if (expired) setRuntime(fresh.id, { lastTemporaryBanError: null, lastTemporaryBanSweepAt: nowIso() });
   return { expired, pending: keep.length, error: lastError };
@@ -1285,6 +1322,13 @@ async function expireManagedDynamicBans(bot) {
   const targets = managedServerContexts(fresh);
   const keep = [...rows]; let expired = 0;
   for (const entry of due) {
+    if (hasPermanentManagedBan(getManagedBot(fresh.id) || fresh, entry.steamId)) {
+      const index = keep.findIndex(row => row.steamId === entry.steamId);
+      if (index >= 0) keep.splice(index, 1);
+      expired++;
+      appendManagedAudit(fresh.id, { actor: 'system', action: 'stale-dynamic-ban-cleared', target: entry.steamId, detail: 'Permanent ban preserved; no WARDOGS unban issued.' });
+      continue;
+    }
     let failed = false;
     if (entry.escalated) {
       for (const target of targets) {
@@ -1627,6 +1671,7 @@ export async function unbanManagedPlayer(bot, steamId, meta = {}) {
   if (!normalized) throw new Error('Invalid SteamID64');
   const freshBefore = getManagedBot(bot?.id) || bot;
   const dynamic = meta?._dynamicSnapshot || dynamicBans(freshBefore).find((entry) => entry.steamId === normalized);
+  const locallyTrackedBan = sharedServerBanRows(freshBefore).some(row => row.steamId === normalized);
   const fanout = sharedBanActionTargets(freshBefore);
   if (fanout.length > 1 && meta?._fanout !== true && (!meta?.skipSync || meta?.fanoutWithinBot === true)) {
     const results = [], errors = [];
@@ -1652,10 +1697,10 @@ export async function unbanManagedPlayer(bot, steamId, meta = {}) {
   let result = { localOnly: Boolean(dynamic && !dynamic.escalated) };
   if (!dynamic || dynamic.escalated) {
     try { result = await wardogsRequest(bot, `/v1/bans/${encodeURIComponent(normalized)}`, { method: 'DELETE' }); }
-    catch (error) { if (!(meta?.tolerateMissing && Number(error?.status || 0) === 404)) throw error; }
+    catch (error) { if (!((meta?.tolerateMissing || locallyTrackedBan) && Number(error?.status || 0) === 404)) throw error; }
   }
   const fresh = getManagedBot(bot?.id);
-  if (fresh) upsertManagedBot({ id: fresh.id, temporaryBans: temporaryBans(fresh).filter((entry) => entry.steamId !== normalized), dynamicBans: dynamicBans(fresh).filter((entry) => entry.steamId !== normalized) });
+  if (fresh) upsertManagedBot({ id: fresh.id, temporaryBans: temporaryBans(fresh).filter((entry) => entry.steamId !== normalized), dynamicBans: dynamicBans(fresh).filter((entry) => entry.steamId !== normalized), ...(!meta?.skipSync ? { sharedServerBans: removeSharedServerBan(fresh, normalized) } : {}) });
   appendManagedAudit(bot.id, { actor: meta?.actor || 'system', action: 'unban', target: normalized, detail: dynamic && !dynamic.escalated ? 'Dynamic ban removed locally.' : 'WARDOGS ban removed.' });
   if (!meta?.skipSync) await syncUnbanToAcceptedTarget(getManagedBot(bot.id) || bot, normalized, meta);
   return result;
@@ -2130,7 +2175,7 @@ async function pollManagedDynamicBans(bot, state) {
 }
 
 async function syncManagedLevelCap(bot, state, playerCount) {
-  // Never act from an incomplete roster. Caller passes official /v1/status occupancy.
+  // Use the official /v1/status occupancy; never infer it from a partial roster.
   const fresh = getManagedBot(bot.id) || bot;
   const server = managedServerContext(fresh, bot._managedServerId);
   if (!server || !Number.isInteger(playerCount)) return;
@@ -2138,44 +2183,77 @@ async function syncManagedLevelCap(bot, state, playerCount) {
   const old = { lowSince: state.levelCapLowSince, capped: server.autoLevelCapApplied === true };
   const decision = levelCapDecision(old, playerCount, now, server.autoLevelCapEnabled === true);
   state.levelCapLowSince = decision.lowSince;
-  setServerRuntime(bot, { autoLevelCapLowSince: decision.lowSince ? new Date(decision.lowSince).toISOString() : null,
-    autoLevelCapMode: server.autoLevelCapApplied ? 'level-30' : 'unlimited', autoLevelCapLastPlayerCount: playerCount });
-  if (!decision.action || now < Number(state.levelCapRetryAfter || 0)) return;
-  state.levelCapRetryAfter = now + 5 * 60_000; // retry conservatively, never spam config writes
+  setServerRuntime(bot, {
+    autoLevelCapLowSince: decision.lowSince ? new Date(decision.lowSince).toISOString() : null,
+    autoLevelCapMode: server.autoLevelCapApplied ? 'level-30' : 'unlimited',
+    autoLevelCapLastPlayerCount: playerCount
+  });
+  // Also repair old installations where an earlier version wrote 0. The first
+  // high-occupancy poll verifies the open limit once per bot process.
+  const action = decision.action || (server.autoLevelCapEnabled && !server.autoLevelCapApplied &&
+    playerCount >= 25 && !state.levelCapOpened ? 'uncap' : null);
+  if (!action || now < Number(state.levelCapRetryAfter || 0)) return;
+  state.levelCapRetryAfter = now + 5 * 60_000;
   try {
-    let updated = false;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const config = await wardogsRequest(bot, '/v1/config');
-      if (config?.writable === false) throw new Error('WARDOGS config is read-only');
-      const sections = Array.isArray(config?.sections) ? config.sections : [];
-      const session = sections.find((row) => String(row?.section || '').includes('/Script/WDGame.WDGameSession'));
-      const override = (session?.keyOverrides || []).find((x) => String(x?.key || '').toLowerCase() === 'servermaxplayerlevel');
-      if (override?.writable === false) throw new Error(`ServerMaxPlayerLevel is locked: ${override.lockedBy || 'hosting provider'}`);
-      if (typeof config.text !== 'string') throw new Error('Config text unavailable');
-      const existing = configMaxPlayerLevel(config.text);
-      // If somebody adjusted the value manually, do not overwrite their settings.
-      if (server.autoLevelCapApplied && existing !== 30) {
-        persistManagedServerState(bot, { autoLevelCapApplied: false });
-        setServerRuntime(bot, { autoLevelCapLastError: 'Level cap changed externally; automation suspended until next low-count interval.' });
-        state.levelCapLowSince = 0;
-        return;
+    const targets = action === 'cap' ? [30] : [...UNLIMITED_LEVEL_CANDIDATES];
+    let applied = null;
+    let firstError = '';
+    for (const target of targets) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const config = await wardogsRequest(bot, '/v1/config');
+          if (config?.writable === false) throw new Error('WARDOGS config is read-only');
+          const sections = Array.isArray(config?.sections) ? config.sections : [];
+          const session = sections.find(row => String(row?.section || '').includes('/Script/WDGame.WDGameSession'));
+          const override = (session?.keyOverrides || []).find(x => String(x?.key || '').toLowerCase() === 'servermaxplayerlevel');
+          if (override?.writable === false) throw new Error(`ServerMaxPlayerLevel is locked: ${override.lockedBy || 'hosting provider'}`);
+          if (typeof config.text !== 'string') throw new Error('Config text unavailable');
+          const existing = configMaxPlayerLevel(config.text);
+          // External edits should win over automation, never fight an admin.
+          if (server.autoLevelCapApplied && existing !== 30) {
+            persistManagedServerState(bot, { autoLevelCapApplied: false });
+            setServerRuntime(bot, { autoLevelCapLastError: 'Level cap changed externally; automation suspended.' });
+            state.levelCapLowSince = 0;
+            return;
+          }
+          const text = patchMaxPlayerLevel(config.text, target);
+          if (text !== config.text) {
+            const revision = String(config.revision || '').replace(/^"|"$/g, '');
+            const headers = { 'Content-Type': 'text/plain; charset=utf-8' };
+            if (revision) headers['If-Match'] = `"${revision}"`;
+            const outcome = await wardogsTextRequest(bot, '/v1/config?fullApply=true', { method: 'PUT', textBody: text, headers });
+            const errors = Array.isArray(outcome?.data?.errors) ? outcome.data.errors : [];
+            if (errors.length) throw new Error(`Config rejected: ${JSON.stringify(errors).slice(0, 220)}`);
+          }
+          // Do not claim 900 works if the host silently clamps it or ignores it.
+          const verify = await wardogsRequest(bot, '/v1/config');
+          if (configMaxPlayerLevel(verify?.text) !== target) throw new Error(`WARDOGS did not retain ServerMaxPlayerLevel=${target}`);
+          applied = { target, previous: existing };
+          break;
+        } catch (error) {
+          if (Number(error?.status) === 412 && attempt === 0) continue;
+          if (!firstError) firstError = String(error?.message || error).slice(0, 220);
+          if (action === 'cap') throw error;
+          // A rejected 900 is expected on builds whose documented maximum is
+          // 600. No fallback to 0: that is what the user explicitly rejected.
+          if (!String(error?.message || '').includes('ServerMaxPlayerLevel=') &&
+              !String(error?.message || '').startsWith('Config rejected:') &&
+              ![400, 422].includes(Number(error?.status || 0))) throw error;
+          break;
+        }
       }
-      const target = decision.action === 'cap' ? 30 : decision.action === 'uncap' ? 0 : server.autoLevelCapOriginal;
-      const text = patchMaxPlayerLevel(config.text, target);
-      if (text !== config.text) {
-        const revision = String(config.revision || '').replace(/^"|"$/g, '');
-        const headers = { 'Content-Type': 'text/plain; charset=utf-8' };
-        if (revision) headers['If-Match'] = `"${revision}"`;
-        try { await wardogsTextRequest(bot, '/v1/config?fullApply=true', { method: 'PUT', textBody: text, headers }); }
-        catch (error) { if (Number(error.status) === 412 && attempt === 0) continue; throw error; }
-      }
-      persistManagedServerState(bot, { autoLevelCapApplied: decision.action === 'cap', autoLevelCapOriginal: decision.action === 'cap' ? existing : 0 });
-      appendManagedAudit(bot, { actor: 'auto-level-cap', action: decision.action, detail: `${playerCount} online, ServerMaxPlayerLevel=${target}; game-server restart may be required` });
-      setServerRuntime(bot, { autoLevelCapMode: decision.action === 'cap' ? 'level-30' : 'unlimited', autoLevelCapLastAppliedAt: nowIso(), autoLevelCapLastError: null, autoLevelCapNeedsRestart: true });
-      updated = true;
-      break;
+      if (applied) break;
     }
-    if (!updated) throw new Error('Config revision conflict');
+    if (!applied) throw new Error(`WARDOGS rejected the open level limit (900/600). ${firstError}`);
+    state.levelCapOpened = action !== 'cap';
+    persistManagedServerState(bot, {
+      autoLevelCapApplied: action === 'cap',
+      autoLevelCapOriginal: action === 'cap' ? applied.previous : 0
+    });
+    appendManagedAudit(bot, { actor: 'auto-level-cap', action: action,
+      detail: `${playerCount} online, ServerMaxPlayerLevel=${applied.target}; game-server restart may be required` });
+    setServerRuntime(bot, { autoLevelCapMode: action === 'cap' ? 'level-30' : `level-${applied.target}`,
+      autoLevelCapLastAppliedAt: nowIso(), autoLevelCapLastError: null, autoLevelCapNeedsRestart: true });
   } catch (error) {
     setServerRuntime(bot, { autoLevelCapLastError: String(error.message || error).slice(0, 250) });
   }

@@ -1,4 +1,5 @@
-// WARDOGS ServerMaxPlayerLevel=0 means no level restriction.
+// On hosted servers 0 is sometimes overridden; try the requested 900, then the documented WARDOGS maximum 600.
+export const UNLIMITED_LEVEL_CANDIDATES = Object.freeze([900, 600]);
 export const LEVEL_CAP_WAIT_MS = 30 * 60_000;
 export function levelCapDecision(previous = {}, playerCount, now = Date.now(), enabled = false) {
   const state = { lowSince: Number(previous.lowSince) || 0, capped: previous.capped === true };
@@ -17,7 +18,7 @@ export function configMaxPlayerLevel(text) {
   return key ? Number(key[1]) : 0;
 }
 export function patchMaxPlayerLevel(text, level) {
-  if (!Number.isInteger(level) || level < 0 || level > 600) throw new Error('Unsupported max level');
+  if (!Number.isInteger(level) || level < 0 || level > 900) throw new Error('Unsupported max level');
   const source = String(text || '');
   const newline = source.includes('\r\n') ? '\r\n' : '\n';
   const lines = source.split(/\r?\n/);

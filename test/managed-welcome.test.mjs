@@ -67,14 +67,18 @@ test('welcome waits for observed team selection, stable polls, then spawn settle
   assert.equal(ready[0].steamId, B_SPAWNED.steamId);
 });
 
-test('a playable faction already present in the join snapshot is not enough to send early', () => {
+test('a playable faction already present waits for grace then permits welcome', () => {
   const s = state();
   managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
   const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_PREASSIGNED], 2);
   assert.equal(joined.length, 1);
   assert.deepEqual(targets(s, [A, B_PREASSIGNED], joined, 1_000), []);
-  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 30_000), []);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 19_999), []);
   assert.equal(s.welcomeTeamChoiceConfirmed.has(B_PREASSIGNED.steamId), false);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 21_000), []);
+  assert.equal(s.welcomeTeamChoiceConfirmed.has(B_PREASSIGNED.steamId), true);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 23_000), []);
+  assert.equal(targets(s, [A, B_PREASSIGNED], [], 28_000).length, 1);
 });
 
 test('a post-join change from one real faction to another confirms team selection', () => {
@@ -177,4 +181,16 @@ test('match boundary detection catches map changes and score resets', () => {
   result = managedMatchBoundary(first, { map: 'Europe', factionScores: [{ name: 'Valkyra', score: 0 }, { name: 'Lonestar', score: 0 }], rotation: { nowIndex: 1 } });
   assert.equal(result.changed, true);
   assert.equal(result.reason, 'map');
+});
+
+
+test('a missing status faction catalog cannot block welcomes forever', () => {
+  const s = state();
+  managedJoinCandidates(s.welcomeJoinTracker, [A], 2);
+  const joined = managedJoinCandidates(s.welcomeJoinTracker, [A, B_PREASSIGNED], 2);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], joined, 1000, {validFactions: []}), []);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 29000, {validFactions: []}), []);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 32000, {validFactions: []}), []);
+  assert.deepEqual(targets(s, [A, B_PREASSIGNED], [], 34000, {validFactions: []}), []);
+  assert.equal(targets(s, [A, B_PREASSIGNED], [], 39000, {validFactions: []}).length, 1);
 });
