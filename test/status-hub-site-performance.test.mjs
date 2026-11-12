@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 test('website HTML references the Status Hub favicons, not bot artwork',()=>{
  const html=fs.readFileSync('src/html.js','utf8');
- assert.match(html,/favicon\.svg\?v=3\.12\.63/);
+ const version=JSON.parse(fs.readFileSync('package.json','utf8')).version;
+ assert.ok(html.includes(`favicon.svg?v=${version}`));
  assert.match(html,/apple-touch-icon/);
- assert.match(html,/style\.css\?v=3\.12\.63/);
+ assert.ok(html.includes(`style.css?v=${version}`));
  assert.ok(fs.existsSync('public/favicon.svg'));
 });
 test('Bot Services only fetches subscription rows for the current user',()=>{

@@ -1,3 +1,7 @@
+## v3.12.64 – Downloads von versteckten Custom-Bot-Dateien
+
+- `Custom Bots → Dateien`: auch `.env`, `.gitignore`, versteckte Verzeichnisse und Laufzeit-Dateien mit Punkt-Präfix privat herunterladen; kein generischer „Interner Fehler“ mehr. Öffentliche Website-Dateien bleiben geschützt.
+- Details: [UPDATE-v3.12.64.md](UPDATE-v3.12.64.md).
 
 ## v3.12.62 – Custom Bots: vollständiger Source-/Datenexport und einzelne Dateien löschen
 
