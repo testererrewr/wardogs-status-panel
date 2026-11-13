@@ -4,7 +4,9 @@ WORKDIR /runner
 ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts
-COPY src/runner.js ./src/runner.js
+# Copy all local modules imported by the runner. Omitting the helper causes
+# ERR_MODULE_NOT_FOUND and an endless runner restart loop.
+COPY src/runner.js src/custom-bot-container-lifecycle.js ./src/
 EXPOSE 4000
 ENTRYPOINT []
 CMD ["node", "src/runner.js"]

@@ -1,3 +1,10 @@
+## v3.12.67 – Runner-Startfix (fehlendes Hilfsmodul)
+
+- `Dockerfile.runner` kopiert jetzt auch `src/custom-bot-container-lifecycle.js` in das Runner-Image.
+- Behebt `ERR_MODULE_NOT_FOUND: /runner/src/custom-bot-container-lifecycle.js` und den dadurch ausgelösten Runner-Neustart.
+- Der Runner kann wieder die Zustände bestehender Custom Bots melden. Keine Custom-Bot-Container, Bot-Dateien oder Datenbanken werden dazu neu gebaut/gelöscht.
+- Siehe [UPDATE-v3.12.67.md](UPDATE-v3.12.67.md).
+
 ## v3.12.66 – Custom-Bot-Status: Sammelabfrage mit Einzelfallback
 
 - Die Custom-Bot-Übersicht darf alle Bots bei einer einzigen gescheiterten Docker-Abfrage nicht pauschal als „Unavailable“ markieren.
