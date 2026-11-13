@@ -1,3 +1,11 @@
+## v3.12.66 – Custom-Bot-Status: Sammelabfrage mit Einzelfallback
+
+- Die Custom-Bot-Übersicht darf alle Bots bei einer einzigen gescheiterten Docker-Abfrage nicht pauschal als „Unavailable“ markieren.
+- Bounded Einzelabfragen zeigen, soweit möglich, echte Laufend/Gestoppt/Container-fehlt-Zustände.
+- Ein tatsächlicher Runner- oder Docker-Ausfall erscheint als „Status nicht prüfbar“, inklusive sicherer Diagnosen statt der irreführenden Stopp-Anzeige.
+- Bots werden durch diese Statusänderung weder gestoppt noch neu gebaut; vorhandene Source- und Datenbankdateien werden nicht verändert.
+- Details: [UPDATE-v3.12.66.md](UPDATE-v3.12.66.md).
+
 ## v3.12.65 – Custom-Bot-Neustart bei fehlendem Altcontainer
 
 - Behebt den Docker-Fehler `No such container` bei der Migration alter Custom-Bot-Laufzeitdateien. Vorhandene persistente Daten werden nicht überschrieben.
