@@ -13,7 +13,7 @@ const end = runnerSource.indexOf("app.post('/ensure'", begin);
 assert.ok(begin > 0 && end > begin);
 const source = runnerSource.slice(begin, end);
 
-function fixture({ present = true, imagePresent = false, copyError = '', diffError = '', inspectError = '' } = {}) {
+function fixture({ present = true, imagePresent = false, copyError = '', diffError = '', inspectError = '', noHostPath = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wardogs-runner-'));
   const id = crypto.randomUUID();
   const base = path.join(dir, id);
@@ -31,6 +31,7 @@ function fixture({ present = true, imagePresent = false, copyError = '', diffErr
     assert.equal(cmd, 'docker');
     docker.push(args);
     if (args[0] === 'inspect') {
+      if (noHostPath && args.at(-1) === 'missing-runner') return { code: 1, out: '', err: 'not found' };
       if (inspectError) return { code: 1, out: '', err: inspectError };
       const idx = args.indexOf('--type');
       const isContainerOnly = idx !== -1 && args[idx + 1] === 'container';
@@ -64,7 +65,7 @@ function fixture({ present = true, imagePresent = false, copyError = '', diffErr
     if (args[0] === 'pause' || args[0] === 'unpause') return { code: 0, out: '', err: '' };
     throw new Error(`unexpected Docker command: ${args.join(' ')}`);
   };
-  const ctx = { fs, path, process: { env: { CUSTOM_BOTS_HOST_PATH: dir, HOSTNAME: 'runner' } }, console: { warn(){} }, root: dir,
+  const ctx = { fs, path, process: { env: { CUSTOM_BOTS_HOST_PATH: noHostPath ? '' : dir, HOSTNAME: noHostPath ? 'missing-runner' : 'runner' } }, console: { warn(){}, info(){} }, root: dir,
     names: (x) => ({ container: `statushub-custom-${x}`, image: `statushub-custom-${x}:latest`, network: `statushub-net-${x}` }), run: calls,
     isMissingDockerContainerError, isMissingDockerFileError, sleep: async () => {} };
   vm.createContext(ctx);
@@ -158,5 +159,16 @@ test('new upload builds an image, but skips copying from nonexistent old contain
     assert.equal(f.docker.some(x => x[0] === 'cp' && x[1].endsWith(':/bot/data/.')), false);
     assert.equal(f.docker.some(x => x[0] === 'diff'), false);
     assert.equal(f.docker.filter(x => x[0] === 'inspect').every(x => x.includes('--type') && x[x.indexOf('--type') + 1] === 'container'), true);
+  } finally { f.cleanup(); }
+});
+
+test('a new upload always starts docker build before host volume discovery can fail', async () => {
+  const f = fixture({ present: false, noHostPath: true });
+  try {
+    fs.writeFileSync(path.join(f.base, 'Dockerfile.generated'), 'FROM scratch');
+    await assert.rejects(f.startFresh(f.id, {}), /Host-Pfad/);
+    assert.equal(f.docker.some((args) => args[0] === 'build'), true);
+    assert.equal(f.docker.some((args) => args[0] === 'create'), false);
+    assert.equal(fs.existsSync(path.join(f.base, 'runtime-data')), true);
   } finally { f.cleanup(); }
 });

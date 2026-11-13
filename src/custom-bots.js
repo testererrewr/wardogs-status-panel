@@ -149,7 +149,7 @@ function buildDockerfile(runtime, entrypoint) {
   const entry = safeEntry(entrypoint, runtime);
   const command = runtime === 'node22' ? ['node', entry] : ['python', entry];
   if (runtime === 'node22') {
-    return `FROM node:22-alpine\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; elif [ -f package.json ]; then npm install --omit=dev --no-audit --no-fund; fi\nRUN mkdir -p /bot/data && chown -R node:node /bot\nUSER node\nCMD ${JSON.stringify(command)}\n`;
+    return `FROM node:22-alpine\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; elif [ -f package.json ]; then npm install --no-audit --no-fund; fi\nRUN if [ -f package.json ]; then npm run build --if-present && npm prune --omit=dev --no-audit --no-fund; fi\nRUN mkdir -p /bot/data && chown -R node:node /bot\nUSER node\nCMD ${JSON.stringify(command)}\n`;
   }
   if (runtime === 'python313') {
     return `FROM python:3.13-slim\nENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1\nWORKDIR /bot\nCOPY src/ .\nRUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt; fi\nRUN useradd -m -u 1000 bot && mkdir -p /bot/data && chown -R bot:bot /bot\nUSER bot\nCMD ${JSON.stringify(command)}\n`;

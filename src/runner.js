@@ -116,7 +116,13 @@ async function build(id, image) {
     if (error?.code === 'EACCES') throw new Error('upload files inaccessible (runner permissions)');
     throw new Error('upload files missing');
   }
-  await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
+  console.info(`[custom-runner] ${id}: Docker-Image wird gebaut`);
+  try {
+    await run('docker', ['build', '-t', image, '-f', 'Dockerfile.generated', '.'], { timeout: 240000, cwd: dir });
+  } catch (error) {
+    throw new Error(`Docker-Build fehlgeschlagen: ${String(error.message || error).slice(-2500)}`);
+  }
+  console.info(`[custom-runner] ${id}: Docker-Image erfolgreich gebaut`);
 }
 // Custom Bot runtime state MUST survive rebuilds. The main panel and runner
 // share the same /workspace bind mount; resolve its actual HOST source from
@@ -125,8 +131,12 @@ let hostWorkspaceCache = '';
 async function hostWorkspace() {
   if (hostWorkspaceCache) return hostWorkspaceCache;
   const explicit = String(process.env.CUSTOM_BOTS_HOST_PATH || '').trim();
+  // The update script passes the absolute host path explicitly. Docker's
+  // auto-generated HOSTNAME may not be resolvable via self-inspect on every VPS.
   const result = explicit || (await run('docker', ['inspect', '--type', 'container', '-f', '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}', process.env.HOSTNAME || ''], { timeout: 12000 })).out.trim();
-  if (!path.isAbsolute(result)) throw new Error('Custom-Bot-Datenspeicher: Host-Pfad des Runner-Mounts nicht gefunden');
+  if (!path.isAbsolute(result) || /[\x00-\x1f\x7f]/.test(result)) {
+    throw new Error('Custom-Bot-Datenspeicher: Host-Pfad nicht gefunden. CUSTOM_BOTS_HOST_PATH in .env prüfen und Runner neu starten.');
+  }
   hostWorkspaceCache = path.resolve(result);
   return hostWorkspaceCache;
 }
@@ -292,9 +302,11 @@ async function startFresh(id, envObj) {
   const { container, image, network } = names(id);
   // Build first while the previous bot continues running. Stop it only for
   // the final, consistent SQLite snapshot (including WAL/SHM) before removal.
-  const hostSource = path.join(await hostWorkspace(), id, 'runtime-data');
-  await ensureNetwork(network, id);
+  // Build immediately from the uploaded source. Resolving the host volume
+  // must never silently prevent the compile/install phase from starting.
   await build(id, image);
+  await ensureNetwork(network, id);
+  const hostSource = path.join(await hostWorkspace(), id, 'runtime-data');
   const hadContainer = await existsContainer(container);
   const wasRunning = hadContainer && await isRunning(container);
   if (wasRunning) {
@@ -319,18 +331,25 @@ async function startFresh(id, envObj) {
     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2', '--label', `server-status-hub.custom=${id}`];
   for (const [k, v] of Object.entries(validateEnv(envObj))) args.push('-e', `${k}=${v}`);
   args.push(image);
-  await run('docker', args, { timeout: 30000 });
+  console.info(`[custom-runner] ${id}: Docker-Container wird erstellt`);
+  try {
+    await run('docker', args, { timeout: 30000 });
+  } catch (error) {
+    throw new Error(`Docker-Container konnte nicht erstellt werden: ${String(error.message || error).slice(-1500)}`);
+  }
   // Restore older root-level databases before the bot's process starts.
   const restored = path.join(root, id, 'runtime-root');
   if (fs.existsSync(restored) && collectFiles(restored).length) {
     await run('docker', ['cp', '-a', `${restored}/.`, `${container}:/bot/`], { timeout: 30000 });
   }
+  console.info(`[custom-runner] ${id}: Bot wird gestartet`);
   await run('docker', ['start', container], { timeout: 20000 });
   await sleep(1200);
   if (!(await isRunning(container))) {
     const logs = await recentLogs(container);
     throw new Error(`custom bot exited directly after start${logs ? `: ${logs}` : ''}`);
   }
+  console.info(`[custom-runner] ${id}: Bot läuft`);
   return container;
 }
 
