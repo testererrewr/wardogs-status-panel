@@ -6,6 +6,7 @@ import { rateLimit } from 'express-rate-limit';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
+import { isMissingDockerContainerError, isMissingDockerFileError } from './custom-bot-container-lifecycle.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -65,7 +66,16 @@ function validateEnv(obj) {
 
 async function existsContainer(name) {
   const r = await run('docker', ['inspect', name], { allowFailure: true, timeout: 15000 });
-  return r.code === 0;
+  if (r.code === 0) return true;
+  // A stopped / removed container is normal; Docker daemon errors are not.
+  if (isMissingDockerContainerError(`${r.err} ${r.out}`)) return false;
+  throw new Error(`Docker-Containerstatus konnte nicht geprüft werden: ${(r.err || r.out).slice(0, 250)}`);
+}
+async function disappearedDuringCopy(container, errorText) {
+  if (!isMissingDockerContainerError(errorText)) return false;
+  if (await existsContainer(container)) return false;
+  console.warn(`[custom-runner] Alter Container ${container} wurde während der Datenübernahme entfernt; vorhandene persistente Daten bleiben erhalten.`);
+  return true;
 }
 async function isRunning(name) {
   const r = await run('docker', ['inspect', '-f', '{{.State.Running}}', name], { allowFailure: true, timeout: 15000 });
@@ -176,18 +186,34 @@ async function captureWritableRoot(container, id) {
   const staged = path.join(base, '.runtime-root-next');
   fs.rmSync(staged, { recursive: true, force: true });
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
-  const result = await run('docker', ['diff', container], { timeout: 20000, maxOutput: 2_000_000, requireFullOutput: true });
-  const candidates = [...new Set(result.out.split(/\r?\n/).map((line) => writableRuntimeName(line.slice(2).trim())).filter(Boolean))];
-  if (candidates.length > RUNTIME_MAX_FILES) throw new Error('Zu viele geänderte Laufzeitdateien für die Sicherung');
-  for (const rel of candidates) {
-    const out = path.join(staged, ...rel.split('/'));
-    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
-    const copied = await run('docker', ['cp', `${container}:/bot/${rel}`, out], { timeout: 20000, allowFailure: true });
-    if (copied.code !== 0) continue; // file may have disappeared while capturing
-    if (!fs.lstatSync(out).isFile() || fs.lstatSync(out).isSymbolicLink()) throw new Error('Unsichere Laufzeitdatei entdeckt');
+  try {
+    const result = await run('docker', ['diff', container], { timeout: 20000, maxOutput: 2_000_000, requireFullOutput: true, allowFailure: true });
+    if (result.code !== 0) {
+      if (await disappearedDuringCopy(container, `${result.err} ${result.out}`)) return false;
+      throw new Error(`Container-Dateiänderungen konnten nicht gelesen werden: ${(result.err || result.out).slice(0, 250)}`);
+    }
+    const candidates = [...new Set(result.out.split(/\r?\n/).map((line) => writableRuntimeName(line.slice(2).trim())).filter(Boolean))];
+    if (candidates.length > RUNTIME_MAX_FILES) throw new Error('Zu viele geänderte Laufzeitdateien für die Sicherung');
+    for (const rel of candidates) {
+      const out = path.join(staged, ...rel.split('/'));
+      fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+      const copied = await run('docker', ['cp', `${container}:/bot/${rel}`, out], { timeout: 20000, allowFailure: true });
+      if (copied.code !== 0) {
+        if (await disappearedDuringCopy(container, `${copied.err} ${copied.out}`)) return false;
+        // Files changed between diff and cp are possible on a live bot.
+        if (isMissingDockerFileError(`${copied.err} ${copied.out}`)) continue;
+        throw new Error(`Laufzeitdatei konnte nicht gesichert werden: ${(copied.err || copied.out).slice(0, 250)}`);
+      }
+      if (!fs.lstatSync(out).isFile() || fs.lstatSync(out).isSymbolicLink()) throw new Error('Unsichere Laufzeitdatei entdeckt');
+    }
+    collectFiles(staged);
+    replaceTree(path.join(base, 'runtime-root'), staged);
+    return true;
+  } finally {
+    // When the old container has vanished, never overwrite a previous good
+    // runtime-root snapshot with a partial or empty staging tree.
+    fs.rmSync(staged, { recursive: true, force: true });
   }
-  collectFiles(staged);
-  replaceTree(path.join(base, 'runtime-root'), staged);
 }
 async function captureRuntime(id, { forBackup = false } = {}) {
   const { container } = names(id), base = path.join(root, id);
@@ -196,19 +222,34 @@ async function captureRuntime(id, { forBackup = false } = {}) {
   let running = false;
   if (await existsContainer(container)) {
     running = await isRunning(container);
-    if (running) await run('docker', ['pause', container], { timeout: 20000 });
+    let paused = false, missing = false;
     try {
-      if (!(await containerHasDataMount(container))) {
+      if (running) {
+        const pause = await run('docker', ['pause', container], { allowFailure: true, timeout: 20000 });
+        if (pause.code === 0) paused = true;
+        else if (await disappearedDuringCopy(container, `${pause.err} ${pause.out}`)) missing = true;
+        else throw new Error(`Container konnte nicht pausiert werden: ${(pause.err || pause.out).slice(0, 250)}`);
+      }
+      if (!missing && !(await containerHasDataMount(container))) {
         const staging = path.join(base, '.runtime-data-next');
         fs.rmSync(staging, { recursive: true, force: true });
         fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
-        const copied = await run('docker', ['cp', `${container}:/bot/data/.`, staging], { allowFailure: true, timeout: 25000 });
-        if (copied.code !== 0 && !/no such file|could not find/i.test(copied.err)) throw new Error(`Container-Daten konnten nicht gelesen werden: ${copied.err.slice(0, 150)}`);
-        collectFiles(staging);
-        if (copied.code === 0) replaceTree(data, staging);
-        else { fs.rmSync(staging, { recursive: true, force: true }); }
+        try {
+          const copied = await run('docker', ['cp', `${container}:/bot/data/.`, staging], { allowFailure: true, timeout: 25000 });
+          if (copied.code === 0) {
+            collectFiles(staging);
+            replaceTree(data, staging);
+          } else if (await disappearedDuringCopy(container, `${copied.err} ${copied.out}`)) {
+            missing = true;
+          } else if (!isMissingDockerFileError(`${copied.err} ${copied.out}`)) {
+            throw new Error(`Container-Daten konnten nicht gelesen werden: ${(copied.err || copied.out).slice(0, 250)}`);
+          }
+          // Missing /bot/data is normal for bots that never used this folder.
+        } finally {
+          fs.rmSync(staging, { recursive: true, force: true });
+        }
       }
-      await captureWritableRoot(container, id);
+      if (!missing) await captureWritableRoot(container, id);
       if (!fs.existsSync(data)) copyTree(path.join(base, 'src', 'data'), data);
       if (forBackup) {
         const staged = path.join(base, '.runtime-export-next');
@@ -217,11 +258,11 @@ async function captureRuntime(id, { forBackup = false } = {}) {
         replaceTree(path.join(base, 'runtime-export-data'), staged);
       }
     } finally {
-      if (running) await run('docker', ['unpause', container], { allowFailure: true, timeout: 20000 });
+      if (paused) await run('docker', ['unpause', container], { allowFailure: true, timeout: 20000 });
     }
   }
-  // Source contains any initial data/ files. Seed only if the bot never wrote
-  // its own runtime data (and a previous container could not be migrated).
+  // Never replace existing host data because the legacy Docker container is
+  // missing. Only seed data/ from the uploaded project on first creation.
   if (!fs.existsSync(data)) copyTree(path.join(base, 'src', 'data'), data);
   collectFiles(data);
   if (forBackup && !(await existsContainer(container))) {
@@ -230,7 +271,7 @@ async function captureRuntime(id, { forBackup = false } = {}) {
     copyTree(data, staged);
     replaceTree(path.join(base, 'runtime-export-data'), staged);
   }
-  return { running, files: collectFiles(data).length };
+  return { running: running && await existsContainer(container), files: collectFiles(data).length };
 }
 // A snapshot, rebuild and delete for one bot must not overlap: all three
 // touch the same SQLite files and staging directories.
@@ -253,7 +294,12 @@ async function startFresh(id, envObj) {
   await build(id, image);
   const hadContainer = await existsContainer(container);
   const wasRunning = hadContainer && await isRunning(container);
-  if (wasRunning) await run('docker', ['stop', '-t', '10', container], { timeout: 25000 });
+  if (wasRunning) {
+    const stopped = await run('docker', ['stop', '-t', '10', container], { allowFailure: true, timeout: 25000 });
+    if (stopped.code !== 0 && !(await disappearedDuringCopy(container, `${stopped.err} ${stopped.out}`))) {
+      throw new Error(`Alter Container konnte nicht gestoppt werden: ${(stopped.err || stopped.out).slice(0, 250)}`);
+    }
+  }
   try { await captureRuntime(id); }
   catch (error) {
     if (wasRunning) await run('docker', ['start', container], { allowFailure: true, timeout: 20000 });
@@ -297,7 +343,16 @@ app.post('/ensure', async (req, res) => {
           await startFresh(id, req.body.env || {});
           return { ok: true, running: true, reused: false, migratedNetwork: wrongNetwork, migratedRuntime: legacyReadOnly };
         }
-        if (!(await isRunning(container))) await run('docker', ['start', container], { timeout: 20000 });
+        if (!(await isRunning(container))) {
+          const started = await run('docker', ['start', container], { allowFailure: true, timeout: 20000 });
+          if (started.code !== 0) {
+            if (!(await disappearedDuringCopy(container, `${started.err} ${started.out}`))) {
+              throw new Error(`Bot-Container konnte nicht gestartet werden: ${(started.err || started.out).slice(0, 250)}`);
+            }
+            await startFresh(id, req.body.env || {});
+            return { ok: true, running: true, reused: false, recoveredMissingContainer: true };
+          }
+        }
         return { ok: true, running: true, reused: true };
       }
       await startFresh(id, req.body.env || {});
