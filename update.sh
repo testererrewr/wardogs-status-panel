@@ -42,6 +42,14 @@ if ! grep -q '^SECURITY_GLOBAL_LIMIT=' .env; then echo 'SECURITY_GLOBAL_LIMIT=12
 if ! grep -q '^SECURITY_WRITE_LIMIT=' .env; then echo 'SECURITY_WRITE_LIMIT=180' >> .env; fi
 if ! grep -q '^ADMIN_IP_ALLOWLIST=' .env; then echo 'ADMIN_IP_ALLOWLIST=' >> .env; fi
 mkdir -p data custom-bots
+# Docker bind mounts require a HOST path. Set it deterministically; the runner
+# must not guess it from its own container hostname during the first bot build.
+CUSTOM_BOTS_HOST_PATH="$(realpath custom-bots)"
+if grep -q '^CUSTOM_BOTS_HOST_PATH=' .env; then
+  sed -i "s|^CUSTOM_BOTS_HOST_PATH=.*|CUSTOM_BOTS_HOST_PATH=${CUSTOM_BOTS_HOST_PATH}|" .env
+else
+  printf 'CUSTOM_BOTS_HOST_PATH=%s\n' "$CUSTOM_BOTS_HOST_PATH" >> .env
+fi
 chown -R 1000:1000 data custom-bots
 chmod 750 data custom-bots
 find data -type f -exec chmod 600 {} + 2>/dev/null || true

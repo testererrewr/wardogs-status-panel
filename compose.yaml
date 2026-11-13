@@ -67,6 +67,8 @@ services:
       RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET}
       RUNNER_PORT: 4000
       HOME: /tmp/runner-home
+      # Absolute host path (set by update.sh); avoids Docker self-inspect failures.
+      CUSTOM_BOTS_HOST_PATH: ${CUSTOM_BOTS_HOST_PATH:-}
     expose:
       - "4000"
     volumes:

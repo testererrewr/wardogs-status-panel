@@ -1,3 +1,11 @@
+## v3.12.69 – Custom-Bot-Upload: Build und Start zuverlässig ausführen
+
+- Der Runner bekommt beim Update einen expliziten absoluten Host-Pfad für `custom-bots`. Er hängt nicht mehr zwingend von Docker-Selbstinspektion anhand des Containernamens ab.
+- `docker build` wird direkt nach einem Upload/Neu-Bauen ausgeführt; der Host-Pfad wird erst danach benötigt. Build-/Create-/Start-Phasen erhalten eindeutige Logs und Fehler.
+- Node.js-Bots installieren für ein vorhandenes `npm run build` auch Build-Abhängigkeiten und entfernen Entwicklungsabhängigkeiten anschließend (`npm prune --omit=dev`). Node-Projekte ohne Build-Skript bleiben kompatibel.
+- Der Fehlerfall mit fehlendem alten Container und das sichere Übernehmen persistenter Daten bleiben abgedeckt.
+- Siehe [UPDATE-v3.12.69.md](UPDATE-v3.12.69.md).
+
 ## v3.12.68 – Custom-Bot-Neustart: Docker-Images nicht als Container behandeln
 
 - Der Runner verwendet jetzt ausschließlich `docker inspect --type container`, wenn er bestehende Custom-Bot-Container prüft. Ein vorhandenes Docker-Image allein führt nicht mehr zu „No such container“ beim ersten Start.
