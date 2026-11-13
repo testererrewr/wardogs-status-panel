@@ -1,3 +1,8 @@
+## v3.12.65 – Custom-Bot-Neustart bei fehlendem Altcontainer
+
+- Behebt den Docker-Fehler `No such container` bei der Migration alter Custom-Bot-Laufzeitdateien. Vorhandene persistente Daten werden nicht überschrieben.
+- Details: [UPDATE-v3.12.65.md](UPDATE-v3.12.65.md).
+
 ## v3.12.64 – Downloads von versteckten Custom-Bot-Dateien
 
 - `Custom Bots → Dateien`: auch `.env`, `.gitignore`, versteckte Verzeichnisse und Laufzeit-Dateien mit Punkt-Präfix privat herunterladen; kein generischer „Interner Fehler“ mehr. Öffentliche Website-Dateien bleiben geschützt.
