@@ -25,6 +25,7 @@ import { allowSameOriginManagedFrame } from './managed-embed-security.js';
 import { prepareCustomBot, parseEnvText, deleteCustomBotFiles, listCustomBotFiles, resolveCustomBotFile, overlayCustomBotFiles, listCustomBotRuntimeFiles, resolveCustomBotRuntimeFile, deleteCustomBotSourceFile, createCustomBotBackup } from './custom-bots.js';
 import { sendPrivateCustomBotDownload } from './custom-bot-download.js';
 import { ensureCustomBot, restartCustomBot, stopCustomBot, deleteCustomBotRuntime, customBotStatus, customBotStatuses, customBotLogs, customBotSnapshot, customBotDeleteData } from './runner-client.js';
+import { resolveCustomBotStatuses } from './custom-bot-statuses.js';
 import { managedBotRuntime, refreshManagedDiscordPanels, parseManagedRules, testManagedWardogs, syncManagedBots, restartManagedBot, stopManagedBot, shutdownManagedBots, managedDashboard, managedMapOptions, MANAGED_DISCORD_PERMISSION_KEYS, broadcastManaged, banManagedPlayer, temporaryBanManagedPlayer, kickManagedPlayer, killManagedPlayer, whisperManagedPlayer, whisperManagedFaction, moveManagedPlayer, unbanManagedPlayer, addManagedReservedSlot, removeManagedReservedSlot, restartManagedMatch, endManagedMatch, setManagedLighting, changeManagedMap, normalizeSteamId64, normalizeManagedBanDiscordLink, formatManagedBanDuration, requestManagedBanSync, acceptManagedBanSync, rejectManagedBanSync, syncManagedBanSnapshot, createManagedBanSyncServer, joinManagedBanSyncServer, leaveManagedBanSyncServer, resyncManagedBanSyncServer, synchronizeManagedServerBanList, updateManagedBanSyncCommunitySettings, appendManagedAudit, restoreManagedDynamicServerName } from './managed-bots.js';
 import { playtimeBotRuntime, syncPlaytimeBots, restartPlaytimeBot, stopPlaytimeBot, shutdownPlaytimeBots, testPlaytimeWardogs, refreshPlaytimeTracker, playtimeTrackerSnapshot, playtimeTrackerServers, combinedStatsSnapshot, searchCombinedPlayers, leaderboardPositions, KD_MIN_KILLS, HEADSHOT_RATE_MIN_KILLS, PLAYTIME_SERVICE_ID } from './playtime-tracker.js';
 import { KILL_STATS_SERVICE_ID, killStatsBotRuntime, syncKillStatsBots, restartKillStatsBot, stopKillStatsBot, shutdownKillStatsBots, testKillStatsWardogs, refreshKillStatsDiscord, killStatsSnapshot, searchKillStatsPlayer, managementKillFeed, prettyCause, configureWardogsKillFeed, configureWardogsPlaytimeKillFeed, configureWardogsManagementFeed, ingestWardogsKillFeed, killStatsSnapshotFromStats, searchKillStatsSnapshot } from './kill-stats.js';
@@ -1139,7 +1140,7 @@ function managedBotForm(req, service, bot) {
     ${rt.lastError?`<div class="span2 warning"><strong>Runtime:</strong> ${esc(rt.lastError)}</div>`:''}${rt.lastSteamError?`<div class="span2 warning"><strong>Steam Check:</strong> ${esc(rt.lastSteamError)}</div>`:''}${rt.lastPanelError?`<div class="span2 warning"><strong>Discord Panel:</strong> ${esc(rt.lastPanelError)}</div>`:''}${rt.welcomeWatcherLastPollError?`<div class="span2 warning"><strong>Welcome Watcher:</strong> ${esc(rt.welcomeWatcherLastPollError)}</div>`:''}${rt.lastWelcomeWhisperError?`<div class="span2 warning"><strong>Welcome Whisper:</strong> ${esc(rt.lastWelcomeWhisperError)}</div>`:''}
   </form>
   <section class="panel managed-config-block"><div class="row between"><strong>${tr(lang,'Config Export / Import','Config export / import')}</strong><a class="button ghost smallbtn" href="/managed-bots/${esc(bot.id)}/config/export">${tr(lang,'Config exportieren','Export config')}</a></div><form method="post" enctype="multipart/form-data" action="/managed-bots/${esc(bot.id)}/config/import" class="managed-add-row"><input type="hidden" name="_csrf" value="${esc(csrf(req))}"><input type="file" name="config" accept="application/json,.json" required><button class="button ghost smallbtn">${tr(lang,'Config importieren','Import config')}</button></form></section>
-  <script src="/managed.js?v=3.12.65" defer></script>`;
+  <script src="/managed.js?v=3.12.66" defer></script>`;
 }
 
 
@@ -1595,7 +1596,7 @@ function managedEmbeddedPage(req,res, body, { autoRefreshSeconds=0 } = {}) {
   // All mutation forms navigate the top-level panel after their CSRF-checked POST.
   allowSameOriginManagedFrame(res);
   res.set('Cache-Control','private, no-store');
-  return res.send(`<!doctype html><html lang="${esc(langOf(req))}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/style.css?v=3.12.65"><style>html,body{background:transparent;min-height:0}body{display:block;padding:0 2px 20px}.managed-live{margin:0}</style></head><body data-refresh-seconds="${Number(autoRefreshSeconds)||0}">${body}${autoRefreshSeconds?`<p class="muted small" data-managed-auto-refresh>Auto-refresh</p><script src="/managed-live-refresh.js?v=3.12.65" defer></script>`:''}<script src="/managed.js?v=3.12.65" defer></script><script>document.addEventListener('DOMContentLoaded',()=>{for(const f of document.querySelectorAll('form'))f.target='_top';for(const a of document.querySelectorAll('a[href^="/bot-services/"]')){if(!a.hasAttribute('data-iframe-refresh'))a.target='_top';}});</script></body></html>`);
+  return res.send(`<!doctype html><html lang="${esc(langOf(req))}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/style.css?v=3.12.66"><style>html,body{background:transparent;min-height:0}body{display:block;padding:0 2px 20px}.managed-live{margin:0}</style></head><body data-refresh-seconds="${Number(autoRefreshSeconds)||0}">${body}${autoRefreshSeconds?`<p class="muted small" data-managed-auto-refresh>Auto-refresh</p><script src="/managed-live-refresh.js?v=3.12.66" defer></script>`:''}<script src="/managed.js?v=3.12.66" defer></script><script>document.addEventListener('DOMContentLoaded',()=>{for(const f of document.querySelectorAll('form'))f.target='_top';for(const a of document.querySelectorAll('a[href^="/bot-services/"]')){if(!a.hasAttribute('data-iframe-refresh'))a.target='_top';}});</script></body></html>`);
 }
 
 app.get('/bot-services/:id/live', requireLogin, async(req,res)=>{
@@ -2777,24 +2778,26 @@ app.get('/custom-bots', requireLogin, (req, res) => {
   });
   const canUpload=ownCount<limit;
   const quota=u.role==='admin'?tr(lang,'Admin: unbegrenzt','Admin: unlimited'):limit>0?`${ownCount}/${limit} ${tr(lang,'Upload-Slots','upload slots')}`:tr(lang,'Custom-Bot-Uploads nicht freigeschaltet','Custom bot uploads are not enabled');
-  render(req,res,'Custom Bots',`<div class="pagehead"><div><h1>Custom Bots</h1><p>${esc(quota)} · ${tr(lang,'Node.js/Python Uploads laufen isoliert','Node.js/Python uploads run in isolated containers')}</p></div>${canUpload?`<a class="button primary" href="/custom-bots/new">+ ${tr(lang,'Bot hochladen','Upload bot')}</a>`:''}</div>${limit===0&&u.role!=='admin'?`<div class="panel warning">${tr(lang,'Ein Admin muss deinen Account zuerst für Custom-Bot-Uploads freischalten.','An admin must enable custom bot uploads for your account first.')}</div>`:''}<section class="grid">${rows.join('')||`<div class="empty panel">${tr(lang,'Keine Custom Bots.','No custom bots.')}</div>`}</section><script defer src="/custom-bots-status.js?v=3.12.65"></script>`);
+  render(req,res,'Custom Bots',`<div class="pagehead"><div><h1>Custom Bots</h1><p>${esc(quota)} · ${tr(lang,'Node.js/Python Uploads laufen isoliert','Node.js/Python uploads run in isolated containers')}</p></div>${canUpload?`<a class="button primary" href="/custom-bots/new">+ ${tr(lang,'Bot hochladen','Upload bot')}</a>`:''}</div>${limit===0&&u.role!=='admin'?`<div class="panel warning">${tr(lang,'Ein Admin muss deinen Account zuerst für Custom-Bot-Uploads freischalten.','An admin must enable custom bot uploads for your account first.')}</div>`:''}<section class="grid">${rows.join('')||`<div class="empty panel">${tr(lang,'Keine Custom Bots.','No custom bots.')}</div>`}</section><script defer src="/custom-bots-status.js?v=3.12.66"></script>`);
 });
 
 app.get('/custom-bots/statuses', requireLogin, async (req, res) => {
   const user = currentUser(req);
   const bots = listCustomBotsFor(user.discordId, false);
   res.setHeader('Cache-Control', 'private, no-store');
-  try {
-    const statuses = {};
-    // A bounded single Docker request per batch; never hold up the HTML page.
-    for (let i = 0; i < bots.length; i += 250) {
-      const result = await customBotStatuses(bots.slice(i, i + 250));
-      Object.assign(statuses, result.statuses || {});
-    }
-    res.json({ ok: true, statuses });
-  } catch (error) {
-    res.status(503).json({ ok: false, error: 'Runner status temporarily unavailable' });
+  // Failure of a single Docker batch query must not mark every bot as offline.
+  // An individual Docker inspect is a read-only fallback for small bot lists.
+  const output = {};
+  let degraded = false;
+  for (let i = 0; i < bots.length; i += 250) {
+    const result = await resolveCustomBotStatuses(bots.slice(i, i + 250), {
+      batch: customBotStatuses,
+      individual: customBotStatus
+    });
+    Object.assign(output, result.statuses);
+    degraded ||= result.degraded;
   }
+  res.json({ ok: true, statuses: output, degraded });
 });
 
 app.get('/custom-bots/new', requireLogin, (req,res)=>{
