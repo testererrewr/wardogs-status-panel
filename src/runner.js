@@ -65,7 +65,10 @@ function validateEnv(obj) {
 }
 
 async function existsContainer(name) {
-  const r = await run('docker', ['inspect', name], { allowFailure: true, timeout: 15000 });
+  // IMPORTANT: untyped `docker inspect` matches images as well as containers.
+  // Build creates an identically named :latest image before `docker create`.
+  // An untyped inspect can therefore report a non-existent container as present.
+  const r = await run('docker', ['inspect', '--type', 'container', name], { allowFailure: true, timeout: 15000 });
   if (r.code === 0) return true;
   // A stopped / removed container is normal; Docker daemon errors are not.
   if (isMissingDockerContainerError(`${r.err} ${r.out}`)) return false;
@@ -78,7 +81,7 @@ async function disappearedDuringCopy(container, errorText) {
   return true;
 }
 async function isRunning(name) {
-  const r = await run('docker', ['inspect', '-f', '{{.State.Running}}', name], { allowFailure: true, timeout: 15000 });
+  const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{.State.Running}}', name], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'true';
 }
 async function ensureNetwork(name, id) {
@@ -91,11 +94,11 @@ async function ensureNetwork(name, id) {
   }
 }
 async function containerUsesNetwork(container, network) {
-  const r = await run('docker', ['inspect', '-f', `{{if index .NetworkSettings.Networks \"${network}\"}}yes{{else}}no{{end}}`, container], { allowFailure: true, timeout: 15000 });
+  const r = await run('docker', ['inspect', '--type', 'container', '-f', `{{if index .NetworkSettings.Networks \"${network}\"}}yes{{else}}no{{end}}`, container], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'yes';
 }
 async function containerIsReadOnly(container) {
-  const r = await run('docker', ['inspect', '-f', '{{.HostConfig.ReadonlyRootfs}}', container], { allowFailure: true, timeout: 15000 });
+  const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{.HostConfig.ReadonlyRootfs}}', container], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'true';
 }
 async function recentLogs(container) {
@@ -122,13 +125,13 @@ let hostWorkspaceCache = '';
 async function hostWorkspace() {
   if (hostWorkspaceCache) return hostWorkspaceCache;
   const explicit = String(process.env.CUSTOM_BOTS_HOST_PATH || '').trim();
-  const result = explicit || (await run('docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}', process.env.HOSTNAME || ''], { timeout: 12000 })).out.trim();
+  const result = explicit || (await run('docker', ['inspect', '--type', 'container', '-f', '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}', process.env.HOSTNAME || ''], { timeout: 12000 })).out.trim();
   if (!path.isAbsolute(result)) throw new Error('Custom-Bot-Datenspeicher: Host-Pfad des Runner-Mounts nicht gefunden');
   hostWorkspaceCache = path.resolve(result);
   return hostWorkspaceCache;
 }
 async function containerHasDataMount(container) {
-  const r = await run('docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/bot/data"}}yes{{end}}{{end}}', container], { allowFailure: true, timeout: 15000 });
+  const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{range .Mounts}}{{if eq .Destination "/bot/data"}}yes{{end}}{{end}}', container], { allowFailure: true, timeout: 15000 });
   return r.code === 0 && r.out.trim() === 'yes';
 }
 const RUNTIME_MAX_FILES = 6000;

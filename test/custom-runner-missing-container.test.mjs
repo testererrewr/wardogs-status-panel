@@ -13,7 +13,7 @@ const end = runnerSource.indexOf("app.post('/ensure'", begin);
 assert.ok(begin > 0 && end > begin);
 const source = runnerSource.slice(begin, end);
 
-function fixture({ present = true, copyError = '', diffError = '', inspectError = '' } = {}) {
+function fixture({ present = true, imagePresent = false, copyError = '', diffError = '', inspectError = '' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wardogs-runner-'));
   const id = crypto.randomUUID();
   const base = path.join(dir, id);
@@ -25,18 +25,23 @@ function fixture({ present = true, copyError = '', diffError = '', inspectError 
   fs.writeFileSync(path.join(base, 'runtime-root', 'stats.db'), 'previously recovered root database');
   const docker = [];
   let running = false;
+  let imageBuilt = imagePresent;
   const container = `statushub-custom-${id}`;
   const calls = async (cmd, args) => {
     assert.equal(cmd, 'docker');
     docker.push(args);
     if (args[0] === 'inspect') {
       if (inspectError) return { code: 1, out: '', err: inspectError };
-      if (!present) return { code: 1, out: '', err: `Error: No such object: ${container}` };
-      if (args[1] === '-f') return { code: 0, out: running ? 'true' : 'false', err: '' };
-      return { code: 0, out: '{}', err: '' };
+      const idx = args.indexOf('--type');
+      const isContainerOnly = idx !== -1 && args[idx + 1] === 'container';
+      // Critical regression: untyped docker inspect can match a built IMAGE
+      // whose name is the same as a not-yet-created container.
+      if (!present && (isContainerOnly || !imageBuilt)) return { code: 1, out: '', err: `Error: No such object: ${container}` };
+      if (args.includes('-f')) return { code: 0, out: running ? 'true' : 'false', err: '' };
+      return { code: 0, out: imageBuilt && !present ? '{"Id":"sha256:image"}' : '{}', err: '' };
     }
     if (args[0] === 'network' && args[1] === 'inspect') return { code: 0, out: '{}', err: '' };
-    if (args[0] === 'build') return { code: 0, out: '', err: '' };
+    if (args[0] === 'build') { imageBuilt = true; return { code: 0, out: '', err: '' }; }
     if (args[0] === 'rm') { present = false; running = false; return { code: 1, out: '', err: `No such container: ${container}` }; }
     if (args[0] === 'create') { present = true; return { code: 0, out: container, err: '' }; }
     if (args[0] === 'start') { present = true; running = true; return { code: 0, out: container, err: '' }; }
@@ -127,5 +132,31 @@ test('new build starts normally when old container was already removed', async (
     assert.equal(f.docker.some(x => x[0] === 'create'), true);
     assert.equal(f.docker.some(x => x[0] === 'start'), true);
     assert.equal(fs.readFileSync(path.join(f.base,'runtime-data','stats.sqlite'),'utf8'), 'persisted host database');
+  } finally { f.cleanup(); }
+});
+
+
+test('an existing Docker image must never be mistaken for the bot container', async () => {
+  const f = fixture({ present: false, imagePresent: true });
+  try {
+    assert.equal(await f.existsContainer(`statushub-custom-${f.id}`), false);
+    await f.captureRuntime(f.id);
+    assert.equal(f.docker.filter(x => x[0] === 'inspect').every(x => x.includes('--type') && x[x.indexOf('--type') + 1] === 'container'), true);
+    assert.equal(f.docker.some(x => x[0] === 'cp' || x[0] === 'diff'), false);
+    assert.equal(fs.readFileSync(path.join(f.base, 'runtime-data', 'stats.sqlite'), 'utf8'), 'persisted host database');
+  } finally { f.cleanup(); }
+});
+
+test('new upload builds an image, but skips copying from nonexistent old container', async () => {
+  const f = fixture({ present: false, imagePresent: false });
+  try {
+    fs.writeFileSync(path.join(f.base, 'Dockerfile.generated'), 'FROM scratch');
+    await f.startFresh(f.id, {});
+    const buildIndex = f.docker.findIndex(x => x[0] === 'build');
+    const createIndex = f.docker.findIndex(x => x[0] === 'create');
+    assert.ok(buildIndex >= 0 && createIndex > buildIndex);
+    assert.equal(f.docker.some(x => x[0] === 'cp' && x[1].endsWith(':/bot/data/.')), false);
+    assert.equal(f.docker.some(x => x[0] === 'diff'), false);
+    assert.equal(f.docker.filter(x => x[0] === 'inspect').every(x => x.includes('--type') && x[x.indexOf('--type') + 1] === 'container'), true);
   } finally { f.cleanup(); }
 });
