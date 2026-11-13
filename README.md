@@ -1,3 +1,9 @@
+## v3.12.68 – Custom-Bot-Neustart: Docker-Images nicht als Container behandeln
+
+- Der Runner verwendet jetzt ausschließlich `docker inspect --type container`, wenn er bestehende Custom-Bot-Container prüft. Ein vorhandenes Docker-Image allein führt nicht mehr zu „No such container“ beim ersten Start.
+- Gilt für neue Uploads, Neu-Bauen, Laufzeit-Datensicherungen und Statusprüfungen. Bestehende Daten werden nicht gelöscht.
+- Siehe [UPDATE-v3.12.68.md](UPDATE-v3.12.68.md) für Tests und Anleitung.
+
 ## v3.12.67 – Runner-Startfix (fehlendes Hilfsmodul)
 
 - `Dockerfile.runner` kopiert jetzt auch `src/custom-bot-container-lifecycle.js` in das Runner-Image.
